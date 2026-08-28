@@ -516,8 +516,8 @@
 <div class="wrap">
   <div class="header">
     <div>
-      <div class="title">🎙️ Voice Chat <span style="opacity:0.6; font-weight:600">· X-ASR · Qwen3.5-4B · Qwen3-TTS</span></div>
-      <div class="subtitle">VAD Silero · STT X-ASR (sherpa 160ms) · LLM Qwen3.5-4B-MTP (native tools) · TTS Qwen3-TTS 0.6B CustomVoice Q8 24k · Svelte 5 + AudioWorklet</div>
+      <div class="title">🎙️ Voice Chat <span style="opacity:0.6; font-weight:600">· X-ASR · Gemma-4-E2B · Qwen3-TTS</span></div>
+      <div class="subtitle">VAD Silero · STT X-ASR (sherpa 160ms) · LLM Gemma-4-E2B-it (native tools) · TTS Qwen3-TTS 0.6B CustomVoice Q8 24k · Svelte 5 + AudioWorklet</div>
     </div>
     <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap">
       <div class="badge {connected ? 'ok' : ''}">{connected ? '● CONNECTED' : '○ DISCONNECTED'} · {mode.toUpperCase()} · RSS {rssMb} MB</div>
@@ -620,9 +620,9 @@
       <div class="meta">Backend: <code>ws://{location.hostname}:8000/ws/chat</code> · API <code>/api/chat</code> · <code>/health</code> shows peak RSS</div>
 
       <div class="card" style="margin-top:12px; padding:12px; background:#0f0f14; border-color:#1f3d2b">
-        <h3 style="margin-bottom:6px; color:#20c997">🔧 Qwen3.5-4B-MTP Tool Calling · web_search via self-hosted SearXNG</h3>
+        <h3 style="margin-bottom:6px; color:#20c997">🔧 Gemma-4-E2B-it Tool Calling · web_search via self-hosted SearXNG</h3>
         <div style="font-size:12px; opacity:0.85; line-height:1.6">
-          <b>Qwen3.5-4B-MTP</b> (Q4_K_M, native tools) multi-turn <code>tool_calls</code> → <code>web_search(query)</code> → <b>SearXNG</b> self-hosted (bing + wikipedia engines, entity-first queries) → <code>tool_response</code> → answer → spoken via <b>Qwen3-TTS 0.6B CustomVoice</b> (faster_qwen3_tts cu124 GGML, TRUE streaming, 24k).<br/>
+          <b>Gemma-4-E2B-it</b> (Q4_K_M, native tools) multi-turn <code>tool_calls</code> → <code>web_search(query)</code> → <b>SearXNG</b> self-hosted (bing + wikipedia engines, entity-first queries) → <code>tool_response</code> → answer → spoken via <b>Qwen3-TTS 0.6B CustomVoice</b> (faster_qwen3_tts cu124 GGML, TRUE streaming, 24k).<br/>
           <span style="opacity:0.6">Try:</span> “What's the weather?”, “Search AI news”, “Who is …?” — watch 🔍 bubbles.
         </div>
         {#if lastSearchResults.length}
@@ -644,7 +644,7 @@
           <tbody>
           <tr><td style="padding:5px 8px; opacity:0.7; border-bottom:1px solid #1e1e28">VAD</td><td style="padding:5px 8px; border-bottom:1px solid #1e1e28"><code>Silero VAD</code> <span style="opacity:0.5">· turn-taking, 16k</span></td></tr>
           <tr><td style="padding:5px 8px; opacity:0.7; border-bottom:1px solid #1e1e28">STT</td><td style="padding:5px 8px; border-bottom:1px solid #1e1e28"><code>GilgameshWind/X-ASR-zh-en</code> <span style="opacity:0.5">· sherpa Zipformer 160ms streaming, zh+en 16k</span></td></tr>
-          <tr><td style="padding:5px 8px; opacity:0.7; border-bottom:1px solid #1e1e28">LLM</td><td style="padding:5px 8px; border-bottom:1px solid #1e1e28"><code>unsloth/Qwen3.5-4B-MTP-GGUF</code> <span style="opacity:0.5">· 4B MTP Q4_K_M, llama-server :11435, native tools=[web_search]</span></td></tr>
+          <tr><td style="padding:5px 8px; opacity:0.7; border-bottom:1px solid #1e1e28">LLM</td><td style="padding:5px 8px; border-bottom:1px solid #1e1e28"><code>unsloth/gemma-4-E2B-it-GGUF</code> <span style="opacity:0.5">· 4B E2B Q4_K_M, llama-server :11435, native tools=[web_search]</span></td></tr>
           <tr><td style="padding:5px 8px; opacity:0.7">TTS</td><td style="padding:5px 8px"><code>Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice</code> <span style="opacity:0.5">· GGML cu124 Q8_0, 24k, speaker Aiden, TTFA ~20ms</span></td></tr>
           </tbody>
         </table>
@@ -656,6 +656,6 @@
   </div>
 
   <div style="text-align:center; font-size:11px; opacity:0.45; margin-top:16px">
-    <span style="color:#20c997">● Real: Silero VAD + X-ASR + Qwen3.5-4B-MTP + Qwen3-TTS-Q8</span> · SearXNG self-hosted :8888 · <code>https://training-machine.tailf63b31.ts.net</code> · <code>wss</code> · No mock.
+    <span style="color:#20c997">● Real: Silero VAD + X-ASR + Gemma-4-E2B + Qwen3-TTS-Q8</span> · SearXNG self-hosted :8888 · <code>https://training-machine.tailf63b31.ts.net</code> · <code>wss</code> · No mock.
   </div>
 </div>

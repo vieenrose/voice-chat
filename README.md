@@ -1,6 +1,6 @@
 # Voice Chat — full-duplex streaming speech-to-speech with tools
 
-**X-ASR (STT) → Qwen3.5-4B-MTP (LLM + native tools) → Qwen3-TTS 0.6B Q8 (streaming TTS)**
+**X-ASR (STT) → Gemma-4-E2B-it (LLM + native tools) → Qwen3-TTS 0.6B Q8 (streaming TTS)**
 
 A real-model, no-mock full-duplex voice chat demo with web-search tool calling,
 multi-turn history (bilingual zh/en), and public HTTPS access via Tailscale funnel.
@@ -27,7 +27,7 @@ Browser (Svelte 5, AudioWorklet, pre-roll jitter buffer 0.6s, barge-in)
 - **Full duplex**: talk while the assistant speaks; barge-in cancels TTS instantly.
 - **Real models only** (`mock=false` everywhere):
   - STT: `GilgameshWind/X-ASR-zh-en` — sherpa-onnx Zipformer, 160 ms streaming, zh+en, CUDA.
-  - LLM: `unsloth/Qwen3.5-4B-MTP-GGUF` Q4_K_M — llama-server, native `tools=[web_search, get_current_datetime]`.
+  - LLM: `unsloth/gemma-4-E2B-it-GGUF` Q4_K_M — llama-server, native `tools=[web_search, get_current_datetime]` (TTFT ~90–530 ms).
   - TTS: `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` Q8 — `qwentts-cpp-python==0.3.1+cu124` GGML CUDA, true streaming.
   - Fallbacks: Kokoro-1.0 (82M ONNX) → MOSS-TTS-Nano-100M ONNX (CUDA EP) → VoxCPM2.
 - **Tool calling**: self-hosted SearXNG (`!bing` engine), entity-first zh/en query crafting,
@@ -58,7 +58,7 @@ cd frontend && npm run build
 ```
 
 Model files expected on disk (mount/volumes in Docker):
-- LLM: `/tmp/llms/Qwen3.5-4B-Q4_K_M.gguf` (or `--llm` override)
+- LLM: `/tmp/llms/gemma-4-e2b-it-Q4_K_M.gguf` (or `--llm` override)
 - TTS: `/tmp/qwen3_tts/talker_cv_q8.gguf` + `/tmp/qwen3_tts/codec.gguf`
 - STT: `/tmp/XASR/deployment/models/chunk-160ms-model`
 - SearXNG: `:8888` (self-hosted, `!bing` engine enabled)
@@ -97,5 +97,5 @@ see `docker-compose.yml`). CUDA users: `--gpus all` + nvidia-container-toolkit.
 ## 📜 License / models
 
 Code: Apache-2.0 intent. Models:
-Qwen3.5-4B-MTP (Apache-2.0), Qwen3-TTS (Apache-2.0), X-ASR (Apache-2.0),
+Gemma-4-E2B-it (Gemma license), Qwen3.5-4B-MTP (Apache-2.0), Qwen3-TTS (Apache-2.0), X-ASR (Apache-2.0),
 Kokoro-1.0 (Apache-2.0), MOSS-TTS-Nano (Apache-2.0), SearXNG (AGPL-3.0).
