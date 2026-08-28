@@ -47,7 +47,7 @@ except ImportError as e_x:
 try:
     from llm.ling_streaming import LingStreaming as MiniCPMStreaming
     LLM_NAME = "Qwen3.5-2B-MTP-GGUF"
-    print(f"[LLM] Using Qwen3.5-2B-MTP GGUF (llama-server :11436, native tools)")
+    print(f"[LLM] configured at runtime (llama-server, native tools)")
 except ImportError:
     from llm.minicpm_streaming import MiniCPMStreaming
     LLM_NAME = "MiniCPM5"
@@ -142,7 +142,7 @@ class HFSpeechToSpeechPipeline:
         logger.info(f"STT {STT_NAME} model_id={stt_model} backend={self.stt.backend}")
         # LLM: Qwen3.5-2B-MTP GGUF via llama.cpp :11436 — native tools, try real even in mock mode
         try:
-            self.llm = MiniCPMStreaming(model_id="ibm-granite/granite-4.2-3b-GGUF", api_base="http://127.0.0.1:11435/v1", model_name="granite-4.2-3b", device=device, mock=False)
+            self.llm = MiniCPMStreaming(model_id="ibm-granite/granite-4.2-8b-GGUF", api_base="http://127.0.0.1:11435/v1", model_name="granite-4.2-8b", device=device, mock=False)
             # If it still ended up in mock due to server not ready, keep it but log
             if getattr(self.llm, 'mock', False):
                 logger.info(f"LLM {LLM_NAME} not ready (llama-server down), using mock fallback — will become real once GGUF downloaded and server up")

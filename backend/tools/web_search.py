@@ -87,11 +87,11 @@ async def _wttr_weather(query: str) -> Dict | None:
     """Direct weather forecast via wttr.in (no API key, zh+en). Returns a synthetic result dict
     with real forecast numbers for weather-intent queries, or None."""
     ql = query.lower()
-    if not re.search(r"(天气|氣候|气温|预报|降雨|weather|forecast|temperature)", ql):
+    if not re.search(r"(天气|天氣|氣候|气温|氣溫|预报|预报|降雨|weather|forecast|temperature|雨|風|风|雪|晴|多雲|多云)", ql):
         return None
     zh = bool(re.search(r"[\u4e00-\u9fff]", query))
     # strip weather-words to get the location (zh: substring; latin: with \b so 'is' never eats 'Paris')
-    loc = re.sub(r"(明天|后天|大后天|今天|明晚|天气|气温|预报|降雨|如何|怎么样|怎样|多少|度|呢|啊|吗|帮我|查一下|谢谢|请问)", " ", query, flags=re.I)
+    loc = re.sub(r"(明天|後天|后天|大后天|今天|明晚|天气|天氣|气温|氣溫|预报|預報|降雨|如何|怎么样|怎樣|多少|度|呢|啊|吗|媽|帮我|查一下|谢谢|請問|请问)", " ", query, flags=re.I)
     loc = re.sub(r"\b(weather|forecast|temperature|today|tomorrow|next|week|weekend|how|is|the|what|like|in|at|for|this|a|an|and|of|please|now|right)\b", " ", loc, flags=re.I)
     loc = re.sub(r"[，。！？,?!.]+", " ", loc)
     loc = re.sub(r"\s+", " ", loc).strip()
@@ -112,13 +112,13 @@ async def _wttr_weather(query: str) -> Dict | None:
             return None
         day = 2 if re.search(r"(後天|后天|大后天|day after tomorrow)", ql) else (1 if re.search(r"(明天|tomorrow|next day)", ql) else 0)
         di = days[min(day, len(days)-1)]
-        desc = "、".join(d["value"] for d in (di.get("weatherDesc") or [{}]) if d.get("value")) or "未知"
+        desc = "、".join(d["value"] for d in (di.get("weatherDesc") or [{}]) if d.get("value"))
         t_min = di.get("mintempC") or di.get("mintempF")
         t_max = di.get("maxtempC") or di.get("maxtempF")
         ctx = di.get("current_condition") or j.get("current_condition") or [{}]
         hum = (ctx[0] if ctx else {}).get("humidity") or ""
-        label = "明天" if day else "今天"
-        content = (f"【wttr.in 天气】{loc} {label}：{desc}，气温 {t_min}-{t_max}°C，湿度 {hum}%。"
+        label = "後天" if day == 2 else ("明天" if day == 1 else "今天")
+        content = (f"【wttr.in 天气】{loc} {label}：{desc or "天气"}，气温 {t_min}-{t_max}°C，湿度 {hum}%。"
                    f"（数据来源 wttr.in 实时预报，city={loc}）")
         logger.info(f"web_search wttr.in for '{query}' -> {loc} day={label} {t_min}-{t_max}C {desc}")
         return {"title": f"{loc} {label}天气预报", "url": f"https://wttr.in/{urllib.parse.quote(loc)}",
@@ -156,6 +156,11 @@ def _entity_first_query(q: str) -> str:
         cands.insert(0, f"python {m4.group(1)} release")
     # news / latest X -> drop latest/current
     m3 = re.search(r"\b(latest|current|recent|breaking)\s+(.+)", ql)
+    if "news" in ql or "新闻" in ql or "新聞" in ql:
+        # entity-first for news: "big news today in taiwan" -> "Taiwan news today"
+        _loc = re.search(r"\b(taiwan|台灣|台湾|taipei|台北|hong kong|香港|japan|日本|china|中国|中國|france|paris)\b", ql)
+        if _loc:
+            cands.insert(0, f"{_loc.group(1)} news today")
     if m3 and not m4:
         cands.append(_clean_query(m3.group(1)) or m3.group(1))
     # keep unique
@@ -163,7 +168,7 @@ def _entity_first_query(q: str) -> str:
     for c in cands:
         if c not in seen and c.strip():
             seen.add(c); out.append(c)
-    return out[:3]
+    return out[:4]
 
 async def _try_searxng(query: str, count: int, engine: str | None = None) -> List[Dict] | None:
     """Try local self-hosted SearXNG on 8888. engine=None -> aggregate; else single engine by name."""
@@ -195,7 +200,7 @@ async def _try_searxng(query: str, count: int, engine: str | None = None) -> Lis
                     if len(out) >= count:
                         break
                 if out:
-                    logger.info(f"web_search via SearXNG\{engine or 'aggregate'}\: {query} -> {len(out)}")
+                    logger.info(f"web_search via SearXNG {{engine or 'aggregate'}}: {query} -> {len(out)}")
                     return out
     except Exception as e:
         logger.debug(f"SearXNG({engine or 'agg'}) not available {e}")
