@@ -60,7 +60,7 @@ TOOL_DEFS = [
     }
 ]
 
-SYSTEM_PROMPT = "You are a helpful voice assistant with web search. Keep replies concise, conversational, under 80 words, speak naturally for voice chat. For ANY question about current events, news, weather, real-time info, or specific regional events (e.g., '今天台湾有什么重大事件', 'latest news'), you MUST use web_search tool to get the latest information — never refuse or say you cannot provide real-time info. Use search results to answer.\nAlways respond in the user's language (Chinese for Chinese queries, English for English queries)."
+SYSTEM_PROMPT = "You are a helpful voice assistant with web search. Keep replies concise, conversational, under 80 words, speak naturally for voice chat. For ANY question about current events, news, weather, real-time info, or specific regional events (e.g., '今天台湾有什么重大事件', 'latest news'), you MUST use web_search tool to get the latest information — never refuse or say you cannot provide real-time info. Use search results to answer. For questions about today's date, weekday, or current time (今天/星期几/几点), you MUST call the get_current_datetime tool instead of guessing. For weather/forecast questions (even about 明天/後天) call web_search — the search returns the forecast including tomorrow. If a question needs both, call both tools. Always respond in the user's language (Chinese for Chinese queries, English for English queries)."
 
 # Heuristic for fast tool trigger — bilingual (en/zh) - includes Chinese triggers for Taiwan/news
 # (heuristic removed — tool calls are model-driven/native only)
@@ -245,18 +245,12 @@ class LingStreaming:
             web_search = None
             format_results = lambda x: str(x)
         messages = []
-        # Ground the agent in today's date via SYSTEM context (not the user turn — the model
-        # used to mirror the user-prefix date into casual greetings like "Hi! Today is Friday…")
-        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
-        _today = _dt.now(_tz.utc)
-        _tom = _today + _td(days=1)
-        _date_ctx = f"\n<context>Today is {_today.strftime('%A')}, {_today.strftime('%Y-%m-%d')} (UTC); tomorrow is {_tom.strftime('%A')}, {_tom.strftime('%Y-%m-%d')}. Only mention the date when asked.</context>"
         if not history or history[0].get("role") != "system":
-            messages.append({"role": "system", "content": SYSTEM_PROMPT + _date_ctx})
+            messages.append({"role": "system", "content": SYSTEM_PROMPT})
             if history:
                 messages.extend(history)
         else:
-            messages = [dict(history[0], content=history[0]["content"] + _date_ctx)] + list(history[1:])
+            messages = list(history)
         messages.append({"role": "user", "content": prompt})
         _tools = TOOL_DEFS
 
@@ -279,69 +273,65 @@ class LingStreaming:
             tool_calls = [tc for tc in tool_calls if tc["name"].strip()]
 
             if tool_calls:
-                tc0 = tool_calls[0]
-                _tcname = tc0.get("name", "")
-                # ---- get_current_datetime: no network, tells the agent exactly which day it is (today/tomorrow/yesterday) ----
-                if _tcname == "get_current_datetime":
+                # GENUINE tools: execute EVERY tool call the model made in this round and return all results.
+                _exec = []
+                for _i, tc in enumerate(tool_calls):
+                    _tid = f"call_{_i}"
+                    _name = tc.get("name", "")
                     try:
-                        _args = json.loads(tc0["arguments"]) if tc0["arguments"].strip() else {}
+                        _args = json.loads(tc.get("arguments") or "{}") if (tc.get("arguments") or "").strip() else {}
                     except Exception:
                         _args = {}
-                    _tz = str(_args.get("timezone") or "UTC")
-                    try:
-                        from zoneinfo import ZoneInfo
-                        from datetime import datetime as _dt, timedelta as _td
-                        _now = _dt.now(ZoneInfo(_tz))
-                    except Exception:
-                        from datetime import datetime as _dt, timedelta as _td
-                        _now = _dt.utcnow(); _tz = "UTC"
-                    _tom = _now + _td(days=1)
-                    _yest = _now - _td(days=1)
-                    _fmt = (f"Current date and time: {_now.strftime('%A')}, {_now.strftime('%Y-%m-%d')} {_now.strftime('%H:%M:%S')} ({_tz}). "
-                            f"Today is {_now.strftime('%A')} ({_now.strftime('%Y-%m-%d')}). "
-                            f"Tomorrow is {_tom.strftime('%A')} ({_tom.strftime('%Y-%m-%d')}). "
-                            f"Yesterday was {_yest.strftime('%A')} ({_yest.strftime('%Y-%m-%d')}).")
-                    logger.info(f"[LLM Tool] get_current_datetime -> {_fmt}")
-                    yield {"type": "tool_call", "name": "get_current_datetime", "arguments": _args}
-                    yield {"type": "tool_result", "name": "get_current_datetime",
-                           "result": {"date": _now.strftime("%Y-%m-%d"), "weekday": _now.strftime("%A"),
-                                       "time": _now.strftime("%H:%M:%S"), "timezone": _tz},
-                           "formatted": _fmt, "latency_ms": 1, "source": "datetime"}
-                    messages.append({"role": "assistant", "content": None,
-                                     "tool_calls": [{"id": "call_0", "type": "function",
-                                                      "function": {"name": "get_current_datetime", "arguments": tc0["arguments"] or _json_dumps(_args)}}]})
-                    messages.append({"role": "tool", "tool_call_id": "call_0", "content": _fmt})
-                    continue
-                # execute first web_search tool call
-                if web_search is None or _tcname != "web_search":
-                    # unknown tool / no search available -> let the final-answer branch handle the text
-                    tool_calls = []
-                else:
-                    tc0 = tool_calls[0]
-                    try:
-                        args = json.loads(tc0["arguments"]) if tc0["arguments"].strip() else {}
-                    except Exception:
-                        args = {"query": tc0["arguments"][:80]}
-                    query = str(args.get("query") or prompt)[:120]
-                    logger.info(f"[LLM Tool] native web_search '{query}'")
-                    yield {"type": "tool_call", "name": "web_search", "arguments": args, "query": query}
-                    t_tool = time.time()
-                    try:
-                        search_res = await web_search(query, count=5)
-                        formatted = format_results(search_res["results"])
-                        yield {"type": "tool_result", "name": "web_search", "result": search_res, "formatted": formatted,
-                               "latency_ms": int((time.time()-t_tool)*1000),
-                               "source": search_res.get("source", "")}
-                    except Exception as e:
-                        logger.exception(f"LLM tool search failed {e}")
-                        formatted = f"web search failed for '{query}': {e}"
-                        yield {"type": "tool_result", "name": "web_search", "error": str(e)}
-                    # append assistant tool_call + tool result to continue
-                    import json as _json
-                    messages.append({"role": "assistant", "content": None,
-                                     "tool_calls": [{"id": "call_0", "type": "function",
-                                                      "function": {"name": "web_search", "arguments": tc0["arguments"] or _json.dumps(args)}}]})
-                    messages.append({"role": "tool", "tool_call_id": "call_0", "content": formatted})
+                    _argstr = tc.get("arguments") or _json_dumps(_args)
+                    if _name == "get_current_datetime":
+                        _tz = str(_args.get("timezone") or "UTC")
+                        try:
+                            from zoneinfo import ZoneInfo
+                            from datetime import datetime as _dt, timedelta as _td
+                            _now = _dt.now(ZoneInfo(_tz))
+                        except Exception:
+                            from datetime import datetime as _dt, timedelta as _td
+                            _now = _dt.utcnow(); _tz = "UTC"
+                        _tom = _now + _td(days=1); _yest = _now - _td(days=1)
+                        _fmt = (f"Current date and time: {_now.strftime('%A')}, {_now.strftime('%Y-%m-%d')} {_now.strftime('%H:%M:%S')} ({_tz}). "
+                                f"Today is {_now.strftime('%A')} ({_now.strftime('%Y-%m-%d')}). "
+                                f"Tomorrow is {_tom.strftime('%A')} ({_tom.strftime('%Y-%m-%d')}). "
+                                f"Yesterday was {_yest.strftime('%A')} ({_yest.strftime('%Y-%m-%d')}).")
+                        logger.info(f"[LLM Tool] get_current_datetime -> {_fmt}")
+                        yield {"type": "tool_call", "name": "get_current_datetime", "arguments": _args}
+                        yield {"type": "tool_result", "name": "get_current_datetime",
+                               "result": {"date": _now.strftime("%Y-%m-%d"), "weekday": _now.strftime("%A"),
+                                           "time": _now.strftime("%H:%M:%S"), "timezone": _tz},
+                               "formatted": _fmt, "latency_ms": 1, "source": "datetime"}
+                        _exec.append({"id": _tid, "type": "function",
+                                      "function": {"name": "get_current_datetime", "arguments": _argstr}})
+                        _exec.append({"tool_call_id": _tid, "content": _fmt})
+                    elif _name == "web_search" and web_search is not None:
+                        query = str(_args.get("query") or prompt)[:120]
+                        logger.info(f"[LLM Tool] native web_search '{query}'")
+                        yield {"type": "tool_call", "name": "web_search", "arguments": _args, "query": query}
+                        t_tool = time.time()
+                        try:
+                            search_res = await web_search(query, count=5)
+                            formatted = format_results(search_res["results"])
+                            yield {"type": "tool_result", "name": "web_search", "result": search_res, "formatted": formatted,
+                                   "latency_ms": int((time.time()-t_tool)*1000),
+                                   "source": search_res.get("source", "")}
+                        except Exception as e:
+                            logger.exception(f"LLM tool search failed {e}")
+                            formatted = f"web search failed for '{query}': {e}"
+                            yield {"type": "tool_result", "name": "web_search", "error": str(e)}
+                        _exec.append({"id": _tid, "type": "function",
+                                      "function": {"name": "web_search", "arguments": _argstr}})
+                        _exec.append({"tool_call_id": _tid, "content": formatted})
+                    else:
+                        logger.warning(f"unexecuted tool call: {_name}")
+                if _exec:
+                    _starts = [x for x in _exec if "function" in x]
+                    messages.append({"role": "assistant", "content": None, "tool_calls": _starts})
+                    for x in _exec:
+                        if "tool_call_id" in x:
+                            messages.append({"role": "tool", **x})
                     continue
 
             # Ling sometimes emits the tool call as TEMPLATE XML in content instead of delta.tool_calls

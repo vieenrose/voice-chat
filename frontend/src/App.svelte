@@ -100,8 +100,17 @@
         llmStreaming = msg.text_so_far;
         break;
       case 'tool_call':
-        toolStatus = `🔍 Searching SearXNG for "${msg.query || msg.arguments?.query}"...`;
-        chatHistory = [...chatHistory, {role:'tool', text: `🔍 web_search("${msg.query||msg.arguments?.query}") — querying self-hosted SearXNG at localhost:8888...`, streaming:false}];
+        {
+          const tn = msg.name || 'tool';
+          const q = msg.query || msg.arguments?.query || msg.arguments?.timezone || '';
+          if(tn === 'web_search'){
+            toolStatus = `🔍 web_search("${q}") — querying SearXNG...`;
+            chatHistory = [...chatHistory, {role:'tool', text: `🔍 web_search("${q}") — querying self-hosted SearXNG...`, streaming:false}];
+          } else {
+            toolStatus = `🕐 ${tn}() — fetching date/time...`;
+            chatHistory = [...chatHistory, {role:'tool', text: `🕐 ${tn}() — fetching date/time...`, streaming:false}];
+          }
+        }
         break;
       case 'tool_result':
         {
