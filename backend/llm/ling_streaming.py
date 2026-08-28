@@ -245,18 +245,19 @@ class LingStreaming:
             web_search = None
             format_results = lambda x: str(x)
         messages = []
-        if not history or history[0].get("role") != "system":
-            messages.append({"role": "system", "content": SYSTEM_PROMPT})
-            if history:
-                messages.extend(history)
-        else:
-            messages = list(history)
-        # Always ground the agent in today's date (so 明天/後天/weekday are exact, no hallucination).
+        # Ground the agent in today's date via SYSTEM context (not the user turn — the model
+        # used to mirror the user-prefix date into casual greetings like "Hi! Today is Friday…")
         from datetime import datetime as _dt, timedelta as _td, timezone as _tz
         _today = _dt.now(_tz.utc)
         _tom = _today + _td(days=1)
-        _date_hint = f"[Today is {_today.strftime('%A')}, {_today.strftime('%Y-%m-%d')} (UTC). Tomorrow is {_tom.strftime('%A')}, {_tom.strftime('%Y-%m-%d')}.] "
-        messages.append({"role": "user", "content": _date_hint + prompt})
+        _date_ctx = f"\n<context>Today is {_today.strftime('%A')}, {_today.strftime('%Y-%m-%d')} (UTC); tomorrow is {_tom.strftime('%A')}, {_tom.strftime('%Y-%m-%d')}. Only mention the date when asked.</context>"
+        if not history or history[0].get("role") != "system":
+            messages.append({"role": "system", "content": SYSTEM_PROMPT + _date_ctx})
+            if history:
+                messages.extend(history)
+        else:
+            messages = [dict(history[0], content=history[0]["content"] + _date_ctx)] + list(history[1:])
+        messages.append({"role": "user", "content": prompt})
         _tools = TOOL_DEFS
 
         for _round in range(1):  # ONE native tool round (model decides query + whether to search) — then answer. No refine-re-search doubling.
