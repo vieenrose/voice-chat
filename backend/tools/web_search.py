@@ -110,7 +110,7 @@ async def _wttr_weather(query: str) -> Dict | None:
         days = j.get("weather", [])
         if not days:
             return None
-        day = 1 if re.search(r"(明天|后天|大后天|tomorrow)", ql) else 0
+        day = 2 if re.search(r"(後天|后天|大后天|day after tomorrow)", ql) else (1 if re.search(r"(明天|tomorrow|next day)", ql) else 0)
         di = days[min(day, len(days)-1)]
         desc = "、".join(d["value"] for d in (di.get("weatherDesc") or [{}]) if d.get("value")) or "未知"
         t_min = di.get("mintempC") or di.get("mintempF")

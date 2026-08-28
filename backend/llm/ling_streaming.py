@@ -48,7 +48,7 @@ TOOL_DEFS = [
         "type": "function",
         "function": {
             "name": "get_current_datetime",
-            "description": "Get the current date and time (server timezone is UTC). Use for questions about today's date, weekday, current time, or tomorrow calculations. Optional IANA timezone e.g. Asia/Taipei, Asia/Shanghai, Europe/Paris.",
+            "description": "Get the current date and time (UTC). Use ONLY for questions asking what day/date/time it is (星期几/几号/几点/what day/today date). NEVER use for weather/forecast — weather must go to web_search. Optional IANA timezone e.g. Asia/Taipei.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -60,7 +60,7 @@ TOOL_DEFS = [
     }
 ]
 
-SYSTEM_PROMPT = "You are a helpful voice assistant with web search. Keep replies concise, conversational, under 80 words, speak naturally for voice chat. For ANY question about current events, news, weather, real-time info, or specific regional events (e.g., '今天台湾有什么重大事件', 'latest news'), you MUST use web_search tool to get the latest information — never refuse or say you cannot provide real-time info. Use search results to answer. For questions about today's date, weekday, or current time (今天/星期几/几点), you MUST call the get_current_datetime tool instead of guessing. For weather/forecast questions (even about 明天/後天) call web_search — the search returns the forecast including tomorrow. If a question needs both, call both tools. Always respond in the user's language (Chinese for Chinese queries, English for English queries)."
+SYSTEM_PROMPT = "You are a helpful voice assistant with web search. Keep replies concise, conversational, under 80 words, speak naturally for voice chat. For ANY question about current events, news, weather, real-time info, or specific regional events (e.g., '今天台湾有什么重大事件', 'latest news'), you MUST use web_search tool to get the latest information — never refuse or say you cannot provide real-time info. Use search results to answer. For questions about today's date, weekday, or current time (今天/星期几/几点), you MUST call the get_current_datetime tool instead of guessing. For ANY weather/forecast question (including 明天/後天/next week) you MUST call web_search — the search engine returns the forecast for the requested day, so do NOT call get_current_datetime for weather. For date/time questions call get_current_datetime. When both are needed, call both in the same turn. Always answer using the tool RESULTS verbatim (weekday, date, temperatures) — never from memory. Always respond in the user's language (Chinese for Chinese queries, English for English queries)."
 
 # Heuristic for fast tool trigger — bilingual (en/zh) - includes Chinese triggers for Taiwan/news
 # (heuristic removed — tool calls are model-driven/native only)
