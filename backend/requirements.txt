@@ -1,0 +1,38 @@
+# Core
+fastapi==0.115.*
+uvicorn[standard]==0.34.*
+websockets==14.*
+python-multipart==0.0.9
+pydantic==2.11.*
+
+# ML — HF Speech-to-Speech stack
+torch==2.11.*
+torchaudio==2.11.*
+transformers==5.5.*
+accelerate==1.8.*
+huggingface_hub==1.27.*
+tokenizers==0.22.*
+safetensors==0.5.*
+numpy==1.26.*
+scipy==1.14.*
+librosa==0.11.*
+soundfile==0.13.*
+
+# STT: streaming X-ASR — faster-whisper for real streaming, fallback to transformers
+faster-whisper==1.1.*
+openai-whisper==20250625 ; python_version < "3.13"
+
+# TTS: PrimeTTS ONNX + fallback
+onnxruntime-gpu==1.21.* ; sys_platform != "darwin"
+onnxruntime==1.21.* ; sys_platform == "darwin"
+onnx==1.18.*
+phonemizer==3.2.*
+espeakng-loader==0.1.*
+
+# Utils
+silero-vad==5.1.* ; python_version < "3.13"
+webrtcvad==2.0.*
+loguru==0.7.*
+psutil==6.*
+aiohttp==3.*
+uvicorn==0.34.*

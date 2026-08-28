@@ -1,0 +1,26 @@
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Python
+__pycache__/
+*.pyc
+backend/.pytest_cache/
+backend/benchmark_report.json
+
+# Model artifacts / big binaries (mount or download at runtime, don't commit)
+G2PWModel/
+model_quant.onnx
+am.mvn
+asr_example.wav
+*.wav
+/tmp/kokoro/
+/tmp/qwen3_tts/
+/tmp/XASR/
+/tmp/llms/
+
+# OS / editor
+.DS_Store
+*.log
+.idea/
+.vscode/

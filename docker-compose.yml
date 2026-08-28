@@ -1,0 +1,48 @@
+services:
+  llama:
+    image: ghcr.io/ggerganov/llama.cpp:server-cuda
+    command: -m /models/llm/Qwen3.5-4B-Q4_K_M.gguf --host 0.0.0.0 --port 8080 -c 8192 --alias qwen3.5-4b-mtp --n-gpu-layers 99 --jinja
+    volumes:
+      - ./models/llm:/models/llm:ro
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ports:
+      - "11435:8080"
+
+  voice-chat:
+    build: .
+    depends_on:
+      - llama
+    environment:
+      - LLM_API_BASE=http://llama:8080/v1
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      - ./models/tts:/models/tts:ro
+      - ./models/stt:/models/stt:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ports:
+      - "8000:8000"
+
+  searxng:
+    image: searxng/searxng:latest
+    ports:
+      - "8888:8080"
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    environment:
+      - SEARXNG_BASE_URL=http://searxng:8080
