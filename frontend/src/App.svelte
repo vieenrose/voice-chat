@@ -1,5 +1,11 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
+  import { marked } from 'marked';
+  import DOMPurify from 'dompurify';
+  marked.setOptions({ breaks: true, gfm: true });
+  function renderMarkdown(text){
+    try{ const html = marked.parse(text || ''); return DOMPurify.sanitize(html); }catch(e){ return (text||'').replace(/\n/g,'<br/>'); }
+  }
   let s2tConverter = null;
   let toTraditional = (text) => text;
   async function initOpenCC(){
@@ -210,6 +216,13 @@
   .bubble.assistant{align-self:flex-start; background:#1e1e28; border:1px solid #232332}
   .bubble.system{align-self:center; background:transparent; border:1px dashed #2a2a3a; font-size:11px; opacity:0.7}
   .bubble.tool{align-self:center; background:#0e1a14; border:1px solid #1e3326; color:#8fd9b0; font-size:11px; max-width:90%; border-radius:8px; padding:7px 10px}
+  .bubble.markdown :global(p){margin:6px 0}
+  .bubble.markdown :global(strong){color:#fff; font-weight:700}
+  :global(body.light) .bubble.markdown :global(strong){color:#1a1a24}
+  .bubble.markdown :global(ul), .bubble.markdown :global(ol){margin:6px 0 6px 18px; padding:0}
+  .bubble.markdown :global(li){margin:4px 0}
+  .bubble.markdown :global(a){color:#8ea6ff; text-decoration:underline}
+  .bubble.markdown :global(h1), .bubble.markdown :global(h2), .bubble.markdown :global(h3){margin:8px 0 4px; font-size:13px}
   :global(body.light) .bubble.assistant{background:#f1f2f8; border-color:#e3e4ee}
   :global(body.light) .bubble.system{background:#f8f9fc; border-color:#e3e4ee}
   :global(body.light) .bubble.tool{background:#eef8f0; border-color:#c8e8d0; color:#2a6b4a}
@@ -297,7 +310,11 @@
         <h3>Conversation <span style="margin-left:auto; font-size:11px; opacity:0.5; text-transform:none; letter-spacing:0">{chatHistory.length} msgs</span> <button class="ghost" style="padding:4px 8px; font-size:11px; margin-left:8px" onclick={clearChat}>Clear</button></h3>
         <div class="chat" id="chat">
           {#each chatHistory as m}
-            <div class="bubble {m.role} {m.streaming ? 'streaming' : ''}">{m.text}{#if m.streaming}<span style="opacity:0.6"> ▌</span>{/if}</div>
+            {#if m.role==='assistant'}
+              <div class="bubble {m.role} {m.streaming ? 'streaming' : ''} markdown">{@html renderMarkdown(m.text)}{#if m.streaming}<span style="opacity:0.6"> ▌</span>{/if}</div>
+            {:else}
+              <div class="bubble {m.role} {m.streaming ? 'streaming' : ''}">{m.text}{#if m.streaming}<span style="opacity:0.6"> ▌</span>{/if}</div>
+            {/if}
           {:else}
             <div class="bubble system">No messages — hit <b>Listen</b> or type below.</div>
           {/each}
