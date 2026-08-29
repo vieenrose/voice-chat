@@ -42,11 +42,11 @@ except ImportError as e_x:
             print(f"[STT] ARK not ready {e2}, fallback to X-ASR")
             from stt.xasr_streaming import StreamingXASR
             STT_NAME = "X-ASR-160ms"
-# LLM: Qwen3.5-2B-MTP GGUF via llama.cpp (native tool calling) — default production LLM
+# LLM: Qwen3.5-0.8B-MTP GGUF via llama.cpp (native tool calling) — default production LLM
 # (was Ling 3.0 tiny earlier; keep LingStreaming class name for API compat)
 try:
     from llm.ling_streaming import LingStreaming as MiniCPMStreaming
-    LLM_NAME = "Qwen3.5-2B-MTP-GGUF"
+    LLM_NAME = "Qwen3.5-0.8B-MTP-GGUF"
     print(f"[LLM] configured at runtime (llama-server, native tools)")
 except ImportError:
     from llm.minicpm_streaming import MiniCPMStreaming
@@ -140,11 +140,11 @@ class HFSpeechToSpeechPipeline:
             stt_model = "GilgameshWind/X-ASR-zh-en"
         self.stt = StreamingXASR(model_id=stt_model, device=device, mock=False, chunk_ms=160)
         logger.info(f"STT {STT_NAME} model_id={stt_model} backend={self.stt.backend}")
-        # LLM: Qwen3.5-2B-MTP GGUF via llama.cpp :11436 — native tools, try real even in mock mode
+        # LLM: Qwen3.5-0.8B-MTP GGUF via llama.cpp :11436 — native tools, try real even in mock mode
         try:
             import os
             _llm_base = os.getenv("LLM_API_BASE", "http://127.0.0.1:11435/v1")
-            self.llm = MiniCPMStreaming(model_id="unsloth/Qwen3.5-2B-GGUF", api_base=_llm_base, model_name="qwen3.5-2b", device=device, mock=False)
+            self.llm = MiniCPMStreaming(model_id="unsloth/Qwen3.5-0.8B-GGUF", api_base=_llm_base, model_name="qwen3.5-2b", device=device, mock=False)
             # If it still ended up in mock due to server not ready, keep it but log
             if getattr(self.llm, 'mock', False):
                 logger.info(f"LLM {LLM_NAME} not ready (llama-server down), using mock fallback — will become real once GGUF downloaded and server up")

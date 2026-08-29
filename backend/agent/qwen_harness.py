@@ -95,43 +95,6 @@ class QwenGetWeather(BaseTool):
         _EMIT.emit({"type": "tool_result", "name": "get_weather", "result": res, "formatted": formatted, "latency_ms": res.get("latency_ms",0), "source": res.get("source","")})
         return formatted
 
-@register_tool('get_extension', allow_overwrite=True)
-class QwenGetExtension(BaseTool):
-    name = 'get_extension'
-    description = '查詢公司通訊錄中某人的分機號碼（支援中文姓名，自動處理拼音/同音字/ASR辨識錯誤的模糊搜尋，100人資料庫）。可選 department 用於消歧義（如 王小明 有多位時，用 研發部/行銷部 區分）。請用此工具查詢任何人的分機，不要用 web_search。'
-    parameters = {
-        'type': 'object',
-        'properties': {
-            'name': {'type': 'string', 'description': '要查詢的人名（中文2-4字，可能有錯字或同音字，如 王小名/汪小明 會自動找到 王小明）'},
-            'department': {'type': 'string', 'description': '可選：部門名稱用於消歧義，如 研發部、行銷部、人資部、財務部、業務部、客服部、設計部', 'nullable': True}
-        },
-        'required': ['name']
-    }
-    def call(self, params, **kwargs):
-        import json as _json
-        if isinstance(params, str):
-            try:
-                d = _json.loads(params)
-                name = d.get('name','') if isinstance(d, dict) else params
-                dept = d.get('department') if isinstance(d, dict) else None
-            except:
-                name = params
-                dept = None
-        else:
-            name = params.get('name','') if isinstance(params, dict) else ''
-            dept = params.get('department') if isinstance(params, dict) else None
-        name = str(name).strip()
-        dept = str(dept).strip() if dept else None
-        _EMIT.emit({"type": "tool_call", "name": "get_extension", "arguments": {"name": name, "department": dept}, "query": name})
-        from tools.contact_db import get_extension
-        res = get_extension(name, dept=dept)
-        msg = res.get("message", "")
-        # Add candidates detail if any
-        if res.get("candidates"):
-            msg += " " + " ".join([f"{c['name']}({c['ext']})" for c in res["candidates"][:3]])
-        _EMIT.emit({"type": "tool_result", "name": "get_extension", "result": res, "formatted": msg, "latency_ms": 5, "source": "contact_db"})
-        return msg
-
 @register_tool('get_current_datetime', allow_overwrite=True)
 class QwenDateTime(BaseTool):
     name = 'get_current_datetime'
@@ -181,8 +144,8 @@ def _make_agent():
     }
     return Assistant(
         llm=llm_cfg,
-        function_list=['web_search', 'get_weather', 'get_current_datetime', 'get_extension'],
-        system_message="You are a helpful voice assistant (zh-TW). For weather use get_weather(location, date). For general search use web_search. For date/time use get_current_datetime. For 任何人的分機/聯絡人/電話查詢 一定要用 get_extension(name)（支援模糊拼音/同音字/ASR錯誤，如 王小名會找到王小明），不要用 web_search。Always answer in the user's language (zh-TW用繁體中文)."
+        function_list=['web_search', 'get_weather', 'get_current_datetime'],
+        system_message="You are a helpful voice assistant. For weather use get_weather(location, date). For general search use web_search. For date/time use get_current_datetime. Always answer in the user's language."
     )
 
 _agent = None
