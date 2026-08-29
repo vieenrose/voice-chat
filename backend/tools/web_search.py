@@ -158,6 +158,12 @@ def _entity_first_query(q: str) -> str:
     m3 = re.search(r"\b(latest|current|recent|breaking)\s+(.+)", ql)
     if "news" in ql or "新闻" in ql or "新聞" in ql:
         # entity-first for news: "big news today in taiwan" -> "Taiwan news today"
+        # known news outlets -> site-targeted (bing honors site:): "cnn headlines" -> site:cnn.com top story
+        _outlet = re.search(r"\b(cnn|bbc|nytimes|nyt|reuters|ap|aljazeera|theguardian|guardian|fox news|fox|msnbc|nhk|abc news|cnbc|bloomberg)\b", ql)
+        if _outlet:
+            _o = _outlet.group(1).lower()
+            cands.insert(0, f"site:{_o}.com top headlines today")
+            cands.insert(0, f"{_o} headlines latest today")
         _loc = re.search(r"\b(taiwan|台灣|台湾|taipei|台北|hong kong|香港|japan|日本|china|中国|中國|france|paris)\b", ql)
         if _loc:
             cands.insert(0, f"{_loc.group(1)} news today")

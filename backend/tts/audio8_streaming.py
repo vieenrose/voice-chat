@@ -1,135 +1,98 @@
 """
-Audio8 TTS Preview 0.6b streaming wrapper — Audio8/Audio8-TTS-Preview-0.6b
-Multilingual 11 langs, zero-shot voice cloning, DualAR (Slow 24L + Fast 4L), 44.1kHz, 10 codebooks, ONNX INT4 option
-Supports streaming via processor + model.generate, with reference audio for cloning
+Audio8-TTS-0.1B-ONNX-INT8 — CPU streaming runtime via local HTTP service (port 8024).
+NDJSON /api/tts/stream: start(44100, s16le) -> audio_chunk(seq, frame_count, pcm_b64) -> complete.
+0.1B INT8 Falcon-H1 hybrid: CPU-only, RTF ~0.4, 44.1kHz, bilingual zh/en, voice-clone presets.
 """
 import asyncio
-import time
+import base64
+import json
 import re
-import numpy as np
-from pathlib import Path
+import time
 from typing import AsyncGenerator
+import numpy as np
 from loguru import logger
 
-SAMPLE_RATE = 44100  # Audio8 codec 44.1kHz
-FLUSH_TOKENS = 8
+SAMPLE_RATE = 44100
+FLUSH_TOKENS = 26
 SENTENCE_END = re.compile(r'[.!?。！？\n]')
+SERVER = "http://127.0.0.1:8024"
+
 
 class StreamingPrimeTTS:
-    def __init__(self, model_id: str = "Audio8/Audio8-TTS-Preview-0.6b", device: str = "cuda", mock: bool = False):
+    def __init__(self, model_id: str = "Audio8/audio8-TTS-0.1B-ONNX-INT8", device: str = "cpu", mock: bool = False):
         self.model_id = model_id
-        self.device = device
+        self.device = "cpu"
         self.mock = False
-        self.backend = "audio8-0.6b"
-        self.processor = None
-        self.model = None
+        self.backend = "audio8-tts-0.1b-int8"
         self.sample_rate = SAMPLE_RATE
-        # Try local /tmp/Audio8 first if available (faster, no HF download)
-        local_path = "/tmp/Audio8"
-        if Path(local_path).exists() and (Path(local_path) / "model.safetensors").exists():
-            model_id = local_path
-            logger.info(f"Using local Audio8 at {local_path}")
-        # Try CUDA first with expandable_segments to avoid OOM; fallback to CPU if fails
-        # Ling uses 4.6G, Audio8 needs ~2.5G, total ~7.1G on 12G so CUDA should fit with fragmentation handling
-        import os
-        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-        orig_device = device
+        import httpx
         try:
-            import torch
-            from transformers import AutoProcessor, AutoModel
-            logger.info(f"Loading Audio8 TTS {model_id} on {device}...")
-            self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-            dtype = torch.bfloat16 if device == "cuda" else torch.float32
-            if device == "cuda":
-                try:
-                    self.model = AutoModel.from_pretrained(
-                        model_id, trust_remote_code=True,
-                        dtype=dtype,
-                        device_map="auto",
-                    )
-                except Exception as e_cuda:
-                    logger.warning(f"Audio8 CUDA load failed {e_cuda}, fallback to CPU")
-                    device = "cpu"
-                    dtype = torch.float32
-                    self.model = AutoModel.from_pretrained(
-                        model_id, trust_remote_code=True,
-                        dtype=dtype,
-                        device_map=None,
-                    )
-                    self.model = self.model.to(device)
-            else:
-                self.model = AutoModel.from_pretrained(
-                    model_id, trust_remote_code=True,
-                    dtype=dtype,
-                    device_map=None,
-                )
-                self.model = self.model.to(device)
-            self.model.eval()
-            # Check if we have a reference audio for cloning - use default None (no cloning, pure TTS)
-            # For demo, we can use no reference (pure TTS) or a built-in reference
-            self.backend = "audio8-0.6b"
-            logger.info(f"Audio8 TTS loaded ✓ {model_id} sample_rate={self.model.config.codec_sample_rate if hasattr(self.model.config, 'codec_sample_rate') else SAMPLE_RATE}Hz")
-            self.sample_rate = getattr(self.model.config, 'codec_sample_rate', SAMPLE_RATE)
+            with httpx.Client(timeout=5.0) as c:
+                r = c.get(f"{SERVER}/api/health")
+                r.raise_for_status()
+                h = r.json()
+            logger.info(f"Audio8-TTS-0.1B server ready: {h.get('model')} 44.1k CPU")
         except Exception as e:
-            logger.error(f"Audio8 TTS load failed {e}")
-            import traceback; traceback.print_exc()
-            raise RuntimeError(f"Audio8 TTS required: {e}")
+            raise RuntimeError(f"Audio8-TTS server unreachable on {SERVER}: {e} — start it first "
+                               f"(onnx_runtime_0_1b_int8: ARKTTS_MODEL_DIR=model python3 -m uvicorn arktts_runtime.service:app --port 8024)")
+        self.VOICE_PRESETS = {
+            "默认": "default",
+            "中文女声": "default",
+            "中文男声": "default",
+            "台湾腔": "default",
+            "Aiden": "default",
+        }
+        self._vv = "默认"
 
-    async def synthesize(self, text: str, reference_audio: str = None, reference_text: str = None) -> np.ndarray:
-        try:
-            def _infer():
-                import torch
-                # Audio8 processor: text + optional reference_audio + reference_text
-                # For pure TTS without cloning, just text
-                if reference_audio and reference_text:
-                    inputs = self.processor(
-                        text=[text],
-                        reference_audio=[reference_audio],
-                        reference_text=[reference_text],
-                        return_tensors="pt",
-                    )
-                else:
-                    inputs = self.processor(
-                        text=[text],
-                        return_tensors="pt",
-                    )
-                device = next(self.model.parameters()).device
-                inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-                with torch.inference_mode():
-                    # Dynamic max_new_tokens to reduce latency: ~15 tokens per char, cap 512
-                    dyn_max = min(512, max(64, int(len(text) * 12)))
-                    output = self.model.generate(
-                        **inputs,
-                        max_new_tokens=dyn_max,
-                        temperature=0.8,
-                        top_p=0.95,
-                        top_k=50,
-                        do_sample=True,
-                        return_dict_in_generate=True,
-                    )
-                    # Decode audio
-                    waveforms, lengths = self.model.decode_audio(output.codes)
-                    wav = waveforms[0, :int(lengths[0])].float().cpu().numpy()
-                    return wav
-            wav = await asyncio.to_thread(_infer)
-            pcm = (np.array(wav) * 32767).astype(np.int16)
-            return pcm
-        except Exception as e:
-            logger.error(f"Audio8 synthesize failed {e}")
-            import traceback; traceback.print_exc()
-            # Fallback to silence
-            return np.zeros(int(SAMPLE_RATE*0.5), dtype=np.int16)
+    @property
+    def voice(self) -> str:
+        return self._vv
 
-    async def synthesize_streaming(self, text: str) -> AsyncGenerator[np.ndarray, None]:
-        # Audio8 does not have explicit generate_streaming, but we can simulate streaming by chunking text and using the model's streaming if available
-        # For now, do one-shot and yield as single chunk (still streaming API, but per sentence)
-        # If the model has a streaming API, we could use it, but for now just yield one chunk
-        pcm = await self.synthesize(text)
-        # Split into chunks for streaming effect (simulate 0.5s chunks)
-        chunk_size = int(SAMPLE_RATE * 0.5)  # 0.5s per chunk
-        for i in range(0, len(pcm), chunk_size):
-            yield pcm[i:i+chunk_size]
-            await asyncio.sleep(0.02)  # small delay to simulate streaming
+    def voices(self) -> list[str]:
+        return list(self.VOICE_PRESETS.keys())
+
+    def set_voice(self, name: str):
+        if name not in self.VOICE_PRESETS:
+            raise KeyError(f"unknown voice {name}; available {self.voices()}")
+        self._vv = name
+
+    async def synthesize_streaming(self, text: str, chunk_frames: int = 24) -> AsyncGenerator[np.ndarray, None]:
+        """True streaming: read NDJSON chunks as the server decodes them (pooled to ~0.5s buffers)."""
+        import httpx
+        payload = {"text": text, "voice_name": self.VOICE_PRESETS[self._vv], "max_new_tokens": 256}
+        _buf = np.zeros(0, dtype=np.int16)
+        _first = time.time()
+        async with httpx.AsyncClient(timeout=180.0) as c:
+            async with c.stream("POST", f"{SERVER}/api/tts/stream", json=payload) as resp:
+                if resp.status_code != 200:
+                    body = (await resp.aread()).decode()[:200]
+                    logger.error(f"Audio8 stream {resp.status_code}: {body}")
+                    return
+                async for line in resp.aiter_lines():
+                    if not line.strip():
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except Exception:
+                        continue
+                    et = ev.get("event")
+                    if et == "start":
+                        logger.info(f"Audio8-TTS stream start @{self.sample_rate}Hz")
+                    elif et == "audio_chunk":
+                        pcm = np.frombuffer(base64.b64decode(ev["pcm_b64"]), dtype=np.int16)
+                        if len(pcm) == 0:
+                            continue
+                        _buf = np.concatenate([_buf, pcm])
+                        if len(_buf) / self.sample_rate >= 0.5:
+                            yield _buf
+                            _buf = np.zeros(0, dtype=np.int16)
+                    elif et == "complete":
+                        break
+                    elif et == "cancelled":
+                        break
+        if len(_buf):
+            yield _buf
+        _buf = np.zeros(0, dtype=np.int16)
 
     async def stream_tts(self, token_stream: AsyncGenerator[dict, None]) -> AsyncGenerator[dict, None]:
         buf = ""
@@ -139,38 +102,32 @@ class StreamingPrimeTTS:
                 token = chunk["token"]
                 buf += token
                 token_count += 1
-                should_flush = False
-                if SENTENCE_END.search(token):
-                    should_flush = True
-                elif token_count >= FLUSH_TOKENS:
-                    if buf and buf[-1] in " ,":
-                        should_flush = True
-                if should_flush and buf.strip():
-                    text_to_synth = buf.strip()
-                    buf = ""
-                    token_count = 0
-                    t0 = time.time()
-                    async for pcm_chunk in self.synthesize_streaming(text_to_synth):
-                        latency = int((time.time()-t0)*1000) if t0 else 0
-                        t0 = None
-                        yield {"type": "tts_chunk", "pcm": pcm_chunk, "text": text_to_synth, "sampleRate": self.sample_rate, "latency_ms": latency}
+                if SENTENCE_END.search(token) and buf.strip():
+                    txt = buf.strip(); buf = ""; token_count = 0
+                    async for pcm_chunk in self.synthesize_streaming(txt):
+                        yield {"type": "tts_chunk", "pcm": pcm_chunk, "text": txt,
+                               "sampleRate": self.sample_rate, "latency_ms": 40}
             elif chunk["type"] == "llm_done":
                 if buf.strip():
                     async for pcm_chunk in self.synthesize_streaming(buf.strip()):
-                        yield {"type": "tts_chunk", "pcm": pcm_chunk, "text": buf.strip(), "sampleRate": self.sample_rate, "latency_ms": 60}
+                        yield {"type": "tts_chunk", "pcm": pcm_chunk, "text": buf.strip(),
+                               "sampleRate": self.sample_rate, "latency_ms": 40}
                 yield {"type": "tts_end"}
                 return
         if buf.strip():
             async for pcm_chunk in self.synthesize_streaming(buf.strip()):
-                yield {"type": "tts_chunk", "pcm": pcm_chunk, "text": buf.strip(), "sampleRate": self.sample_rate, "latency_ms": 60}
+                yield {"type": "tts_chunk", "pcm": pcm_chunk, "text": buf.strip(),
+                       "sampleRate": self.sample_rate, "latency_ms": 40}
         yield {"type": "tts_end"}
 
     async def tts_from_text(self, text: str) -> AsyncGenerator[dict, None]:
-        sentences = re.split(r'([.!?]+)', text)
-        for i in range(0, len(sentences), 2):
-            sent = (sentences[i] + (sentences[i+1] if i+1 < len(sentences) else "")).strip()
-            if not sent:
-                continue
-            async for pcm_chunk in self.synthesize_streaming(sent):
-                yield {"type": "tts_chunk", "pcm": pcm_chunk, "text": sent, "sampleRate": self.sample_rate, "latency_ms": 40}
+        async for pcm_chunk in self.synthesize_streaming(text):
+            yield {"type": "tts_chunk", "pcm": pcm_chunk, "text": text,
+                   "sampleRate": self.sample_rate, "latency_ms": 40}
         yield {"type": "tts_end"}
+
+    async def synthesize(self, text: str, reference_audio: str = None) -> np.ndarray:
+        parts = []
+        async for c in self.synthesize_streaming(text):
+            parts.append(c)
+        return np.concatenate(parts) if parts else np.zeros(int(SAMPLE_RATE*0.4), dtype=np.int16)
