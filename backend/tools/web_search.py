@@ -70,8 +70,8 @@ async def _wttr_weather(query: str) -> Dict | None:
     zh = bool(re.search(r"[\u4e00-\u9fff]", query))
     # Generic: remove common question/weather words to isolate location (language-agnostic, not demo-specific)
     loc = re.sub(r"[，。！？,?!.]+", " ", query)
-    # Remove generic weather/time words (common across languages, not hard-coded locations)
-    loc = re.sub(r"(天气|天氣|气温|氣溫|预报|預報|降雨|如何|怎么样|怎樣|多少|度|呢|啊|吗|weather|forecast|temperature|today|tomorrow|next|week|weekend|how|is|the|what|like|in|at|for|this|a|an|and|of|please|now|right|can|you|tell|me|search|find|about|please)+", " ", loc, flags=re.I)
+    loc = re.sub(r"(天气|天氣|气温|氣溫|预报|預報|降雨|如何|怎么样|怎樣|多少|度|呢|啊|吗)", " ", loc, flags=re.I)
+    loc = re.sub(r"\b(weather|forecast|temperature|today|tomorrow|next|week|weekend|how|is|the|what|like|in|at|for|this|a|an|and|of|please|now|right|can|you|tell|me|search|find|about)\b", " ", loc, flags=re.I)
     loc = re.sub(r"\s+", " ", loc).strip()
     if _is_chinese(query):
         # For Chinese, take last remaining Chinese chunk as location
@@ -281,31 +281,23 @@ def _relevance_score(query: str, results: List[Dict]) -> float:
     score = hits / min(3, len(results))
     return score
 
-_GRANITE_MODEL = None
-def _get_granite():
-    global _GRANITE_MODEL
-    if _GRANITE_MODEL is None:
-        from sentence_transformers import SentenceTransformer
-        import torch
-        _device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        _GRANITE_MODEL = SentenceTransformer('/tmp/granite-emb', device=_device)
-        logger.info(f"Granite embedding loaded on {_device} (384d, multilingual)")
-    return _GRANITE_MODEL
+EMBED_URL = "http://127.0.0.1:11434/v1/embeddings"
+EMBED_MODEL = "granite-embedding"
 
 async def _embed_batch(texts: List[str]) -> List[List[float]]:
-    """Batch embed via granite-embedding-97m-multilingual-r2 (local, 384d, zh-TW+en)."""
+    """Batch embed via granite-97m Q8 GGUF on :11434 (115MB, 384d, zh-TW+en, CUDA)."""
     if not texts:
         return []
     try:
-        model = await asyncio.to_thread(_get_granite)
-        embs = await asyncio.to_thread(model.encode, texts, normalize_embeddings=True, convert_to_numpy=True)
-        # embs is np array (n, dim)
-        if hasattr(embs, 'tolist'):
-            return embs.tolist()
-        return [e.tolist() if hasattr(e, 'tolist') else list(e) for e in embs]
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.post(EMBED_URL, json={"model": EMBED_MODEL, "input": texts})
+            if resp.status_code == 200:
+                data = resp.json()
+                items = sorted(data.get("data", []), key=lambda x: x.get("index", 0))
+                return [it["embedding"] for it in items if "embedding" in it]
     except Exception as e:
         logger.debug(f"granite embed failed {e}")
-        return []
+    return []
 
 def _cosine(a: List[float], b: List[float]) -> float:
     import math

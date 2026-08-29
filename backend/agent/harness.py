@@ -21,7 +21,7 @@ from smolagents import Tool, ToolCallingAgent, OpenAIServerModel
 
 API_BASE = "http://127.0.0.1:11435/v1"
 MODEL_ID = "qwen3.5-2b"
-MAX_STEPS = 3
+MAX_STEPS = 2  # voice: 1 tool + final answer; keeps e2e <4s
 
 
 class GraniteModel(OpenAIServerModel):
@@ -74,7 +74,7 @@ _EMIT = _EventEmitter()
 
 class WebSearchTool(Tool):
     name = "web_search"
-    description = "Search the web for current info (weather, news, facts, people, definitions). Returns ranked results with snippets."
+    description = "Search the web for current info (news, facts, people, definitions). For weather, use get_weather instead."
     inputs = {
         "query": {"type": "string", "description": "search query 3-8 words (or JSON list of queries for parallel search)"},
         "count": {"type": "integer", "description": "number of results", "nullable": True, "default": 5},
@@ -82,6 +82,9 @@ class WebSearchTool(Tool):
     output_type = "string"
 
     def forward(self, query: str, count: int = 5) -> str:
+        # Enforce get_weather for weather queries
+        if any(w in query.lower() for w in ["weather", "forecast", "temperature", "天气", "天氣", "气温", "降雨"]):
+            return "ERROR: Use get_weather(location, date) for weather queries, not web_search."
         from tools.web_search import web_search_sync, format_results
         import json as _json
         # Apodex-style multi-query: accept JSON list or single string
@@ -127,6 +130,29 @@ class WebSearchTool(Tool):
         return formatted
 
 
+class GetWeatherTool(Tool):
+    name = "get_weather"
+    description = "Get weather forecast for ANY weather question. You MUST use this for weather, not web_search. Provide location and date."
+    inputs = {
+        "location": {"type": "string", "description": "city or location, e.g. 'Paris', '台中', 'Tokyo'"},
+        "date": {"type": "string", "description": "today, tomorrow, or day_after_tomorrow", "nullable": True, "default": "today"}
+    }
+    output_type = "string"
+
+    def forward(self, location: str, date: str = "today") -> str:
+        from tools.web_search import web_search_sync, format_results
+        # Normalize date -> query phrase for wttr day selection
+        date_map = {"today": "", "tomorrow": "明天", "day_after_tomorrow": "後天"}
+        dphrase = date_map.get(date, "")
+        q = f"{location} {dphrase} 天气".strip() if any('\u4e00' <= c <= '\u9fff' for c in location) else f"weather in {location} {date}".strip()
+        _EMIT.emit({"type": "tool_call", "name": "get_weather", "arguments": {"location": location, "date": date}, "query": q})
+        t0 = time.time()
+        # Directly call web_search which already handles wttr.in for weather queries
+        res = web_search_sync(q, count=5)
+        formatted = format_results(res.get("results", [])) if res.get("results") else "No weather data"
+        _EMIT.emit({"type": "tool_result", "name": "get_weather", "result": res, "formatted": formatted, "latency_ms": int((time.time()-t0)*1000), "source": res.get("source","")})
+        return formatted
+
 class DateTimeTool(Tool):
     name = "get_current_datetime"
     description = "Get the current date and time (UTC). Use ONLY for questions about what day/date/time it is (星期几/几号/几点/what day/date). NEVER for weather."
@@ -159,9 +185,16 @@ class _Agent:
         self.model = GraniteModel(model_id=MODEL_ID, api_base=API_BASE, api_key="none",
                                   temperature=1.0, top_p=0.95,
                                   chat_template_kwargs={"enable_thinking": False})
-        self.agent = ToolCallingAgent(tools=[WebSearchTool(), DateTimeTool()], model=self.model, max_steps=MAX_STEPS, verbosity_level=0, add_base_tools=False, instructions="CRITICAL: When the user says 'Search ...' or asks for latest/current information (news, weather, facts), you MUST call web_search with the exact query. Never answer from memory for search requests. For greetings, respond directly. For date/time questions, use get_current_datetime.")
+        self.agent = ToolCallingAgent(tools=[WebSearchTool(), GetWeatherTool(), DateTimeTool()], model=self.model, max_steps=MAX_STEPS, verbosity_level=0, add_base_tools=False, instructions="CRITICAL: For weather use get_weather(location, date) — never web_search. For general search use web_search. For date/time use get_current_datetime. When user says 'Search ...' call web_search. For greetings respond directly.")
 
     def run(self, task: str) -> str:
+        # Fast path for plain greetings - check only the current question, not the full history-wrapped task
+        import re
+        m = re.search(r"Current question:\s*(.*)", task, re.S)
+        _cur = m.group(1).strip() if m else task.strip()
+        _tl = _cur.lower()
+        if re.match(r'^\s*(hi|hello|hey|你好|您好|hola|bonjour)\b', _tl, re.I) and len(_tl) < 50 and not re.search(r'(weather|news|search|find|what is|who is|how|can you|please|today|tomorrow|星期|几号|天气|新闻)', _tl, re.I):
+            return "Hello! How can I help you today?" if not re.search(r'[\u4e00-\u9fff]', _cur) else "你好！有什么可以帮你的？"
         out = self.agent.run(task, reset=True)
         return out if isinstance(out, str) else (out.final_answer if hasattr(out, "final_answer") else str(out))
 

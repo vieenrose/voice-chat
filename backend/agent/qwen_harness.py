@@ -52,6 +52,34 @@ class QwenWebSearch(BaseTool):
         _EMIT.emit({"type": "tool_result", "name": "web_search", "result": res, "formatted": formatted, "latency_ms": res.get("latency_ms", 0), "source": res.get("source","")})
         return formatted
 
+@register_tool('get_weather', allow_overwrite=True)
+class QwenGetWeather(BaseTool):
+    name = 'get_weather'
+    description = 'Get weather forecast for a location (today/tomorrow/day_after_tomorrow). Wraps wttr.in + SearXNG.'
+    parameters = {
+        'type': 'object',
+        'properties': {
+            'location': {'type': 'string', 'description': "city, e.g. 'Paris', '台中'"},
+            'date': {'type': 'string', 'description': 'today, tomorrow, or day_after_tomorrow'}
+        },
+        'required': ['location']
+    }
+    def call(self, params, **kwargs):
+        import json
+        if isinstance(params, str):
+            try: params = json.loads(params)
+            except: params = {}
+        loc = params.get('location','') if isinstance(params, dict) else ''
+        date = params.get('date','today') if isinstance(params, dict) else 'today'
+        dmap = {'today':'', 'tomorrow':'明天', 'day_after_tomorrow':'後天'}
+        q = f"{loc} {dmap.get(date,'')} 天气".strip() if any('\u4e00' <= c <= '\u9fff' for c in loc) else f"weather in {loc} {date}".strip()
+        _EMIT.emit({"type": "tool_call", "name": "get_weather", "arguments": {"location": loc, "date": date}, "query": q})
+        from tools.web_search import web_search_sync, format_results
+        res = web_search_sync(q, count=5)
+        formatted = format_results(res.get("results", [])) if res.get("results") else "No weather data"
+        _EMIT.emit({"type": "tool_result", "name": "get_weather", "result": res, "formatted": formatted, "latency_ms": res.get("latency_ms",0), "source": res.get("source","")})
+        return formatted
+
 @register_tool('get_current_datetime', allow_overwrite=True)
 class QwenDateTime(BaseTool):
     name = 'get_current_datetime'
@@ -91,13 +119,12 @@ def _make_agent():
             'max_tokens': 256,
             'temperature': 0.7,
             'top_p': 0.9,
-            'chat_template_kwargs': {'enable_thinking': False}
         }
     }
     return Assistant(
         llm=llm_cfg,
-        function_list=['web_search', 'get_current_datetime'],
-        system_message="You are a helpful voice assistant. Be concise and natural. For weather/news/facts, call web_search. For date/time, call get_current_datetime. Always answer in the user's language."
+        function_list=['web_search', 'get_weather', 'get_current_datetime'],
+        system_message="You are a helpful voice assistant. For weather use get_weather(location, date). For general search use web_search. For date/time use get_current_datetime. When user says 'Search ...' call web_search. Always answer in the user's language."
     )
 
 _agent = None
