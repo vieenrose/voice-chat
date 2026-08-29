@@ -121,24 +121,25 @@ _PINYIN_TO_CONTACTS = {}  # pinyin -> list
 for c in CONTACTS:
     _PINYIN_TO_CONTACTS.setdefault(c["pinyin"], []).append(c)
 
-def _to_pinyin(text: str) -> str:
-    """Convert zh to pinyin using pypinyin if available, else fallback to stored mapping or simple."""
-    # Try pypinyin
+def _to_bopomofo(text: str) -> str:
+    """Convert zh to bopomofo (zhuyin) using pypinyin Style.BOPOMOFO, fallback to char map. Bopomofo is zh-TW standard (ㄅㄆㄇㄈ), better than pinyin for TW ASR."""
     try:
-        from pypinyin import lazy_pinyin
-        # For query, convert each char
-        pys = lazy_pinyin(text)
-        return " ".join(pys).lower()
+        from pypinyin import pinyin, Style
+        # BOPOMOFO includes tone marks, e.g. 王->ㄨㄤˊ, 小->ㄒㄧㄠˇ, 明->ㄇㄧㄥˊ
+        pys = pinyin(text, style=Style.BOPOMOFO, errors='ignore')
+        # pys is List[List[str]], flatten and join with space
+        flat = [item[0] for sub in pys for item in [sub] if sub]
+        return " ".join(flat)
     except:
         pass
-    # Fallback: try to find in CONTACTS pinyin map via char lookup (simple)
-    # Build char -> pinyin from CONTACTS
+    # Fallback: char -> bopomofo via CONTACTS bopomofo map (if pypinyin not available)
     char_map = {}
     for c in CONTACTS:
+        # CONTACTS stores pinyin, not bopomofo, so fallback to pinyin as last resort
         for ch, py in zip(c["name"], c["pinyin"].split()):
             char_map[ch] = py
     pys = [char_map.get(ch, ch) for ch in text]
-    return " ".join(pys).lower()
+    return " ".join(pys)
 
 def _similarity(a: str, b: str) -> float:
     """Phonetic similarity 0..1 using rapidfuzz if available, else difflib."""
@@ -184,20 +185,23 @@ def find_contact(query: str, top_k: int = 3, threshold: float = 0.65) -> List[Tu
                 if name not in seen:
                     best.append((contact, 0.95))
                     seen.add(name)
-        # 3. Pinyin fuzzy
-        q_pinyin = _to_pinyin(q)
+        # 3. Bopomofo fuzzy (zh-TW zhuyin, handles ASR homophones better than pinyin)
+        q_bpmf = _to_bopomofo(q)
         for contact in CONTACTS:
             name = contact["name"]
             if name in seen and any(s > 0.9 for _, s in best if _ == contact):
                 continue
-            c_pinyin = contact["pinyin"]
+            # Cache bopomofo per contact (compute once)
+            if "bopomofo" not in contact:
+                contact["bopomofo"] = _to_bopomofo(name)
+            c_bpmf = contact["bopomofo"]
             # Character-level Jaccard + pinyin similarity
             # Char similarity
             import difflib
             char_sim = difflib.SequenceMatcher(None, q, name).ratio()
-            pinyin_sim = _similarity(q_pinyin, c_pinyin)
-            # Weighted: pinyin more important for ASR errors (homophones)
-            score = 0.4 * char_sim + 0.6 * pinyin_sim
+            bpmf_sim = _similarity(q_bpmf, c_bpmf)
+            # Weighted: bopomofo more important for TW ASR homophones (ㄨㄤˊ vs ㄨㄤˋ tone, ㄔㄣˊ vs ㄔㄥˊ)
+            score = 0.35 * char_sim + 0.65 * bpmf_sim
             # Boost if pinyin edit distance 1 (tone confusion etc.)
             if score >= threshold and name not in seen:
                 best.append((contact, score))
