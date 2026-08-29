@@ -265,7 +265,13 @@ class LingStreaming:
         """SMOLAGENTS-driven agent loop: model plans + calls tools (web_search / get_current_datetime)
         for up to MAX_STEPS, then produces the final answer. Legacy inline loop kept as fallback."""
         try:
-            from agent.harness import run_agent_task
+            try:
+                from agent.qwen_harness import run_agent_task
+            except ImportError:
+                try:
+                    from agent.pydantic_harness import run_agent_task
+                except ImportError:
+                    from agent.harness import run_agent_task
             _HARNESS = True
         except Exception as e:
             logger.warning(f"smolagents harness unavailable ({e}) -> legacy loop")

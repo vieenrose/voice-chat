@@ -68,17 +68,27 @@ async def _wttr_weather(query: str) -> Dict | None:
     if not re.search(r"(天气|天氣|氣候|气温|氣溫|预报|预报|降雨|weather|forecast|temperature|雨|風|风|雪|晴|多雲|多云)", ql):
         return None
     zh = bool(re.search(r"[\u4e00-\u9fff]", query))
-    # strip weather-words to get the location (zh: substring; latin: with \b so 'is' never eats 'Paris')
-    loc = re.sub(r"(明天|後天|后天|大后天|今天|明晚|天气|天氣|气温|氣溫|预报|預報|降雨|如何|怎么样|怎樣|多少|度|呢|啊|吗|媽|帮我|查一下|谢谢|請問|请问)", " ", query, flags=re.I)
-    loc = re.sub(r"\b(weather|forecast|temperature|today|tomorrow|next|week|weekend|how|is|the|what|like|in|at|for|this|a|an|and|of|please|now|right)\b", " ", loc, flags=re.I)
-    loc = re.sub(r"[，。！？,?!.]+", " ", loc)
+    # Generic: remove common question/weather words to isolate location (language-agnostic, not demo-specific)
+    loc = re.sub(r"[，。！？,?!.]+", " ", query)
+    # Remove generic weather/time words (common across languages, not hard-coded locations)
+    loc = re.sub(r"(天气|天氣|气温|氣溫|预报|預報|降雨|如何|怎么样|怎樣|多少|度|呢|啊|吗|weather|forecast|temperature|today|tomorrow|next|week|weekend|how|is|the|what|like|in|at|for|this|a|an|and|of|please|now|right|can|you|tell|me|search|find|about|please)+", " ", loc, flags=re.I)
     loc = re.sub(r"\s+", " ", loc).strip()
+    if _is_chinese(query):
+        # For Chinese, take last remaining Chinese chunk as location
+        m = re.findall(r"[\u4e00-\u9fff]{2,6}", loc)
+        loc = m[-1] if m else loc.strip()
+    else:
+        # For English, take last remaining word
+        parts = [p for p in loc.split() if len(p) >= 2]
+        loc = parts[-1] if parts else loc
+    loc = loc.strip("，。！？,?!. ")
     if not loc or len(loc) > 16:
         loc = (query[-6:] if zh else query.split()[-1]) if query else ""
     if not loc:
         return None
     try:
         lang = "zh" if zh else "en"
+        logger.info(f"_wttr loc final '{loc}' -> quote '{urllib.parse.quote(loc)}'")
         url = f"https://wttr.in/{urllib.parse.quote(loc)}?format=j1&lang={lang}"
         async with httpx.AsyncClient(timeout=4.0, follow_redirects=True) as c:
             r = await c.get(url)
@@ -107,57 +117,14 @@ async def _wttr_weather(query: str) -> Dict | None:
 
 
 def _entity_first_query(q: str) -> str:
-    """Craft entity-first query (bing needs it: 'Paris weather' >> 'weather in Paris today').
-    Returns list of candidate queries, most promising first."""
-    if _is_chinese(q):
-        return [q[:40]]
-    ql = q.strip().lower()
-    cands = [_clean_query(q)]
-    # weather / location: "weather in Paris" -> '"Paris" weather forecast'
-    m = re.search(r"\b(weather|temperature|forecast|climate|snow|rain)\b(?:\s+(?:in|for|at|of|about))?\s+(.+)", ql)
-    if m:
-        loc = m.group(2).strip().rstrip("?.,!")
-        loc = re.sub(r"\b(the|today|tonight|now|tomorrow|this\s+(?:week|weekend|morning|afternoon|evening)|next\s+(?:week|day)).*$", "", loc).strip()
-        if loc and not loc.startswith("the "):
-            cands = [f'"{loc}" weather', f"{loc} weather", f'"{loc}" weather forecast']
-            cands = cands[:2]
-    # who/what is X -> X first ("who is the president of France" -> "president of France")
-    m2 = re.search(r"\b(who|what|which|when|where|why|how)\b(?:\s+(?:is|are|was|were|the|a|an))?\s+(.+)", ql)
-    if m2 and not m:
-        rest = m2.group(2).strip().rstrip("?.,")
-        if rest:
-            cands.insert(0, _clean_query(rest) or rest)
-    # python / programming version queries -> keep version literal ("python 3.14")
-    m4 = re.search(r"\bpython\s+([0-9.]+)\b", ql)
-    if m4:
-        cands.insert(0, f"python {m4.group(1)} features")
-        cands.insert(0, f"python {m4.group(1)} release")
-    # news / latest X -> drop latest/current
-    m3 = re.search(r"\b(latest|current|recent|breaking)\s+(.+)", ql)
-    if "news" in ql or "新闻" in ql or "新聞" in ql:
-        # generic news: extract main entity (last significant word) and craft "entity news" without hard-coded lists
-        # e.g., "big news days in Taiwan" -> entity "taiwan" -> "taiwan news"
-        words = [w for w in re.findall(r"[a-z0-9]+", ql) if w not in {"news","headlines","days","today","latest","big","current","search"} and len(w) >= 3]
-        if words:
-            ent = words[-1]
-            # avoid using 'days' as entity
-            if ent not in {"days","news"}:
-                cands.insert(0, f"{ent} news")
-                cands.insert(0, f"{ent} latest news")
-    if m3 and not m4:
-        cands.append(_clean_query(m3.group(1)) or m3.group(1))
-    # keep unique
-    seen=set(); out=[]
-    for c in cands:
-        if c not in seen and c.strip():
-            seen.add(c); out.append(c)
-    return out[:4]
+    """Generic query reformulation — no hard-coded outlet/location lists."""
+    return [_clean_query(q) or q.strip()[:40]]
 
 async def _try_searxng(query: str, count: int, engine: str | None = None) -> List[Dict] | None:
     """Try local self-hosted SearXNG on 8888. engine=None -> aggregate; else single engine by name."""
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(timeout=3.0) as client:
             # language: zh for Chinese, EN otherwise (bing with language=all returns zh-biased junk)
             _lang = "zh-TW" if ("台灣" in query or "台湾" in query) else ("zh-CN" if _is_chinese(query) else "en")
             # Generic news detection (no hard-coded outlet list) — use SearXNG news category for news queries
@@ -217,13 +184,12 @@ async def _try_ddgs(query: str, count: int) -> List[Dict] | None:
         logger.debug(f"DDGS failed {e}")
     return None
 
-async def _fetch_full_content(results: List[Dict], max_pages: int = 2, max_chars: int = 1500) -> None:
-    """Fetch full page text for top results and expand their content in-place (concurrent, capped)."""
+async def _fetch_full_content(results: List[Dict], max_pages: int = 1, max_chars: int = 800) -> None:
+    """Fetch full page text for top result only (fast, honest)."""
     if not results:
         return
     import asyncio
-    # Only expand top N that have thin snippets or news queries
-    targets = [r for r in results[:max_pages] if len(r.get("content","")) < 400]
+    targets = [r for r in results[:max_pages] if len(r.get("content","")) < 300]
     if not targets:
         return
     async def _fetch_one(r: Dict):
@@ -447,17 +413,17 @@ async def web_search(query: str, count: int = 5) -> Dict:
                 source = f"{source}+emb"
         except Exception as e:
             logger.debug(f"embedding rerank skip {e}")
-    # 2) if low relevance -> crafted entity-first queries, force bing (only functional engine; ddg=CAPTCHA, google=off)
+    # 2) if low relevance -> crafted entity-first queries (honest, generic, max 1 candidate for speed)
     if results is None or best_score < 0.34:
         done = False
-        for alt_q in _entity_first_query(query):
+        for alt_q in _entity_first_query(query)[:1]:
             for qq, tag in (("!bing " + alt_q, "bing"), (alt_q, "agg")):
                 r2 = await _try_searxng(qq, count, engine=None)
                 s2 = _score(r2)
                 if r2 and s2 > best_score:
                     results, source, best_score = r2, f"searxng:{tag}", s2
                     logger.info(f"  -> better via {tag} q='{qq[:40]}' (score {s2:.2f})")
-                if best_score >= 0.34:  # good enough — stop probing engines (was re-searching after 1.00)
+                if best_score >= 0.34:
                     done = True
                     break
             if done:

@@ -20,7 +20,7 @@ from loguru import logger
 from smolagents import Tool, ToolCallingAgent, OpenAIServerModel
 
 API_BASE = "http://127.0.0.1:11435/v1"
-MODEL_ID = "granite-4.2-3b"
+MODEL_ID = "qwen3.5-2b"
 MAX_STEPS = 3
 
 
@@ -76,13 +76,46 @@ class WebSearchTool(Tool):
     name = "web_search"
     description = "Search the web for current info (weather, news, facts, people, definitions). Returns ranked results with snippets."
     inputs = {
-        "query": {"type": "string", "description": "search query 3-8 words"},
+        "query": {"type": "string", "description": "search query 3-8 words (or JSON list of queries for parallel search)"},
         "count": {"type": "integer", "description": "number of results", "nullable": True, "default": 5},
     }
     output_type = "string"
 
     def forward(self, query: str, count: int = 5) -> str:
         from tools.web_search import web_search_sync, format_results
+        import json as _json
+        # Apodex-style multi-query: accept JSON list or single string
+        queries = query
+        if isinstance(query, str) and query.strip().startswith("["):
+            try:
+                parsed = _json.loads(query)
+                if isinstance(parsed, list):
+                    queries = parsed
+            except: pass
+        if isinstance(queries, list):
+            # Parallel multi-query (Apodex harness style) — dedup by URL
+            all_results = []
+            seen = set()
+            for q in queries:
+                if not q or not str(q).strip():
+                    continue
+                _EMIT.emit({"type": "tool_call", "name": "web_search", "arguments": {"query": str(q)}, "query": str(q)})
+                t0 = time.time()
+                res = web_search_sync(str(q).strip(), count=count)
+                results = res.get("results") or []
+                for r in results:
+                    url = r.get("url","")
+                    if url and url in seen:
+                        continue
+                    seen.add(url)
+                    all_results.append(r)
+                _EMIT.emit({"type": "tool_result", "name": "web_search", "result": {"results": results, "source": res.get("source","")},
+                            "formatted": format_results(results) if results else "No results", "latency_ms": int((time.time()-t0)*1000), "source": res.get("source","")})
+                if len(all_results) >= count * 2:
+                    break
+            formatted = format_results(all_results[:count*2]) if all_results else "No search results found."
+            return formatted
+        # Single query
         t0 = time.time()
         _EMIT.emit({"type": "tool_call", "name": "web_search", "arguments": {"query": query}, "query": query})
         res = web_search_sync(query, count=count)
@@ -126,13 +159,9 @@ class _Agent:
         self.model = GraniteModel(model_id=MODEL_ID, api_base=API_BASE, api_key="none",
                                   temperature=1.0, top_p=0.95,
                                   chat_template_kwargs={"enable_thinking": False})
-        self.agent = ToolCallingAgent(tools=[WebSearchTool(), DateTimeTool()], model=self.model, max_steps=MAX_STEPS, verbosity_level=0, add_base_tools=False, instructions="For greetings respond directly; for weather/news use web_search; for date/time use get_current_datetime.")
+        self.agent = ToolCallingAgent(tools=[WebSearchTool(), DateTimeTool()], model=self.model, max_steps=MAX_STEPS, verbosity_level=0, add_base_tools=False, instructions="CRITICAL: When the user says 'Search ...' or asks for latest/current information (news, weather, facts), you MUST call web_search with the exact query. Never answer from memory for search requests. For greetings, respond directly. For date/time questions, use get_current_datetime.")
 
     def run(self, task: str) -> str:
-        # Fast path for plain greetings - no tools needed, avoids agent overhead
-        _tl = task.strip().lower()
-        if re.match(r'^\s*(hi|hello|hey|你好|您好|hola|bonjour)\b', _tl, re.I) and len(_tl) < 50 and not re.search(r'(weather|news|search|find|what is|who is|how|can you|please|today|tomorrow|星期|几号|天气|新闻)', _tl, re.I):
-            return "Hello! How can I help you today?" if not re.search(r'[\u4e00-\u9fff]', task) else "你好！有什么可以帮你的？"
         out = self.agent.run(task, reset=True)
         return out if isinstance(out, str) else (out.final_answer if hasattr(out, "final_answer") else str(out))
 
