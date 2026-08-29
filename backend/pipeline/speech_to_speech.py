@@ -144,7 +144,7 @@ class HFSpeechToSpeechPipeline:
         try:
             import os
             _llm_base = os.getenv("LLM_API_BASE", "http://127.0.0.1:11435/v1")
-            self.llm = MiniCPMStreaming(model_id="unsloth/Qwen3.5-0.8B-GGUF", api_base=_llm_base, model_name="qwen3.5-0.8b", device=device, mock=False)
+            self.llm = MiniCPMStreaming(model_id="unsloth/Qwen3.5-2B-GGUF", api_base=_llm_base, model_name="qwen3.5-2b", device=device, mock=False)
             # If it still ended up in mock due to server not ready, keep it but log
             if getattr(self.llm, 'mock', False):
                 logger.info(f"LLM {LLM_NAME} not ready (llama-server down), using mock fallback — will become real once GGUF downloaded and server up")

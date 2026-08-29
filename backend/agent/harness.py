@@ -21,7 +21,7 @@ from smolagents import Tool, ToolCallingAgent, OpenAIServerModel
 
 import os
 API_BASE = os.getenv("LLM_API_BASE", "http://127.0.0.1:11435/v1")
-MODEL_ID = os.getenv("LLM_MODEL_ID", "qwen3.5-0.8b")
+MODEL_ID = os.getenv("LLM_MODEL_ID", "qwen3.5-2b")
 MAX_STEPS = 2  # voice: 1 tool + final answer; keeps e2e <4s
 
 
