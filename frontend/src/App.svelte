@@ -237,7 +237,7 @@
       <div class="logo">🎙️</div>
       <div style="min-width:0">
         <div class="title">Voice Chat</div>
-        <div class="subtitle">X-ASR · Qwen3.5-2B · Qwen3-TTS · smolagents</div>
+        <div class="subtitle">X-ASR · Qwen3.5-2B Q4 · Granite-97M Q8 (CUDA) · Qwen3-TTS · Qwen-Agent</div>
       </div>
     </div>
     <div class="header-actions">
@@ -286,8 +286,8 @@
       <div class="card">
         <h3>Stack</h3>
         <div style="font-size:12px; line-height:1.6; opacity:0.85">
-          <div><b>STT</b> X-ASR sherpa 160ms · <b>LLM</b> Qwen3.5-2B · <b>Agent</b> smolagents · <b>TTS</b> Qwen3-TTS Q8 24k</div>
-          <div class="subtle">SearXNG + wttr.in · Tools: web_search · get_weather · get_current_datetime · honest search</div>
+          <div><b>STT</b> X-ASR 160ms (16k, zh+en) · <b>LLM</b> Qwen3.5-2B Q4 · <b>Embed</b> Granite-97M Q8 (CUDA, 384d) · <b>TTS</b> Qwen3-TTS 0.6B Q8_0 24kHz</div>
+          <div class="subtle">Agent <b>Qwen-Agent</b> (3 tools) · SearXNG self-host (general) + wttr.in + Bing fallback · Tools: web_search · get_weather · get_current_datetime · honest (no curated mocks)</div>
         </div>
       </div>
     </div>
@@ -328,6 +328,6 @@
   </div>
 
   <div style="text-align:center; font-size:11px; opacity:0.4; margin-top:16px">
-    Silero VAD · X-ASR · Qwen3.5-2B · Qwen3-TTS · <a href="https://github.com/vieenrose/voice-chat" style="color:inherit">GitHub</a>
+    Silero VAD · X-ASR · Qwen3.5-2B Q4 · Granite-97M Q8 · Qwen3-TTS · Qwen-Agent · <a href="https://github.com/vieenrose/voice-chat" style="color:inherit">GitHub</a>
   </div>
 </div>
