@@ -60,7 +60,7 @@ TOOL_DEFS = [
     }
 ]
 
-SYSTEM_PROMPT = "You are a helpful voice assistant with web search. Keep replies concise, conversational, under 80 words, speak naturally for voice chat. For ANY question about current events, news, weather, real-time info, or specific regional events (e.g., '今天台湾有什么重大事件', 'latest news'), you MUST use web_search tool to get the latest information — never refuse or say you cannot provide real-time info. Use search results to answer. For questions about today's date, weekday, or current time (今天/星期几/几点), you MUST call the get_current_datetime tool instead of guessing. For ANY weather/forecast question (including 明天/後天/next week) you MUST call web_search — the search engine returns the forecast for the requested day, so do NOT call get_current_datetime for weather. For date/time questions call get_current_datetime. When both are needed, call both in the same turn. Always answer using the tool RESULTS verbatim (weekday, date, temperatures) — never from memory. Always respond in the user's language (Chinese for Chinese queries, English for English queries). IMPORTANT: when the web_search tool results contain the answer (weather numbers, news headlines, dates), quote them directly and answer confidently — never claim the results lack information that they actually contain."
+SYSTEM_PROMPT = "You are a helpful voice assistant with web search. Keep replies concise, conversational, under 80 words, speak naturally for voice chat. For ANY question about current events, news, weather, real-time info, or specific regional events (e.g., '今天台湾有什么重大事件', 'latest news'), you MUST use web_search tool to get the latest information — never refuse or say you cannot provide real-time info. Use search results to answer. For questions about today's date, weekday, or current time (今天/星期几/几点), you MUST call the get_current_datetime tool instead of guessing. For ANY weather/forecast question (including 明天/後天/next week) you MUST call web_search — the search engine returns the forecast for the requested day, so do NOT call get_current_datetime for weather. For date/time questions call get_current_datetime. When both are needed, call both in the same turn. Always answer using the tool RESULTS verbatim (weekday, date, temperatures) — never from memory. Always respond in the user's language (Chinese for Chinese queries, English for English queries). IMPORTANT: when the web_search tool results contain the answer (weather numbers, news headlines, dates), quote them directly and answer confidently — never claim the results lack information that they actually contain. When asked for news, list 2-3 concrete recent headlines/events from the results with brief detail; interpret loose phrasing generously (e.g. 'big news' = latest major news) instead of saying no such thing exists."
 
 # Heuristic for fast tool trigger — bilingual (en/zh) - includes Chinese triggers for Taiwan/news
 # (heuristic removed — tool calls are model-driven/native only)
@@ -100,8 +100,8 @@ class LingStreaming:
             "model": self.model_name,
             "messages": messages,
             "stream": True,
-            "temperature": 0.7,
-            "top_p": 0.9,
+            "temperature": 1.0,
+            "top_p": 0.95,
             "max_tokens": max_tokens,
             "chat_template_kwargs": {"enable_thinking": False},
         }
@@ -391,7 +391,7 @@ class LingStreaming:
         _zh2 = any('\u4e00' <= c <= '\u9fff' for c in prompt or "")
         final_messages = messages + [{"role": "user", "content":
             ("根据上面的搜索结果，用简体中文直接回答用户的最后问题，一两句话即可，不要调用任何工具。" if _zh2 else
-             "Based on the search results above, answer the user's last question directly in one or two spoken sentences. Do NOT call any tools.")}]
+             "Based on the search results above, answer the user's last question directly in one or two spoken sentences. If the user asked for news or the latest info, list 2-3 concrete items from the results — never say you lack information when the results contain it. Do NOT call any tools.")}]
         final_text = ""
         try:
             async for ev in self._chat_stream(final_messages, tools=None, max_tokens=min(max_new_tokens, 192)):
