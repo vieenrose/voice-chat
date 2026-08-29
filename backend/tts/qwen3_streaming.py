@@ -27,7 +27,7 @@ class StreamingPrimeTTS:
         self.runtime = None
         self.sample_rate = SAMPLE_RATE
         self.speaker = "Aiden"
-        # --- load GGML model (CustomVoice Q8_0, 924MB -> STABLE + 9 built-in speakers; Q4_K_M + Base-clone unstable on this qwentts build) ---
+        # --- load GGML model (0.6B CustomVoice Q8_0, 924M -> STABLE + 9 built-in speakers; 1.7B cstr Q8_0 2.04G has arch mismatch qwen3tts vs qwen3-tts, needs reconvert) ---
         talker = Path("/tmp/qwen3_tts/talker_cv_q8.gguf")
         codec = Path("/tmp/qwen3_tts/codec.gguf")
         if not talker.exists() or not codec.exists():

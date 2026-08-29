@@ -250,7 +250,7 @@
       <div class="logo">🎙️</div>
       <div style="min-width:0">
         <div class="title">Voice Chat</div>
-        <div class="subtitle">X-ASR-int8 · Qwen3.5-2B Q4 · Granite-97M Q8 (CUDA) · Qwen3-TTS · Qwen-Agent</div>
+        <div class="subtitle">X-ASR-int8 · Qwen3.5-2B Q4 · Granite-97M Q8 (CUDA) · Qwen3-TTS 0.6B Q8_0 · Qwen-Agent</div>
       </div>
     </div>
     <div class="header-actions">
