@@ -163,6 +163,23 @@ class GetWeatherTool(Tool):
         _EMIT.emit({"type": "tool_result", "name": "get_weather", "result": res, "formatted": formatted, "latency_ms": int((time.time()-t0)*1000), "source": res.get("source","")})
         return formatted
 
+class GetExtensionTool(Tool):
+    name = "get_extension"
+    description = "查詢公司通訊錄中某人的分機號碼（100人，zh-TW，支援拼音/同音字/ASR模糊搜尋）。任何查分機/聯絡人/電話的問題都必須用此工具，不要用 web_search。"
+    inputs = {
+        "name": {"type": "string", "description": "人名（中文2-4字，可能有錯字/同音字，例 王小名會找到王小明）"},
+    }
+    output_type = "string"
+    def forward(self, name: str) -> str:
+        from tools.contact_db import get_extension
+        _EMIT.emit({"type": "tool_call", "name": "get_extension", "arguments": {"name": name}, "query": name})
+        res = get_extension(name)
+        msg = res.get("message", "")
+        if res.get("candidates"):
+            msg += " " + " ".join([f"{c['name']}({c['ext']})" for c in res["candidates"][:3]])
+        _EMIT.emit({"type": "tool_result", "name": "get_extension", "result": res, "formatted": msg, "latency_ms": 5, "source": "contact_db"})
+        return msg
+
 class DateTimeTool(Tool):
     name = "get_current_datetime"
     description = "Get the current date and time (UTC). Use ONLY for questions about what day/date/time it is (星期几/几号/几点/what day/date). NEVER for weather."
@@ -195,7 +212,7 @@ class _Agent:
         self.model = GraniteModel(model_id=MODEL_ID, api_base=API_BASE, api_key="none",
                                   temperature=1.0, top_p=0.95,
                                   chat_template_kwargs={"enable_thinking": False})
-        self.agent = ToolCallingAgent(tools=[WebSearchTool(), GetWeatherTool(), DateTimeTool()], model=self.model, max_steps=MAX_STEPS, verbosity_level=0, add_base_tools=False, instructions="CRITICAL: For weather use get_weather(location, date) — never web_search. For general search use web_search. For date/time use get_current_datetime. When user says 'Search ...' call web_search. For greetings respond directly.")
+        self.agent = ToolCallingAgent(tools=[WebSearchTool(), GetWeatherTool(), DateTimeTool(), GetExtensionTool()], model=self.model, max_steps=MAX_STEPS, verbosity_level=0, add_base_tools=False, instructions="CRITICAL: For weather use get_weather(location, date) — never web_search. For general search use web_search. For date/time use get_current_datetime. For ANY 分機/聯絡人/電話查詢 一定要用 get_extension(name)（支援模糊拼音/同音字/ASR錯誤），不要用 web_search。Always answer in zh-TW (繁體中文) when user is zh-TW. When user says 'Search ...' call web_search. For greetings respond directly.")
 
     def run(self, task: str) -> str:
         # Fast path for plain greetings - check only the current question, not the full history-wrapped task

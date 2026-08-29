@@ -300,7 +300,7 @@
         <h3>Stack</h3>
         <div style="font-size:12px; line-height:1.6; opacity:0.85">
           <div><b>STT</b> X-ASR 160ms-int8 (16k, zh+en) · <b>LLM</b> Qwen3.5-0.8B Q8_0 · <b>Embed</b> Granite-97M Q8 (CUDA, 384d) · <b>TTS</b> Qwen3-TTS 0.6B Q8_0 24kHz</div>
-          <div class="subtle">Agent <b>Qwen-Agent</b> (3 tools) · SearXNG self-host (general) + wttr.in + Bing fallback · Tools: web_search · get_weather · get_current_datetime · honest (no curated mocks)</div>
+          <div class="subtle">Agent <b>Qwen-Agent</b> (4 tools) · SearXNG self-host + wttr.in + Bing · Tools: web_search · get_weather · get_current_datetime · get_extension (100人 zh-TW 通訊錄, 拼音模糊)</div>
         </div>
       </div>
     </div>
@@ -329,6 +329,7 @@
           <button class="tool-chip" onclick={()=>testSearch('Search latest AI news')}>News</button>
           <button class="tool-chip" onclick={()=>testSearch('Who is the president of France?')}>Who is…</button>
           <button class="tool-chip" onclick={()=>testSearch('今天是星期幾？')}>今天</button>
+          <button class="tool-chip" onclick={()=>testSearch('請幫我查王小明的分機')}>王小明📞</button>
         </div>
         {#if lastSearchResults.length}
           <div style="margin-top:10px; padding:8px; background:rgba(0,0,0,0.2); border-radius:8px; max-height:140px; overflow:auto; border:1px solid #1e1e28">
