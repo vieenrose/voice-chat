@@ -165,15 +165,16 @@ class GetWeatherTool(Tool):
 
 class GetExtensionTool(Tool):
     name = "get_extension"
-    description = "查詢公司通訊錄中某人的分機號碼（100人，zh-TW，支援拼音/同音字/ASR模糊搜尋）。任何查分機/聯絡人/電話的問題都必須用此工具，不要用 web_search。"
+    description = "查詢公司通訊錄中某人的分機號碼（100人，zh-TW，支援拼音/同音字/ASR模糊搜尋）。任何查分機/聯絡人/電話的問題都必須用此工具，不要用 web_search。可選 department 用於消歧義（如 王小明 有多位時用 研發部/行銷部）。"
     inputs = {
         "name": {"type": "string", "description": "人名（中文2-4字，可能有錯字/同音字，例 王小名會找到王小明）"},
+        "department": {"type": "string", "description": "可選：部門名稱用於消歧義，如 研發部、行銷部、人資部、財務部、業務部、客服部、設計部", "nullable": True},
     }
     output_type = "string"
-    def forward(self, name: str) -> str:
+    def forward(self, name: str, department: str = None) -> str:
         from tools.contact_db import get_extension
-        _EMIT.emit({"type": "tool_call", "name": "get_extension", "arguments": {"name": name}, "query": name})
-        res = get_extension(name)
+        _EMIT.emit({"type": "tool_call", "name": "get_extension", "arguments": {"name": name, "department": department}, "query": name})
+        res = get_extension(name, dept=department)
         msg = res.get("message", "")
         if res.get("candidates"):
             msg += " " + " ".join([f"{c['name']}({c['ext']})" for c in res["candidates"][:3]])

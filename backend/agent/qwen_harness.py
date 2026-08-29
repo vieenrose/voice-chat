@@ -98,11 +98,12 @@ class QwenGetWeather(BaseTool):
 @register_tool('get_extension', allow_overwrite=True)
 class QwenGetExtension(BaseTool):
     name = 'get_extension'
-    description = '查詢公司通訊錄中某人的分機號碼（支援中文姓名，自動處理拼音/同音字/ASR辨識錯誤的模糊搜尋，100人資料庫）。請用此工具查詢任何人的分機，不要用 web_search。'
+    description = '查詢公司通訊錄中某人的分機號碼（支援中文姓名，自動處理拼音/同音字/ASR辨識錯誤的模糊搜尋，100人資料庫）。可選 department 用於消歧義（如 王小明 有多位時，用 研發部/行銷部 區分）。請用此工具查詢任何人的分機，不要用 web_search。'
     parameters = {
         'type': 'object',
         'properties': {
-            'name': {'type': 'string', 'description': '要查詢的人名（中文2-4字，可能有錯字或同音字，如 王小名/汪小明 會自動找到 王小明）'}
+            'name': {'type': 'string', 'description': '要查詢的人名（中文2-4字，可能有錯字或同音字，如 王小名/汪小明 會自動找到 王小明）'},
+            'department': {'type': 'string', 'description': '可選：部門名稱用於消歧義，如 研發部、行銷部、人資部、財務部、業務部、客服部、設計部', 'nullable': True}
         },
         'required': ['name']
     }
@@ -112,14 +113,18 @@ class QwenGetExtension(BaseTool):
             try:
                 d = _json.loads(params)
                 name = d.get('name','') if isinstance(d, dict) else params
+                dept = d.get('department') if isinstance(d, dict) else None
             except:
                 name = params
+                dept = None
         else:
             name = params.get('name','') if isinstance(params, dict) else ''
+            dept = params.get('department') if isinstance(params, dict) else None
         name = str(name).strip()
-        _EMIT.emit({"type": "tool_call", "name": "get_extension", "arguments": {"name": name}, "query": name})
+        dept = str(dept).strip() if dept else None
+        _EMIT.emit({"type": "tool_call", "name": "get_extension", "arguments": {"name": name, "department": dept}, "query": name})
         from tools.contact_db import get_extension
-        res = get_extension(name)
+        res = get_extension(name, dept=dept)
         msg = res.get("message", "")
         # Add candidates detail if any
         if res.get("candidates"):

@@ -178,7 +178,7 @@ def _similarity(a: str, b: str) -> float:
         import difflib
         return difflib.SequenceMatcher(None, a, b).ratio()
 
-def find_contact(query: str, top_k: int = 3, threshold: float = 0.65) -> List[Tuple[Dict, float]]:
+def find_contact(query: str, top_k: int = 3, threshold: float = 0.65, dept_filter: str = None) -> List[Tuple[Dict, float]]:
     """
     Fuzzy phonetic matching for zh-TW names with ASR/spelling errors.
     Returns list of (contact, score) sorted by score desc.
@@ -208,18 +208,27 @@ def find_contact(query: str, top_k: int = 3, threshold: float = 0.65) -> List[Tu
         q = q.strip()
         if not q or len(q) < 1:
             continue
-        # 1. Exact match
+        # 1. Exact match (check dept if filter provided)
         if q in _NAME_TO_CONTACT:
-            return [(_NAME_TO_CONTACT[q], 1.0)]
-        # 2. Substring exact
+            c = _NAME_TO_CONTACT[q]
+            if not dept_filter or c["dept"] == dept_filter:
+                return [(c, 1.0)]
+            # If exact name but wrong dept, continue to fuzzy (will be filtered)
+            pass
+        # 2. Substring exact (with dept filter)
         for name, contact in _NAME_TO_CONTACT.items():
             if q == name or name == q:
+                if dept_filter and contact["dept"] != dept_filter:
+                    continue
                 if name not in seen:
                     best.append((contact, 0.95))
                     seen.add(name)
         # 3. Bopomofo fuzzy (zh-TW zhuyin, handles ASR homophones better than pinyin)
         q_bpmf = _to_bopomofo(q)
         for contact in CONTACTS:
+            # Dept filter: if dept_filter provided, skip non-matching dept (hard filter) or boost
+            if dept_filter and contact["dept"] != dept_filter:
+                continue
             name = contact["name"]
             if name in seen and any(s > 0.9 for _, s in best if _ == contact):
                 continue
@@ -266,16 +275,22 @@ def find_contact(query: str, top_k: int = 3, threshold: float = 0.65) -> List[Tu
     best = sorted(uniq.values(), key=lambda x: x[1], reverse=True)
     return best[:top_k]
 
-def get_extension(query: str) -> Dict:
+def get_extension(query: str, dept: str = None) -> Dict:
     """
     Main entry: query extension for a person (zh-TW, with spelling/ASR errors).
     Returns dict with found status, contact, or candidates.
     All messages in zh-TW.
     """
     query = query.strip()
+    # Extract dept from query like "研發部的王小明" or "王小明 研發部"
+    if not dept:
+        m = re.search(r"(研發部|行銷部|人資部|財務部|業務部|客服部|設計部)", query)
+        if m:
+            dept = m.group(1)
+            query = query.replace(dept, "").replace("的", "").strip()
     if not query:
         return {"found": False, "message": "請提供要查詢的姓名。", "candidates": []}
-    matches = find_contact(query, top_k=3, threshold=0.6)
+    matches = find_contact(query, top_k=3, threshold=0.6, dept_filter=dept)
     if not matches:
         return {"found": False, "message": f"找不到「{query}」的相關聯絡人，請確認姓名是否正確。", "candidates": []}
     top, score = matches[0]
