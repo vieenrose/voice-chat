@@ -142,7 +142,14 @@
   function stopMic(){ listening=false; if(animId) cancelAnimationFrame(animId); if(workletNode){ try{workletNode.disconnect();}catch(e){} workletNode=null; } if(mediaStream){ mediaStream.getTracks().forEach(t=>t.stop()); mediaStream=null; } if(audioCtx){ try{audioCtx.close();}catch(e){} audioCtx=null; } audioLevel=0; if(ws && ws.readyState===1) ws.send(JSON.stringify({type:'stop'})); }
   function sendPCM(pcm16){ if(!ws || ws.readyState!==1) return; const header = new Uint8Array(1); header[0]=0x01; const out = new Uint8Array(1 + pcm16.byteLength); out.set(header,0); out.set(new Uint8Array(pcm16.buffer),1); try{ ws.send(out); }catch(e){ const b64 = btoa(String.fromCharCode(...new Uint8Array(pcm16.buffer))); ws.send(JSON.stringify({type:'audio_chunk', pcm:b64, sampleRate:16000})); } }
   function sendText(text){ if(!ws || ws.readyState!==1){ connect(); setTimeout(()=>sendText(text),500); return; } if(speaking) bargeIn(); ws.send(JSON.stringify({type:'text_input', text})); chatHistory=[...chatHistory, {role:'user', text}]; llmStreaming=''; }
-  function bargeIn(){ if(ws && ws.readyState===1) ws.send(JSON.stringify({type:'barge_in'})); jitterQueue=[]; nextPlayTime=0; speaking=false; if(playCtx){ try{playCtx.close();}catch(e){} playCtx=null; nextPlayTime=0; } }
+  let activeSources = [];
+  function bargeIn(){ if(ws && ws.readyState===1) ws.send(JSON.stringify({type:'barge_in'})); jitterQueue=[]; preRollQueue.length=0; preRollStarted=false; nextPlayTime=0; speaking=false;
+    for(const s of activeSources){ try{ s.stop(); }catch(e){} try{ s.disconnect(); }catch(e){} }
+    activeSources=[];
+    if(playCtx){ try{playCtx.close();}catch(e){} playCtx=null; }
+    // Clear any queued TTS chunks
+    ttsText='';
+  }
   let playCtx = null;
   function ensurePlayCtx(sampleRate){
     if(!playCtx){ try{ playCtx = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){ playCtx = new (window.AudioContext||window.webkitAudioContext)(); } nextPlayTime = playCtx.currentTime;
@@ -154,11 +161,12 @@
   function queueAudio(pcm16, sampleRate){
     const ctx = ensurePlayCtx(sampleRate); const float = new Float32Array(pcm16.length); for(let i=0;i<pcm16.length;i++) float[i]=pcm16[i]/32768; const resampled = resampleLinear(float, sampleRate, ctx.sampleRate);
     const buf = ctx.createBuffer(1, resampled.length, ctx.sampleRate); buf.getChannelData(0).set(resampled); const src = ctx.createBufferSource(); src.buffer=buf; src.connect(ctx.destination); const dur=buf.duration;
-    src.onended = ()=>{ if(ctx.currentTime >= nextPlayTime - 0.05) setTimeout(()=>{ if(ctx.currentTime >= nextPlayTime) speaking=false; }, 200); };
+    activeSources.push(src);
+    src.onended = ()=>{ activeSources = activeSources.filter(s=>s!==src); if(ctx.currentTime >= nextPlayTime - 0.05) setTimeout(()=>{ if(ctx.currentTime >= nextPlayTime && activeSources.length===0) speaking=false; }, 200); };
     if(!preRollStarted){ preRollQueue.push({buf, src, dur}); if(preRollQueue.reduce((a,c)=>a+c.dur,0) >= PRE_ROLL_SEC) flushPreRoll(); return; }
     if(nextPlayTime < ctx.currentTime || !isFinite(nextPlayTime)) nextPlayTime = ctx.currentTime + 0.08; src.start(nextPlayTime); nextPlayTime += dur; speaking=true;
   }
-  function flushPreRoll(){ const ctx=ensurePlayCtx(); if(!preRollQueue.length || preRollStarted) return; preRollStarted=true; if(nextPlayTime < ctx.currentTime || !isFinite(nextPlayTime)) nextPlayTime = ctx.currentTime + 0.08; for(const c of preRollQueue){ c.src.start(nextPlayTime); nextPlayTime+=c.dur; } preRollQueue.length=0; speaking=true; }
+  function flushPreRoll(){ const ctx=ensurePlayCtx(); if(!preRollQueue.length || preRollStarted) return; preRollStarted=true; if(nextPlayTime < ctx.currentTime || !isFinite(nextPlayTime)) nextPlayTime = ctx.currentTime + 0.08; for(const c of preRollQueue){ try{ c.src.start(nextPlayTime); }catch(e){} nextPlayTime+=c.dur; } preRollQueue.length=0; speaking=true; }
   function drawWave(){
     if(!canvasEl || !analyser) return; const ctx = canvasEl.getContext('2d'); const data = new Uint8Array(analyser.frequencyBinCount);
     const draw = ()=>{ animId=requestAnimationFrame(draw); analyser.getByteFrequencyData(data); ctx.clearRect(0,0,canvasEl.width,canvasEl.height); const w=canvasEl.width,h=canvasEl.height; const barW=w/data.length*2.2; let x=0; for(let i=0;i<data.length;i+=2){ const v=data[i]/255; const bh=v*h*0.85; ctx.fillStyle=listening?`hsla(265,90%,65%,${0.45+v*0.5})`:`hsla(220,8%,45%,0.5)`; ctx.fillRect(x,h-bh,barW,bh); x+=barW+1; if(x>=w) break; } ctx.fillStyle=listening?'#7c5cff':'#3a3a44'; ctx.fillRect(0,h-3,w*audioLevel,3); }; draw();
