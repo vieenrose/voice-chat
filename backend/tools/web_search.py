@@ -135,8 +135,15 @@ def _entity_first_query(q: str) -> str:
     # news / latest X -> drop latest/current
     m3 = re.search(r"\b(latest|current|recent|breaking)\s+(.+)", ql)
     if "news" in ql or "新闻" in ql or "新聞" in ql:
-        # generic news handling — no hard-coded outlet/location lists
-        pass
+        # generic news: extract main entity (last significant word) and craft "entity news" without hard-coded lists
+        # e.g., "big news days in Taiwan" -> entity "taiwan" -> "taiwan news"
+        words = [w for w in re.findall(r"[a-z0-9]+", ql) if w not in {"news","headlines","days","today","latest","big","current","search"} and len(w) >= 3]
+        if words:
+            ent = words[-1]
+            # avoid using 'days' as entity
+            if ent not in {"days","news"}:
+                cands.insert(0, f"{ent} news")
+                cands.insert(0, f"{ent} latest news")
     if m3 and not m4:
         cands.append(_clean_query(m3.group(1)) or m3.group(1))
     # keep unique
@@ -153,7 +160,7 @@ async def _try_searxng(query: str, count: int, engine: str | None = None) -> Lis
         async with httpx.AsyncClient(timeout=5.0) as client:
             # language: zh for Chinese, EN otherwise (bing with language=all returns zh-biased junk)
             _lang = "zh-TW" if ("台灣" in query or "台湾" in query) else ("zh-CN" if _is_chinese(query) else "en")
-            # Use news category for news queries to get actual articles, not generic topic pages
+            # Generic news detection (no hard-coded outlet list) — use SearXNG news category for news queries
             _is_news = bool(re.search(r"(news|headlines|頭條|新聞|breaking|latest.*news|news.*today)", query.lower()))
             _cat = "news" if _is_news else "general"
             params = {"q": query, "format": "json", "categories": _cat, "pageno": 1,
@@ -308,25 +315,31 @@ def _relevance_score(query: str, results: List[Dict]) -> float:
     score = hits / min(3, len(results))
     return score
 
-EMBED_URL = "http://127.0.0.1:11434/v1/embeddings"
-EMBED_MODEL = "bge-small"
+_GRANITE_MODEL = None
+def _get_granite():
+    global _GRANITE_MODEL
+    if _GRANITE_MODEL is None:
+        from sentence_transformers import SentenceTransformer
+        import torch
+        _device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        _GRANITE_MODEL = SentenceTransformer('/tmp/granite-emb', device=_device)
+        logger.info(f"Granite embedding loaded on {_device} (384d, multilingual)")
+    return _GRANITE_MODEL
 
 async def _embed_batch(texts: List[str]) -> List[List[float]]:
-    """Batch embed via bge-small on :11434 (already running). Returns [] on failure."""
+    """Batch embed via granite-embedding-97m-multilingual-r2 (local, 384d, zh-TW+en)."""
     if not texts:
         return []
     try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            resp = await client.post(EMBED_URL, json={"model": EMBED_MODEL, "input": texts})
-            if resp.status_code == 200:
-                data = resp.json()
-                items = data.get("data", [])
-                # sort by index just in case
-                items = sorted(items, key=lambda x: x.get("index", 0))
-                return [it["embedding"] for it in items if "embedding" in it]
+        model = await asyncio.to_thread(_get_granite)
+        embs = await asyncio.to_thread(model.encode, texts, normalize_embeddings=True, convert_to_numpy=True)
+        # embs is np array (n, dim)
+        if hasattr(embs, 'tolist'):
+            return embs.tolist()
+        return [e.tolist() if hasattr(e, 'tolist') else list(e) for e in embs]
     except Exception as e:
-        logger.debug(f"embed batch failed {e}")
-    return []
+        logger.debug(f"granite embed failed {e}")
+        return []
 
 def _cosine(a: List[float], b: List[float]) -> float:
     import math
@@ -336,7 +349,7 @@ def _cosine(a: List[float], b: List[float]) -> float:
     return dot / (na * nb)
 
 async def _rerank_with_embeddings(query: str, results: List[Dict]) -> tuple[List[Dict], float]:
-    """Semantic rerank via bge-small. Returns (reranked_results, semantic_score 0..1)."""
+    """Semantic rerank via granite-97m-multilingual (384d, zh-TW+en). Returns (reranked_results, semantic_score 0..1)."""
     if not results or len(results) < 2:
         return results, _relevance_score(query, results)
     try:
@@ -348,7 +361,7 @@ async def _rerank_with_embeddings(query: str, results: List[Dict]) -> tuple[List
         scored = []
         for r, e in zip(results, embs[1:]):
             s = _cosine(q_emb, e)
-            # map cosine -1..1 to 0..1, bge-small typical 0.3..0.9 for relevant
+            # map cosine -1..1 to 0..1, granite typical 0.4..0.9 for relevant
             norm = (s + 1) / 2
             scored.append((norm, r))
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -458,10 +471,12 @@ async def web_search(query: str, count: int = 5) -> Dict:
         lite = await _try_lite_scrape(query, count)
         if lite and _score(lite) > best_score:
             results, source, best_score = lite, "lite_scrape", _score(lite)
-    # 4) only generic mock when truly no network results — no curated cheating
     if not results:
-        # truly no network: generic mock (explicitly flagged)
-        results, source = _mock_search(query, count), "mock-offline"
+        latency = int((time.time()-t0)*1000)
+        payload = {"query": query, "results": [], "source": "no_results", "latency_ms": latency, "cached": False}
+        _CACHE[ck] = {"t": time.time(), "data": payload}
+        logger.info(f"web_search '{query}' source=no_results 0 results in {latency}ms — no mock")
+        return payload
 
     # Enrich top results with full page text for more informative answers (concurrent, capped)
     await _maybe_enrich(results)
