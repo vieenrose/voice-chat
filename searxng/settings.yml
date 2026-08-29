@@ -1,0 +1,38 @@
+use_default_settings: true
+server:
+  base_url: http://127.0.0.1:8888/
+  port: 8888
+  bind_address: 127.0.0.1
+  secret_key: "change_this_to_something_random_12345_for_searxng_official_full"
+  limiter: false
+  image_proxy: false
+  http_protocol_version: "1.0"
+ui:
+  query_in_title: true
+  infinite_scroll: false
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: ""
+  ban_time_in_seconds: 10
+  formats:
+    - html
+    - json
+  suspended_times:
+    SearxEngineAccessDenied: 86400
+    SearxEngineCaptcha: 86400
+    SearxEngineTooManyRequests: 3600
+outgoing:
+  request_timeout: 5.0
+  max_request_timeout: 10.0
+  retries: 1
+  retry_sleep: 0.5
+  retries_sleep: 0.5
+# Disable China engines as requested (keep all others)
+disabled_engines:
+  - baidu
+  - sogou
+  - 360search
+  - so.com
+  - chinasearch
+  - woshiphone
