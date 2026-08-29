@@ -38,11 +38,16 @@ class StreamingXASR:
             # Try local /tmp/XASR first (already downloaded)
             local_base = Path(f"/tmp/XASR/deployment/models/chunk-{chunk}ms-model")
             if local_base.exists():
-                enc = str(local_base / f"encoder-{chunk}ms.onnx")
-                dec = str(local_base / f"decoder-{chunk}ms.onnx")
-                join = str(local_base / f"joiner-{chunk}ms.onnx")
+                # Prefer int8 quantized models if available (153M vs 587M total, ~3.9× smaller)
+                enc_int8 = local_base / f"encoder-{chunk}ms.int8.onnx"
+                dec_int8 = local_base / f"decoder-{chunk}ms.int8.onnx"
+                join_int8 = local_base / f"joiner-{chunk}ms.int8.onnx"
+                enc = str(enc_int8 if enc_int8.exists() else local_base / f"encoder-{chunk}ms.onnx")
+                dec = str(dec_int8 if dec_int8.exists() else local_base / f"decoder-{chunk}ms.onnx")
+                join = str(join_int8 if join_int8.exists() else local_base / f"joiner-{chunk}ms.onnx")
                 tokens = str(local_base / "tokens.txt")
-                logger.info(f"X-ASR loading local {chunk}ms {local_base}")
+                is_int8 = enc_int8.exists()
+                logger.info(f"X-ASR loading local {chunk}ms {local_base} {'(int8 152M)' if is_int8 else ''}")
             else:
                 logger.info(f"X-ASR downloading {model_id} chunk-{chunk}ms...")
                 enc = hf_hub_download(model_id, f"deployment/models/chunk-{chunk}ms-model/encoder-{chunk}ms.onnx")
@@ -72,8 +77,9 @@ class StreamingXASR:
                 provider=provider,
             )
             self.stream = self.recognizer.create_stream()
-            self.backend = f"x-asr-sherpa-{chunk}ms"
-            logger.info(f"X-ASR sherpa-onnx loaded ✓ {self.backend} {model_id} (160ms streaming, 593M encoder)")
+            self.backend = f"x-asr-sherpa-{chunk}ms" + ("-int8" if "int8" in enc else "")
+            enc_mb = Path(enc).stat().st_size/1024/1024
+            logger.info(f"X-ASR sherpa-onnx loaded ✓ {self.backend} {model_id} (160ms streaming, {enc_mb:.0f}M encoder{' int8' if 'int8' in enc else ''})")
         except Exception as e:
             logger.warning(f"X-ASR sherpa load failed {e}, trying whisper fallback")
             import traceback; traceback.print_exc()
