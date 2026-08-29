@@ -199,35 +199,38 @@ async def run_agent_task(task: str, event_q=None) -> str:
     def _run():
         try:
             messages = [{'role': 'user', 'content': task}]
+            all_resps = []
             last_resp = None
             for resp in agent.run(messages=messages):
+                all_resps.append(resp)
                 last_resp = resp
-            # Try to extract from last_resp first (most reliable)
-            if last_resp:
-                # last_resp can be List[Dict] or Dict
-                candidates = last_resp if isinstance(last_resp, list) else [last_resp]
-                for m in reversed(candidates):
-                    if isinstance(m, dict) and m.get('role') == 'assistant' and m.get('content'):
-                        c = m['content']
-                        if isinstance(c, str) and c.strip():
-                            return c
-                        if isinstance(c, list):
-                            # content as list of blocks
+            # Collect all assistant messages with non-empty content from entire run (filter thinking leak)
+            candidates_all = []
+            for resp in all_resps:
+                lst = resp if isinstance(resp, list) else [resp]
+                for m in lst:
+                    if isinstance(m, dict) and m.get('role') == 'assistant':
+                        c = m.get('content')
+                        # Filter: content must be non-empty and not just reasoning (reasoning_content is separate)
+                        if isinstance(c, str) and c.strip() and len(c.strip()) > 2:
+                            # Skip if it's just the reasoning dump (empty content with reasoning_content)
+                            if not c.strip().startswith("["):
+                                candidates_all.append(m)
+                        elif isinstance(c, list):
                             txt = "".join(b.get('text','') if isinstance(b, dict) else str(b) for b in c)
-                            if txt.strip(): return txt
-            # Fallback to memory
+                            if txt.strip():
+                                candidates_all.append({"role": "assistant", "content": txt})
+            if candidates_all:
+                # Return the last non-empty assistant content (final answer, not intermediate reasoning)
+                return candidates_all[-1].get('content','')
+            # Fallback to memory (also filter empty)
             if hasattr(agent, 'memory') and agent.memory:
                 hist = agent.memory.get_history() if hasattr(agent.memory, 'get_history') else []
                 for m in reversed(hist):
                     if m.get('role') == 'assistant' and m.get('content'):
                         c = m['content']
-                        if isinstance(c, str) and c.strip() and 'could not find' not in c.lower():
+                        if isinstance(c, str) and c.strip() and len(c.strip()) > 2 and not c.strip().startswith("["):
                             return c
-                        if isinstance(c, str) and c.strip():
-                            return c
-            # If last_resp was list but not captured, try stringifying
-            if last_resp:
-                return str(last_resp)[:2000]
             return "Sorry, I could not find an answer."
         except Exception as e:
             logger.exception(f"qwen agent failed: {e}")
