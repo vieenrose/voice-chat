@@ -163,6 +163,14 @@ async def run_agent_task(task: str, event_q=None) -> str:
     agent = _get_agent()
     def _run():
         try:
+            # Fast path for plain greetings (zh-TW 餵你好 etc., en hi/hello) — no tool call
+            import re
+            m = re.search(r"Current question:\s*(.*)", task, re.S)
+            _cur = m.group(1).strip() if m else task.strip()
+            _tl = _cur.lower()
+            if len(_tl) < 30 and re.search(r'(hi|hello|hey|hola|bonjour|你好|您好|哈囉|嗨|餵|喂|欸|嘿)', _tl, re.I) and not re.search(r'(weather|news|search|find|what is|who is|how|can you|please|today|tomorrow|星期|几号|天气|新聞|頭條|天氣|分機|電話)', _tl, re.I):
+                if len(_tl) < 15 or re.match(r'^\s*[\w\s]*(你好|您好|哈囉|嗨|餵|喂|hi|hello|hey)\b', _tl, re.I):
+                    return "你好！有什麼可以幫你的？" if re.search(r'[\u4e00-\u9fff]', _cur) else "Hello! How can I help you today?"
             messages = [{'role': 'user', 'content': task}]
             all_resps = []
             last_resp = None

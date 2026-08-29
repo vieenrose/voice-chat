@@ -203,8 +203,12 @@ class _Agent:
         m = re.search(r"Current question:\s*(.*)", task, re.S)
         _cur = m.group(1).strip() if m else task.strip()
         _tl = _cur.lower()
-        if re.match(r'^\s*(hi|hello|hey|你好|您好|hola|bonjour)\b', _tl, re.I) and len(_tl) < 50 and not re.search(r'(weather|news|search|find|what is|who is|how|can you|please|today|tomorrow|星期|几号|天气|新闻)', _tl, re.I):
-            return "Hello! How can I help you today?" if not re.search(r'[\u4e00-\u9fff]', _cur) else "你好！有什么可以帮你的？"
+        # Greeting fast path: handle zh-TW fillers like 餵/喂/欸/嘿/哈囉 + 你好, and en hi/hello
+        if len(_tl) < 30 and re.search(r'(hi|hello|hey|hola|bonjour|你好|您好|哈囉|嗨|餵|喂|欸|嘿)', _tl, re.I) and not re.search(r'(weather|news|search|find|what is|who is|how|can you|please|today|tomorrow|星期|几号|天气|新聞|頭條|天氣|分機|電話)', _tl, re.I):
+            # Ensure it's primarily a greeting, not a full sentence with greeting + question
+            # If query is short (<15) and contains greeting, treat as greeting
+            if len(_tl) < 15 or re.match(r'^\s*[\w\s]*(你好|您好|哈囉|嗨|餵|喂|hi|hello|hey)\b', _tl, re.I):
+                return "Hello! How can I help you today?" if not re.search(r'[\u4e00-\u9fff]', _cur) else "你好！有什麼可以幫你的？"
         out = self.agent.run(task, reset=True)
         return out if isinstance(out, str) else (out.final_answer if hasattr(out, "final_answer") else str(out))
 
