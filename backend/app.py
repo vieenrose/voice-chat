@@ -222,6 +222,7 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="default
     sender_task = asyncio.create_task(sender_loop())
     # Track active direct_tts tasks for barge-in cancellation
     active_tts_tasks = set()
+    barge_in_event = asyncio.Event()
     try:
         while True:
             try:
@@ -249,9 +250,11 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="default
                     await pcm_queue.put({"type":"flush"})
                 elif t == "barge_in":
                     logger.info("barge_in received — cancelling active TTS")
+                    barge_in_event.set()
                     for task in list(active_tts_tasks):
                         task.cancel()
                     active_tts_tasks.clear()
+                    barge_in_event.clear()
                     try:
                         await websocket.send_text(json.dumps({"type": "barge_in", "reason": "audio"}))
                     except: pass
@@ -259,9 +262,13 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="default
                     # Barge-in: cancel previous TTS/LLM generation before starting new one
                     if active_tts_tasks:
                         logger.info(f"text_input barge-in: cancelling {len(active_tts_tasks)} active TTS tasks for new query '{data.get('text','')[:30]}'")
+                        barge_in_event.set()
                         for task in list(active_tts_tasks):
                             task.cancel()
                         active_tts_tasks.clear()
+                        # Give cancelled tasks a moment to exit
+                        await asyncio.sleep(0.1)
+                        barge_in_event.clear()
                     try:
                         await websocket.send_text(json.dumps({"type": "barge_in", "reason": "text_input"}))
                     except: pass
@@ -293,6 +300,10 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="default
                         _zh = bool(_re.search(r'[\u4e00-\u9fff]', txt))
                         _lang_hint = "\n（请用简体中文简洁回答，不要使用英文。）" if _zh else "\nAnswer briefly in English."
                         async for ev in pipeline.llm.generate_chat_with_tools(history, txt + _lang_hint) if hasattr(pipeline.llm, 'generate_chat_with_tools') else pipeline.llm.generate_with_tools(txt):
+                            # Check for barge-in cancellation
+                            if barge_in_event.is_set():
+                                logger.info("direct_tts cancelled by barge-in")
+                                break
                             if ev["type"] == "tool_call":
                                 await websocket.send_text(json.dumps({"type":"tool_call","name":ev["name"],"arguments":ev.get("arguments",{}), "query": ev.get("query","")}, ensure_ascii=False))
                                 stats["tool_calls"] += 1
@@ -315,7 +326,12 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="default
                                 flush = False
                                 if SENT_END.search(ev["token"]): flush=True
                                 elif cnt>=300: flush=True  # safety cap ONLY — never the old >=8+' ,' (8-char flush paced the speech)
+                                if barge_in_event.is_set():
+                                    logger.info("direct_tts barge-in: aborting LLM->TTS flush")
+                                    break
                                 if flush and tts_buf.strip():
+                                    if barge_in_event.is_set():
+                                        break
                                     txt_s = tts_buf.strip()
                                     # Skip tool call artifacts and silence - more aggressive
                                     _low = txt_s.lower()
@@ -335,9 +351,15 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="default
                                                 continue
                                         except: pass
                                     tts_buf=""; cnt=0
+                                    # Check again before TTS (long speech may have been barged)
+                                    if barge_in_event.is_set():
+                                        break
                                     # Use streaming to avoid large WS messages (>1MB)
                                     first_chunk = True
                                     async for pcm_chunk in pipeline.tts.synthesize_streaming(txt_s):
+                                        if barge_in_event.is_set():
+                                            logger.info("direct_tts barge-in: aborting TTS streaming mid-sentence")
+                                            break
                                         # Skip silence chunks
                                         if len(pcm_chunk) == int(pipeline.tts.sample_rate*0.3) and int(np.max(np.abs(pcm_chunk))) == 0:
                                             continue

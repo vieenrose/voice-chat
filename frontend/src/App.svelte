@@ -143,12 +143,21 @@
   function sendPCM(pcm16){ if(!ws || ws.readyState!==1) return; const header = new Uint8Array(1); header[0]=0x01; const out = new Uint8Array(1 + pcm16.byteLength); out.set(header,0); out.set(new Uint8Array(pcm16.buffer),1); try{ ws.send(out); }catch(e){ const b64 = btoa(String.fromCharCode(...new Uint8Array(pcm16.buffer))); ws.send(JSON.stringify({type:'audio_chunk', pcm:b64, sampleRate:16000})); } }
   function sendText(text){ if(!ws || ws.readyState!==1){ connect(); setTimeout(()=>sendText(text),500); return; } if(speaking) bargeIn(); ws.send(JSON.stringify({type:'text_input', text})); chatHistory=[...chatHistory, {role:'user', text}]; llmStreaming=''; }
   let activeSources = [];
-  function bargeIn(){ if(ws && ws.readyState===1) ws.send(JSON.stringify({type:'barge_in'})); jitterQueue=[]; preRollQueue.length=0; preRollStarted=false; nextPlayTime=0; speaking=false;
-    for(const s of activeSources){ try{ s.stop(); }catch(e){} try{ s.disconnect(); }catch(e){} }
+  let bargeInLock = false;
+  function bargeIn(){ if(bargeInLock) return; bargeInLock=true; setTimeout(()=>bargeInLock=false, 300);
+    if(ws && ws.readyState===1) ws.send(JSON.stringify({type:'barge_in'}));
+    // Aggressive: stop all scheduled sources including future ones
+    for(const s of [...activeSources]){ try{ s.stop(); }catch(e){} try{ s.disconnect(); }catch(e){} }
     activeSources=[];
-    if(playCtx){ try{playCtx.close();}catch(e){} playCtx=null; }
-    // Clear any queued TTS chunks
-    ttsText='';
+    // Clear pre-roll queue (0.6s buffered)
+    for(const c of [...preRollQueue]){ try{ c.src.stop(); }catch(e){} try{ c.src.disconnect(); }catch(e){} }
+    preRollQueue.length=0; preRollStarted=false;
+    jitterQueue=[]; nextPlayTime=0; speaking=false;
+    if(playCtx){ try{ playCtx.suspend(); }catch(e){} try{ playCtx.close(); }catch(e){} playCtx=null; }
+    // Clear any queued TTS chunks and LLM streaming
+    ttsText=''; llmStreaming='';
+    // Force speaking false even if onended fires late
+    setTimeout(()=>{ speaking=false; }, 50);
   }
   let playCtx = null;
   function ensurePlayCtx(sampleRate){
