@@ -90,7 +90,7 @@
           const src = msg.source || msg.result?.source || 'searxng'; const latency = msg.latency_ms || 0; const count = msg.result?.results?.length || 3;
           toolStatus = `✓ ${count} results via ${src} · ${latency}ms`; lastSearchResults = msg.result?.results || [];
           let preview = (msg.formatted||'').slice(0,200).replace(/\n/g,' '); chatHistory = [...chatHistory, {role:'tool', text: `✓ ${src} · ${latency}ms — ${preview}`}]; } break;
-      case 'tts_chunk': ttsText = toTraditional(msg.text); if(msg.pcm){ try{ const pcm = base64ToInt16(msg.pcm); queueAudio(pcm, msg.sampleRate || 16000); }catch(e){ audioError = String(e).slice(0,120); } } updateAssistantStreaming(); break;
+      case 'tts_chunk': if(Date.now() < ignoreTtsUntil) break; ttsText = toTraditional(msg.text); if(msg.pcm){ try{ const pcm = base64ToInt16(msg.pcm); queueAudio(pcm, msg.sampleRate || 16000); }catch(e){ audioError = String(e).slice(0,120); } } updateAssistantStreaming(); break;
       case 'tts_start': preRollStarted = false; preRollQueue.length = 0; speaking = true; break;
       case 'tts_end': flushPreRoll(); speaking = false; finalizeAssistant(); toolStatus = ''; break;
       case 'latency': latency = msg; break;
@@ -141,10 +141,14 @@
   }
   function stopMic(){ listening=false; if(animId) cancelAnimationFrame(animId); if(workletNode){ try{workletNode.disconnect();}catch(e){} workletNode=null; } if(mediaStream){ mediaStream.getTracks().forEach(t=>t.stop()); mediaStream=null; } if(audioCtx){ try{audioCtx.close();}catch(e){} audioCtx=null; } audioLevel=0; if(ws && ws.readyState===1) ws.send(JSON.stringify({type:'stop'})); }
   function sendPCM(pcm16){ if(!ws || ws.readyState!==1) return; const header = new Uint8Array(1); header[0]=0x01; const out = new Uint8Array(1 + pcm16.byteLength); out.set(header,0); out.set(new Uint8Array(pcm16.buffer),1); try{ ws.send(out); }catch(e){ const b64 = btoa(String.fromCharCode(...new Uint8Array(pcm16.buffer))); ws.send(JSON.stringify({type:'audio_chunk', pcm:b64, sampleRate:16000})); } }
-  function sendText(text){ if(!ws || ws.readyState!==1){ connect(); setTimeout(()=>sendText(text),500); return; } if(speaking) bargeIn(); ws.send(JSON.stringify({type:'text_input', text})); chatHistory=[...chatHistory, {role:'user', text}]; llmStreaming=''; }
+  function sendText(text){ if(!ws || ws.readyState!==1){ connect(); setTimeout(()=>sendText(text),500); return; } if(speaking) bargeIn(); generationId++; ws.send(JSON.stringify({type:'text_input', text})); chatHistory=[...chatHistory, {role:'user', text}]; llmStreaming=''; }
   let activeSources = [];
   let bargeInLock = false;
+  let generationId = 0;
+  let ignoreTtsUntil = 0;
   function bargeIn(){ if(bargeInLock) return; bargeInLock=true; setTimeout(()=>bargeInLock=false, 300);
+    generationId++; // increment to ignore old TTS chunks from previous generation
+    ignoreTtsUntil = Date.now() + 800; // ignore any TTS chunks that were already in flight for old generation
     if(ws && ws.readyState===1) ws.send(JSON.stringify({type:'barge_in'}));
     // Aggressive: stop all scheduled sources including future ones
     for(const s of [...activeSources]){ try{ s.stop(); }catch(e){} try{ s.disconnect(); }catch(e){} }

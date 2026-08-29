@@ -32,6 +32,7 @@ class StreamingPrimeTTSReal:
         self.device = device
         self.mock = mock
         self.backend = "mock"
+        self.sample_rate = SAMPLE_RATE
         self.enc = None
         self.dec = None
         self.frontend = None
@@ -286,10 +287,15 @@ class StreamingPrimeTTSReal:
             return self._mock_synth(text)
 
     async def synthesize_streaming(self, text: str) -> AsyncGenerator[np.ndarray, None]:
-        """True streaming: yields PCM chunks per 24 frames as they are decoded (384ms each)"""
+        """True streaming: yields PCM chunks per 24 frames as they are decoded (384ms each) — checks for cancellation"""
         if self.backend == "mock" or self.enc is None:
             pcm = await self.synthesize(text)
             yield pcm
+            return
+        # Check for cancellation before even starting (for barge-in)
+        try:
+            await asyncio.sleep(0)  # yield to allow cancellation
+        except asyncio.CancelledError:
             return
         try:
             # Offload encode to thread, then stream chunks
@@ -312,6 +318,11 @@ class StreamingPrimeTTSReal:
             z = await asyncio.to_thread(_enc)
             T = z.shape[2]
             for a in range(0, T, CHUNK):
+                # Check for barge-in cancellation before each chunk
+                try:
+                    await asyncio.sleep(0)
+                except asyncio.CancelledError:
+                    return
                 b = min(a + CHUNK, T)
                 s0 = max(0, a - LEFT)
                 e = min(T, b + RIGHT)
@@ -323,10 +334,16 @@ class StreamingPrimeTTSReal:
                     peak = np.max(np.abs(chunk)) if chunk.size else 1
                     # Don't normalize per chunk, keep consistent with full
                     return (chunk * 32767).astype(np.int16)
-                pcm_chunk = await asyncio.to_thread(_dec)
+                try:
+                    pcm_chunk = await asyncio.to_thread(_dec)
+                except asyncio.CancelledError:
+                    return
                 yield pcm_chunk
-                # Small yield to allow event loop
-                await asyncio.sleep(0)
+                # Small yield to allow event loop and cancellation
+                try:
+                    await asyncio.sleep(0)
+                except asyncio.CancelledError:
+                    return
         except Exception as e:
             logger.warning(f"streaming failed {e}, fallback")
             pcm = await self.synthesize(text)
