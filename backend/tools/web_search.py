@@ -135,16 +135,8 @@ def _entity_first_query(q: str) -> str:
     # news / latest X -> drop latest/current
     m3 = re.search(r"\b(latest|current|recent|breaking)\s+(.+)", ql)
     if "news" in ql or "新闻" in ql or "新聞" in ql:
-        # entity-first for news: "big news today in taiwan" -> "Taiwan news today"
-        # known news outlets -> site-targeted (bing honors site:): "cnn headlines" -> site:cnn.com top story
-        _outlet = re.search(r"\b(cnn|bbc|nytimes|nyt|reuters|ap|aljazeera|theguardian|guardian|fox news|fox|msnbc|nhk|abc news|cnbc|bloomberg)\b", ql)
-        if _outlet:
-            _o = _outlet.group(1).lower()
-            cands.insert(0, f"site:{_o}.com top headlines today")
-            cands.insert(0, f"{_o} headlines latest today")
-        _loc = re.search(r"\b(taiwan|台灣|台湾|taipei|台北|hong kong|香港|japan|日本|china|中国|中國|france|paris)\b", ql)
-        if _loc:
-            cands.insert(0, f"{_loc.group(1)} news today")
+        # generic news handling — no hard-coded outlet/location lists
+        pass
     if m3 and not m4:
         cands.append(_clean_query(m3.group(1)) or m3.group(1))
     # keep unique
@@ -218,6 +210,49 @@ async def _try_ddgs(query: str, count: int) -> List[Dict] | None:
         logger.debug(f"DDGS failed {e}")
     return None
 
+async def _fetch_full_content(results: List[Dict], max_pages: int = 2, max_chars: int = 1500) -> None:
+    """Fetch full page text for top results and expand their content in-place (concurrent, capped)."""
+    if not results:
+        return
+    import asyncio
+    # Only expand top N that have thin snippets or news queries
+    targets = [r for r in results[:max_pages] if len(r.get("content","")) < 400]
+    if not targets:
+        return
+    async def _fetch_one(r: Dict):
+        url = r.get("url","")
+        if not url or not url.startswith("http"):
+            return
+        try:
+            async with httpx.AsyncClient(timeout=4.0, follow_redirects=True, headers={"User-Agent":"Mozilla/5.0"}) as client:
+                resp = await client.get(url)
+                if resp.status_code != 200 or len(resp.text) < 500:
+                    return
+                from lxml import html as lxh
+                tree = lxh.fromstring(resp.text)
+                # Remove scripts/styles/nav
+                for el in tree.xpath('//script|//style|//nav|//header|//footer|//aside'):
+                    el.getparent().remove(el) if el.getparent() is not None else None
+                # Prefer article/main, fallback to all <p>
+                paras = tree.xpath('//article//p//text() | //main//p//text()')
+                if len(paras) < 3:
+                    paras = tree.xpath('//div[contains(@class,"content")]//p//text()')
+                if len(paras) < 3:
+                    paras = tree.xpath('//p//text()')
+                text = " ".join(p.strip() for p in paras if p.strip())
+                text = re.sub(r"\s+", " ", text).strip()
+                if len(text) > 300:
+                    # Append full text to existing snippet, keep snippet first
+                    extra = text[:max_chars]
+                    if extra not in r.get("content",""):
+                        r["content"] = r.get("content","") + "\n\nFull page: " + extra
+        except Exception:
+            pass
+    try:
+        await asyncio.gather(*[_fetch_one(r) for r in targets])
+    except Exception:
+        pass
+
 async def _try_lite_scrape(query: str, count: int) -> List[Dict] | None:
     """Scrape lite.duckduckgo.com as last network attempt (no API key)"""
     try:
@@ -273,6 +308,61 @@ def _relevance_score(query: str, results: List[Dict]) -> float:
     score = hits / min(3, len(results))
     return score
 
+EMBED_URL = "http://127.0.0.1:11434/v1/embeddings"
+EMBED_MODEL = "bge-small"
+
+async def _embed_batch(texts: List[str]) -> List[List[float]]:
+    """Batch embed via bge-small on :11434 (already running). Returns [] on failure."""
+    if not texts:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.post(EMBED_URL, json={"model": EMBED_MODEL, "input": texts})
+            if resp.status_code == 200:
+                data = resp.json()
+                items = data.get("data", [])
+                # sort by index just in case
+                items = sorted(items, key=lambda x: x.get("index", 0))
+                return [it["embedding"] for it in items if "embedding" in it]
+    except Exception as e:
+        logger.debug(f"embed batch failed {e}")
+    return []
+
+def _cosine(a: List[float], b: List[float]) -> float:
+    import math
+    dot = sum(x*y for x, y in zip(a, b))
+    na = math.sqrt(sum(x*x for x in a)) or 1e-9
+    nb = math.sqrt(sum(y*y for y in b)) or 1e-9
+    return dot / (na * nb)
+
+async def _rerank_with_embeddings(query: str, results: List[Dict]) -> tuple[List[Dict], float]:
+    """Semantic rerank via bge-small. Returns (reranked_results, semantic_score 0..1)."""
+    if not results or len(results) < 2:
+        return results, _relevance_score(query, results)
+    try:
+        texts = [f"{r.get('title','')} {r.get('content','')[:400]}" for r in results]
+        embs = await _embed_batch([query] + texts)
+        if len(embs) != len(texts) + 1:
+            return results, _relevance_score(query, results)
+        q_emb = embs[0]
+        scored = []
+        for r, e in zip(results, embs[1:]):
+            s = _cosine(q_emb, e)
+            # map cosine -1..1 to 0..1, bge-small typical 0.3..0.9 for relevant
+            norm = (s + 1) / 2
+            scored.append((norm, r))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        reranked = [r for _, r in scored]
+        # semantic score = mean top-3 cosine norm
+        top = [s for s, _ in scored[:3]]
+        sem_score = sum(top) / len(top) if top else 0
+        # Convert to 0..1 relevance comparable to keyword score: threshold ~0.65 is good
+        # Keep as 0..1 for decision logic; caller can blend
+        return reranked, sem_score
+    except Exception as e:
+        logger.debug(f"embedding rerank failed {e}")
+        return results, _relevance_score(query, results)
+
 def _mock_search(query: str, count: int) -> List[Dict]:
     """Generic mock only for truly offline case — no curated cheating"""
     return [
@@ -303,6 +393,14 @@ async def web_search(query: str, count: int = 5) -> Dict:
     t0 = time.time()
     def _score(rs):
         return _relevance_score(query, rs) if rs else 0.0
+    # Helper to enrich top results with full page text (for more informative answers)
+    async def _maybe_enrich(results: List[Dict] | None):
+        if results and len(results) >= 1:
+            # Enrich when snippet is thin or query asks for news/details
+            thin = any(len(r.get("content","")) < 300 for r in results[:2])
+            is_detailed = bool(re.search(r"(news|headlines|details|explain|summary|full|article|新闻|头条)", query.lower()))
+            if thin or is_detailed:
+                await _fetch_full_content(results, max_pages=2, max_chars=1200)
     # 0) direct weather source (wttr.in) — zh+en weather queries get real forecast numbers,
     #    avoiding generic bing pages (baike/attractions) that make the LLM refuse to answer.
     wttr = await _wttr_weather(query)
@@ -325,6 +423,17 @@ async def web_search(query: str, count: int = 5) -> Dict:
     source = "searxng"
     best_score = _score(results)
     logger.info(f"SearXNG relevance for '{query}' = {best_score:.2f}")
+    # 1b) embedding rerank when keyword score is uncertain (0.34-0.65) — semantic helps paraphrases like "big news days"
+    if results and 0.34 <= best_score < 0.65:
+        try:
+            reranked, sem_score = await _rerank_with_embeddings(query, results)
+            if sem_score > 0.65 and reranked is not results:
+                logger.info(f"  -> embedding rerank improved {best_score:.2f} -> {sem_score:.2f}")
+                results = reranked
+                best_score = max(best_score, sem_score * 0.85)  # blend, keep honest
+                source = f"{source}+emb"
+        except Exception as e:
+            logger.debug(f"embedding rerank skip {e}")
     # 2) if low relevance -> crafted entity-first queries, force bing (only functional engine; ddg=CAPTCHA, google=off)
     if results is None or best_score < 0.34:
         done = False
@@ -353,6 +462,18 @@ async def web_search(query: str, count: int = 5) -> Dict:
     if not results:
         # truly no network: generic mock (explicitly flagged)
         results, source = _mock_search(query, count), "mock-offline"
+
+    # Enrich top results with full page text for more informative answers (concurrent, capped)
+    await _maybe_enrich(results)
+    # Final embedding rerank after enrichment if still borderline
+    if results and best_score < 0.5 and source not in ("wttr.in", "mock-offline"):
+        try:
+            reranked, sem_score = await _rerank_with_embeddings(query, results)
+            if sem_score > 0.62:
+                results = reranked
+                source = f"{source}+emb-full"
+        except Exception:
+            pass
 
     latency = int((time.time()-t0)*1000)
     payload = {"query": query, "results": results[:count], "source": source, "latency_ms": latency, "cached": False}
