@@ -220,6 +220,8 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="default
             logger.exception(f"sender_loop error {e}")
 
     sender_task = asyncio.create_task(sender_loop())
+    # Track active direct_tts tasks for barge-in cancellation
+    active_tts_tasks = set()
     try:
         while True:
             try:
@@ -246,11 +248,20 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="default
                 elif t == "stop":
                     await pcm_queue.put({"type":"flush"})
                 elif t == "barge_in":
-                    logger.info("barge_in received")
+                    logger.info("barge_in received — cancelling active TTS")
+                    for task in list(active_tts_tasks):
+                        task.cancel()
+                    active_tts_tasks.clear()
+                    try:
+                        await websocket.send_text(json.dumps({"type": "barge_in", "reason": "audio"}))
+                    except: pass
                 elif t == "text_input":
-                    # Barge-in on new textual input: cancel current TTS/sender (like audio barge-in)
-                    # Note: speaking state is frontend-side, but we signal barge-in anyway to clear TTS queue
-                    logger.info(f"text_input barge-in: new query '{data.get('text','')[:30]}'")
+                    # Barge-in: cancel previous TTS/LLM generation before starting new one
+                    if active_tts_tasks:
+                        logger.info(f"text_input barge-in: cancelling {len(active_tts_tasks)} active TTS tasks for new query '{data.get('text','')[:30]}'")
+                        for task in list(active_tts_tasks):
+                            task.cancel()
+                        active_tts_tasks.clear()
                     try:
                         await websocket.send_text(json.dumps({"type": "barge_in", "reason": "text_input"}))
                     except: pass
@@ -368,7 +379,11 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="default
                                 await websocket.send_text(json.dumps({"type":"tts_end"}))
                                 break
                         # also record latency if we had tool calls
-                    asyncio.create_task(direct_tts())
+                    _task = asyncio.create_task(direct_tts())
+                    active_tts_tasks.add(_task)
+                    def _done_callback(t):
+                        active_tts_tasks.discard(t)
+                    _task.add_done_callback(_done_callback)
                 elif t == "web_search":
                     # explicit tool trigger from frontend
                     q = data.get("query") or data.get("q") or ""
