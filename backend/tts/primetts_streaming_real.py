@@ -58,19 +58,26 @@ class StreamingPrimeTTSReal:
     def _load_streaming(self):
         from huggingface_hub import hf_hub_download
         import onnxruntime as ort
-        # Download streaming split - use v21_streaming (latest streaming) or fallback to v2stream_streaming
-        # Try v21_streaming first (116MB total)
-        try:
-            enc_path = hf_hub_download(self.model_id, "v21_streaming/v21_enc.onnx")
-            dec_path = hf_hub_download(self.model_id, "v21_streaming/v21_dec.onnx")
-            self.enc_path = enc_path
-            self.dec_path = dec_path
-        except Exception as e:
-            logger.warning(f"v21_streaming not found {e}, trying v2stream_streaming")
-            enc_path = hf_hub_download(self.model_id, "v2stream_streaming/v2stream_enc.onnx")
-            dec_path = hf_hub_download(self.model_id, "v2stream_streaming/v2stream_dec.onnx")
-            self.enc_path = enc_path
-            self.dec_path = dec_path
+        # Check local cache first (already downloaded in /tmp/PrimeTTS_test)
+        local_enc = Path("/tmp/PrimeTTS_test/v21_streaming/v21_enc.onnx")
+        local_dec = Path("/tmp/PrimeTTS_test/v21_streaming/v21_dec.onnx")
+        if local_enc.exists() and local_dec.exists():
+            self.enc_path = str(local_enc)
+            self.dec_path = str(local_dec)
+            logger.info(f"PrimeTTS using local cache {self.enc_path}")
+        else:
+            # Download streaming split - use v21_streaming (latest streaming) or fallback to v2stream_streaming
+            try:
+                enc_path = hf_hub_download(self.model_id, "v21_streaming/v21_enc.onnx")
+                dec_path = hf_hub_download(self.model_id, "v21_streaming/v21_dec.onnx")
+                self.enc_path = enc_path
+                self.dec_path = dec_path
+            except Exception as e:
+                logger.warning(f"v21_streaming not found {e}, trying v2stream_streaming")
+                enc_path = hf_hub_download(self.model_id, "v2stream_streaming/v2stream_enc.onnx")
+                dec_path = hf_hub_download(self.model_id, "v2stream_streaming/v2stream_dec.onnx")
+                self.enc_path = enc_path
+                self.dec_path = dec_path
 
         # Also ensure frontend scripts are available - download via hf
         try:

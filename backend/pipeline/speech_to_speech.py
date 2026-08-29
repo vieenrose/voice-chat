@@ -74,10 +74,10 @@ if not HF_OFFICIAL:
     # TTFA ~20ms, GGML CUDA. Speaks whole sentences (app.py flush), prosody pauses capped by _compress_silence.
     # Fallback 1: Kokoro-1.0 82M ONNX. Fallback 2: MOSS-TTS-Nano-100M ONNX (CUDA EP).
     try:
-        from tts.qwen3_streaming import StreamingPrimeTTS
-        from tts.qwen3_streaming import SAMPLE_RATE as TTS_SR
-        TTS_NAME = "Qwen3-TTS-0.6b-CustomVoice-Q8"
-        print(f"[TTS] Using Qwen3-TTS 12Hz 0.6B CustomVoice Q8_0 (faster_qwen3_tts cu124, TRUE streaming, 24k)")
+        from tts.primetts_streaming_real import StreamingPrimeTTSReal as StreamingPrimeTTS
+        from tts.primetts_streaming_real import SAMPLE_RATE as TTS_SR
+        TTS_NAME = "PrimeTTS-v2-streaming"
+        print(f"[TTS] Using PrimeTTS v2 streaming 16k (Luigi/PrimeTTS v21_streaming ONNX, TRUE streaming, 16k) — more stable")
     except ImportError as e_q3:
         print(f"[TTS] Qwen3-TTS not ready {e_q3}, fallback Kokoro-1.0 82M")
         try:
