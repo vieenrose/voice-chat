@@ -316,8 +316,11 @@ def _relevance_score(query: str, results: List[Dict]) -> float:
     score = hits / min(3, len(results))
     return score
 
-EMBED_URL = "http://127.0.0.1:11434/v1/embeddings"
-EMBED_MODEL = "granite-embedding"
+import os
+EMBED_URL = os.getenv("EMBED_API_BASE", "http://127.0.0.1:11434/v1/embeddings")
+if not EMBED_URL.endswith("/embeddings"):
+    EMBED_URL = EMBED_URL.rstrip("/") + "/embeddings"
+EMBED_MODEL = os.getenv("EMBED_MODEL", "granite-embedding")
 
 async def _embed_batch(texts: List[str]) -> List[List[float]]:
     """Batch embed via granite-97m Q8 GGUF on :11434 (115MB, 384d, zh-TW+en, CUDA)."""

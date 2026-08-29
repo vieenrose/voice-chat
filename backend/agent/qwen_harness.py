@@ -126,9 +126,12 @@ class QwenDateTime(BaseTool):
         return fmt
 
 def _make_agent():
+    import os
+    _base = os.getenv("LLM_API_BASE", "http://127.0.0.1:11435/v1")
+    _model = os.getenv("LLM_MODEL_ID", "qwen3.5-0.8b")
     llm_cfg = {
-        'model': 'qwen3.5-0.8b',
-        'model_server': 'http://127.0.0.1:11435/v1',
+        'model': _model,
+        'model_server': _base,
         'api_key': 'none',
         'generate_cfg': {
             'max_tokens': 1024,

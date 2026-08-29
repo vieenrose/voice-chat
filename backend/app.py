@@ -480,7 +480,9 @@ def main():
     args = parser.parse_args()
     global MOCK_MODE, pipeline, SEARXNG_URL
     MOCK_MODE = args.mock
-    SEARXNG_URL = f"http://localhost:{args.searxng_port}"
+    # Respect Docker env SEARXNG_URL (e.g., http://searxng:8080) if set, else use localhost:port
+    if not os.getenv("SEARXNG_URL"):
+        SEARXNG_URL = f"http://localhost:{args.searxng_port}"
     import torch
     if not torch.cuda.is_available():
         args.device = "cpu"
