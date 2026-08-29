@@ -25,43 +25,21 @@ from loguru import logger
 _CACHE: Dict[str, dict] = {}
 CACHE_TTL = 300  # 5 min
 
-MOCK_DB = {
-    "台湾": [
-        {"title": "台湾今日重大事件 — 立法院新法案通过", "url": "https://news.example/taiwan-today", "content": "台北今日：立法院通过重要科技经济法案；台中、高雄天气晴朗 28°C；台股上涨1.2%；重大交通建设启动。"},
-        {"title": "台湾新闻 — 今日焦点", "url": "https://news.example/taiwan-news", "content": "今日台湾焦点：科技产业发布新成果，天气稳定，社会活动正常。"},
-    ],
-    "weather": [
-        {"title": "Paris Weather Today — 18°C Sunny", "url": "https://weather.example/paris", "content": "Paris today: 18°C, sunny, humidity 45%, wind 10km/h NW. Perfect outdoor weather."},
-        {"title": "Weather Forecast Paris 7 days", "url": "https://weather.example/paris7", "content": "Weekly forecast: Mon 18°C sunny, Tue 17°C cloudy, Wed 20°C rainy."},
-    ],
-    "ai news": [
-        {"title": "Latest AI News — OpenAI GPT-5 rumored 2026", "url": "https://news.example/ai-gpt5", "content": "OpenAI reportedly training GPT-5 with 10T parameters, release late 2026. MiniCPM5 also updated with tool calling."},
-        {"title": "SearXNG 2026 update — faster metasearch", "url": "https://searxng.example/update", "content": "SearXNG self-hosted search now supports 200+ engines, privacy-preserving, no tracking."},
-        {"title": "PrimeTTS v2 released", "url": "https://tts.example/primetts", "content": "PrimeTTS streaming TTS now 120ms TTFB, supports en/zh multi-speaker."},
-    ],
-    "python": [
-        {"title": "Python 3.14 released — what's new", "url": "https://python.org/3.14", "content": "Python 3.14 adds JIT, free-threaded mode, and faster asyncio. Voice chat demo uses 3.14."},
-        {"title": "HuggingFace Speech-to-Speech pipeline", "url": "https://huggingface.co/docs/transformers/speech_to_speech", "content": "HF speech-to-speech pipeline composes STT→LLM→TTS with streaming, used in this demo."},
-    ],
-    "minicpm": [
-        {"title": "MiniCPM5-1B — OpenBMB lightweight LLM", "url": "https://huggingface.co/openbmb/MiniCPM5-1B", "content": "MiniCPM5-1B: 1B params, 32k context, tool calling, on-device, Apache 2.0. Powers this voice assistant."},
-    ],
-    "searxng": [
-        {"title": "SearXNG — self-hosted metasearch", "url": "https://docs.searxng.org", "content": "SearXNG is a self-hosted, privacy-respecting metasearch that aggregates 200+ engines without tracking. Self-host via Docker or pip."},
-    ],
-}
+# No curated mock DB — honest search only; generic mock below is only for truly offline case
 
 def _cache_key(query: str, count: int) -> str:
     return hashlib.md5(f"{query.lower().strip()}::{count}".encode()).hexdigest()
 
-def format_results(results: List[Dict], max_chars=1800) -> str:
-    """Format search results for LLM context (compact, <1800 chars)"""
+def format_results(results: List[Dict], max_chars=4000) -> str:
+    """Format search results for LLM context (rich, <4000 chars) — keep snippets long for informative answers"""
     lines = []
     for i, r in enumerate(results[:5], 1):
-        title = r.get("title","")[:120]
+        title = r.get("title","")[:150]
         url = r.get("url","")
-        content = r.get("content","")[:300].replace("\n"," ")
-        lines.append(f"[{i}] {title}\n    URL: {url}\n    Snippet: {content}")
+        content = r.get("content","")[:600].replace("\n"," ").strip()
+        if not content:
+            content = r.get("title","")
+        lines.append(f"[{i}] {title}\n    URL: {url}\n    Date/Snippet: {content}")
     txt = "\n".join(lines)
     return txt[:max_chars]
 
@@ -183,7 +161,10 @@ async def _try_searxng(query: str, count: int, engine: str | None = None) -> Lis
         async with httpx.AsyncClient(timeout=5.0) as client:
             # language: zh for Chinese, EN otherwise (bing with language=all returns zh-biased junk)
             _lang = "zh-TW" if ("台灣" in query or "台湾" in query) else ("zh-CN" if _is_chinese(query) else "en")
-            params = {"q": query, "format": "json", "categories": "general", "pageno": 1,
+            # Use news category for news queries to get actual articles, not generic topic pages
+            _is_news = bool(re.search(r"(news|headlines|頭條|新聞|breaking|latest.*news|news.*today)", query.lower()))
+            _cat = "news" if _is_news else "general"
+            params = {"q": query, "format": "json", "categories": _cat, "pageno": 1,
                       "language": _lang, "safesearch": 1}
             if engine:
                 params["engines"] = engine
@@ -290,23 +271,10 @@ def _relevance_score(query: str, results: List[Dict]) -> float:
         if matched >= needed:
             hits += 1
     score = hits / min(3, len(results))
-    # Also check curated mock keyword: if query is curated and SearXNG low, force fallback
-    curated_hit = any(k in ql for k in MOCK_DB.keys())
-    if curated_hit and score < 0.5:
-        return 0.2  # force fallback to curated
     return score
 
 def _mock_search(query: str, count: int) -> List[Dict]:
-    """Deterministic mock based on keywords - curated for demo, used when SearXNG irrelevant"""
-    ql = query.lower()
-    # find best mock key
-    best = []
-    for key, vals in MOCK_DB.items():
-        if key in ql or any(w in ql for w in key.split()):
-            best.extend(vals)
-    if best:
-        return best[:count]
-    # generic mock
+    """Generic mock only for truly offline case — no curated cheating"""
     return [
         {"title": f"Search results for '{query}' — mock result {i+1}", "url": f"https://example.com/search?q={query.replace(' ','+')}&i={i}", "content": f"This is a mock snippet for query '{query}'. The assistant is in mock mode without network, but tool calling pipeline is working. Result {i+1} contains synthesized information about {query}."}
         for i in range(min(count,3))
@@ -381,15 +349,8 @@ async def web_search(query: str, count: int = 5) -> Dict:
         lite = await _try_lite_scrape(query, count)
         if lite and _score(lite) > best_score:
             results, source, best_score = lite, "lite_scrape", _score(lite)
-    # 4) curated ONLY for specific demo keywords; otherwise keep the best real results
-    curated_hit = any(k in query.lower() for k in MOCK_DB.keys())
-    if (not results or best_score < 0.34) and curated_hit:
-        mock_results = _mock_search(query, count)
-        if mock_results and not mock_results[0]["title"].startswith("Search results for"):
-            results, source = mock_results, "mock-curated"
-        elif not results:
-            results, source = _mock_search(query, count), "mock"
-    elif not results:
+    # 4) only generic mock when truly no network results — no curated cheating
+    if not results:
         # truly no network: generic mock (explicitly flagged)
         results, source = _mock_search(query, count), "mock-offline"
 

@@ -520,6 +520,7 @@
   :global(body.light) .searxng-badge{background:#e9f8f0; border-color:#bfe6d0}
   :global(body.light) .searxng-badge.ok{color:#0aa06a}
   :global(body.light) .lat b{color:#1a1a24}
+  @keyframes pulse { 0%{opacity:0.4} 50%{opacity:1} 100%{opacity:0.4} }
 </style>
 
 <div class="wrap">
