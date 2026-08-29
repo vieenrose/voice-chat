@@ -141,7 +141,7 @@
   }
   function stopMic(){ listening=false; if(animId) cancelAnimationFrame(animId); if(workletNode){ try{workletNode.disconnect();}catch(e){} workletNode=null; } if(mediaStream){ mediaStream.getTracks().forEach(t=>t.stop()); mediaStream=null; } if(audioCtx){ try{audioCtx.close();}catch(e){} audioCtx=null; } audioLevel=0; if(ws && ws.readyState===1) ws.send(JSON.stringify({type:'stop'})); }
   function sendPCM(pcm16){ if(!ws || ws.readyState!==1) return; const header = new Uint8Array(1); header[0]=0x01; const out = new Uint8Array(1 + pcm16.byteLength); out.set(header,0); out.set(new Uint8Array(pcm16.buffer),1); try{ ws.send(out); }catch(e){ const b64 = btoa(String.fromCharCode(...new Uint8Array(pcm16.buffer))); ws.send(JSON.stringify({type:'audio_chunk', pcm:b64, sampleRate:16000})); } }
-  function sendText(text){ if(!ws || ws.readyState!==1){ connect(); setTimeout(()=>sendText(text),500); return; } ws.send(JSON.stringify({type:'text_input', text})); chatHistory=[...chatHistory, {role:'user', text}]; llmStreaming=''; }
+  function sendText(text){ if(!ws || ws.readyState!==1){ connect(); setTimeout(()=>sendText(text),500); return; } if(speaking) bargeIn(); ws.send(JSON.stringify({type:'text_input', text})); chatHistory=[...chatHistory, {role:'user', text}]; llmStreaming=''; }
   function bargeIn(){ if(ws && ws.readyState===1) ws.send(JSON.stringify({type:'barge_in'})); jitterQueue=[]; nextPlayTime=0; speaking=false; if(playCtx){ try{playCtx.close();}catch(e){} playCtx=null; nextPlayTime=0; } }
   let playCtx = null;
   function ensurePlayCtx(sampleRate){
