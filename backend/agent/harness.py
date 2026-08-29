@@ -87,11 +87,20 @@ class WebSearchTool(Tool):
             return "ERROR: Use get_weather(location, date) for weather queries, not web_search."
         from tools.web_search import web_search_sync, format_results
         import json as _json
+        # Handle JSON string from some models: '{"query": "..."}' or '["q1","q2"]'
+        _q = query.strip() if isinstance(query, str) else query
+        if isinstance(_q, str) and _q.startswith('{'):
+            try:
+                d = _json.loads(_q)
+                if isinstance(d, dict) and 'query' in d:
+                    query = str(d['query']).strip()
+                    _q = query
+            except: pass
         # Apodex-style multi-query: accept JSON list or single string
         queries = query
-        if isinstance(query, str) and query.strip().startswith("["):
+        if isinstance(_q, str) and _q.strip().startswith("["):
             try:
-                parsed = _json.loads(query)
+                parsed = _json.loads(_q)
                 if isinstance(parsed, list):
                     queries = parsed
             except: pass

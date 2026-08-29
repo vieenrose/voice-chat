@@ -140,6 +140,9 @@ async def _try_searxng(query: str, count: int, engine: str | None = None) -> Lis
                 results = data.get("results") or data.get("answers") or []
                 out = []
                 for r in results:
+                    # Honest: skip mock-offline fallback from minimal server — trigger real fallback instead
+                    if (r.get("engine") or "").startswith("mock"):
+                        continue
                     title = r.get("title") or r.get("answer") or "Result"
                     url = r.get("url") or r.get("source") or ""
                     content = r.get("content") or r.get("answer") or ""
@@ -255,6 +258,38 @@ async def _try_lite_scrape(query: str, count: int) -> List[Dict] | None:
         logger.debug(f"lite scrape failed {e}")
     return None
 
+async def _try_bing(query: str, count: int) -> List[Dict] | None:
+    """Scrape Bing as honest fallback when DDG/lite are CAPTCHA-blocked (no API key)."""
+    q = query.strip()
+    if q.lower().startswith("!bing "):
+        q = q[6:].strip()
+    try:
+        import httpx
+        from lxml import html as lhtml
+        async with httpx.AsyncClient(timeout=5.0, headers={"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}, follow_redirects=True) as client:
+            resp = await client.get("https://www.bing.com/search", params={"q": q, "form":"QBRE"})
+            if resp.status_code != 200:
+                return None
+            tree = lhtml.fromstring(resp.text)
+            out = []
+            for li in tree.xpath('//li[contains(@class,"b_algo")]')[:count*2]:
+                a = li.xpath('.//h2/a')
+                if not a: continue
+                title = a[0].text_content().strip()[:140]
+                url = a[0].get("href","")
+                snippet = " ".join(li.xpath('.//p//text()')).strip()[:320]
+                if not snippet:
+                    snippet = " ".join(li.xpath('.//div[contains(@class,"b_caption")]//p//text()')).strip()[:320]
+                if title and url and url.startswith("http"):
+                    out.append({"title": title, "url": url, "content": snippet})
+                if len(out) >= count: break
+            if out:
+                logger.info(f"web_search via bing scrape: {q} -> {len(out)}")
+                return out
+    except Exception as e:
+        logger.debug(f"bing scrape failed {e}")
+    return None
+
 def _relevance_score(query: str, results: List[Dict]) -> float:
     """Score 0..1 how relevant results are to query. Low = bad search, should fallback."""
     ql = query.lower()
@@ -346,7 +381,16 @@ async def web_search(query: str, count: int = 5) -> Dict:
     Tool function: web_search
     Returns {"query": str, "results": List[Dict], "source": str, "latency_ms": int}
     """
-    query = query.strip()
+    # Robustness: model sometimes sends JSON string '{"query": "..."}'
+    _raw = query.strip() if isinstance(query, str) else str(query).strip()
+    if _raw.startswith('{'):
+        try:
+            import json as _js
+            d = _js.loads(_raw)
+            if isinstance(d, dict) and 'query' in d:
+                _raw = str(d['query']).strip()
+        except: pass
+    query = _raw.strip()
     if not query:
         return {"query": query, "results": [], "source": "none", "latency_ms": 0}
     ck = _cache_key(query, count)
@@ -429,6 +473,10 @@ async def web_search(query: str, count: int = 5) -> Dict:
         lite = await _try_lite_scrape(query, count)
         if lite and _score(lite) > best_score:
             results, source, best_score = lite, "lite_scrape", _score(lite)
+    if best_score < 0.34:
+        bing = await _try_bing(query, count)
+        if bing and _score(bing) > best_score:
+            results, source, best_score = bing, "bing_scrape", _score(bing)
     if not results:
         latency = int((time.time()-t0)*1000)
         payload = {"query": query, "results": [], "source": "no_results", "latency_ms": latency, "cached": False}

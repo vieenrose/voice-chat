@@ -42,8 +42,23 @@ class QwenWebSearch(BaseTool):
         'required': ['query']
     }
     def call(self, params, **kwargs):
-        import asyncio
-        query = params if isinstance(params, str) else params.get('query', '')
+        import asyncio, json as _json
+        # Qwen-Agent sometimes passes JSON string '{"query": "..."}' or dict
+        if isinstance(params, str):
+            s = params.strip()
+            if s.startswith('{'):
+                try:
+                    d = _json.loads(s)
+                    if isinstance(d, dict) and 'query' in d:
+                        query = str(d['query']).strip()
+                    else:
+                        query = s
+                except:
+                    query = s
+            else:
+                query = s
+        else:
+            query = params.get('query', '') if isinstance(params, dict) else ''
         _EMIT.emit({"type": "tool_call", "name": "web_search", "arguments": {"query": query}, "query": query})
         # Use sync version for Qwen-Agent (which is sync)
         from tools.web_search import web_search_sync, format_results
@@ -141,14 +156,35 @@ async def run_agent_task(task: str, event_q=None) -> str:
     def _run():
         try:
             messages = [{'role': 'user', 'content': task}]
+            last_resp = None
             for resp in agent.run(messages=messages):
-                pass
-            # Get last response
+                last_resp = resp
+            # Try to extract from last_resp first (most reliable)
+            if last_resp:
+                # last_resp can be List[Dict] or Dict
+                candidates = last_resp if isinstance(last_resp, list) else [last_resp]
+                for m in reversed(candidates):
+                    if isinstance(m, dict) and m.get('role') == 'assistant' and m.get('content'):
+                        c = m['content']
+                        if isinstance(c, str) and c.strip():
+                            return c
+                        if isinstance(c, list):
+                            # content as list of blocks
+                            txt = "".join(b.get('text','') if isinstance(b, dict) else str(b) for b in c)
+                            if txt.strip(): return txt
+            # Fallback to memory
             if hasattr(agent, 'memory') and agent.memory:
-                # Try to get last assistant message
-                for m in reversed(agent.memory.get_history() if hasattr(agent.memory, 'get_history') else []):
+                hist = agent.memory.get_history() if hasattr(agent.memory, 'get_history') else []
+                for m in reversed(hist):
                     if m.get('role') == 'assistant' and m.get('content'):
-                        return m['content']
+                        c = m['content']
+                        if isinstance(c, str) and c.strip() and 'could not find' not in c.lower():
+                            return c
+                        if isinstance(c, str) and c.strip():
+                            return c
+            # If last_resp was list but not captured, try stringifying
+            if last_resp:
+                return str(last_resp)[:2000]
             return "Sorry, I could not find an answer."
         except Exception as e:
             logger.exception(f"qwen agent failed: {e}")
