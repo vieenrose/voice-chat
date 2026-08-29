@@ -2,6 +2,8 @@
 Qwen-Agent harness for Qwen3.5-2B voice chat.
 Wraps Qwen-Agent's Assistant with our SearXNG + wttr + granite tools.
 """
+import os
+os.environ["QWEN_AGENT_MAX_LLM_CALL_PER_RUN"] = "3"  # voice: cap at 3 LLM calls (1 tool + final) to prevent 8× loop
 import asyncio
 from loguru import logger
 from qwen_agent.agents import Assistant
@@ -134,7 +136,7 @@ def _make_agent():
         'model_server': _base,
         'api_key': 'none',
         'generate_cfg': {
-            'max_tokens': 1024,
+            'max_tokens': 512,
             'temperature': 0.7,
             'top_p': 0.9,
             'chat_template_kwargs': {'enable_thinking': True},
@@ -145,7 +147,7 @@ def _make_agent():
     return Assistant(
         llm=llm_cfg,
         function_list=['web_search', 'get_weather', 'get_current_datetime'],
-        system_message="You are a helpful voice assistant. For weather use get_weather(location, date). For general search use web_search. For date/time use get_current_datetime. Always answer in the user's language."
+        system_message="You are a helpful voice assistant. For weather use get_weather(location, date) — 1 call max. For general search use web_search — 1 call max with 3-8 words, then answer. For date/time use get_current_datetime — 1 call max. Never do more than 2 tool calls per turn. Always answer in the user's language."
     )
 
 _agent = None
