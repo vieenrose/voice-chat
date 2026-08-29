@@ -27,6 +27,15 @@ def _strip_tool_xml(t: str) -> str:
     return t.strip(" \n,;")
 
 
+def _intent_wants_search(prompt: str) -> bool:
+    """Agent harness intent: does this query really need live info (search)?."""
+    pl = prompt.lower()
+    needs = bool(re.search(r"(news|headlines|head line|新闻|新聞|天气|天氣|weather|forecast|预报|預報|最新|breaking|current|prices|stock|score|result|谁|who is|what is the (latest|current)|\d{4}年)", pl, re.I)) \
+        or bool(re.search(r"(big news|today|tonight|this week) ", pl, re.I))
+    dateonly = bool(re.search(r"(what day|what date|星期几|周几|几号|什么时间|几点|what time|today's date|current time)", pl, re.I))
+    return needs and not dateonly
+
+
 # Ling 3.0 tiny supports tool calling via <tool_call> XML, same as before
 TOOL_DEFS = [
     {
@@ -237,6 +246,59 @@ class LingStreaming:
             yield {"type": "llm_done", "text": text_so_far}
 
     async def generate_chat_with_tools(self, history: List[Dict], prompt: str, max_new_tokens: int = 256) -> AsyncGenerator[dict, None]:
+        """SMOLAGENTS-driven agent loop: model plans + calls tools (web_search / get_current_datetime)
+        for up to MAX_STEPS, then produces the final answer. Legacy inline loop kept as fallback."""
+        try:
+            from agent.harness import run_agent_task
+            _HARNESS = True
+        except Exception as e:
+            logger.warning(f"smolagents harness unavailable ({e}) -> legacy loop")
+            _HARNESS = False
+        if not _HARNESS:
+            async for ev in self._legacy_chat_with_tools(history, prompt, max_new_tokens=max_new_tokens):
+                yield ev
+            return
+
+        if history:
+            _hist = "\n".join([f"{m.get('role')}: {m.get('content','')[:120]}" for m in history[-4:]])
+            task_str = f"Conversation history:\n{_hist}\n\nCurrent question: {prompt}"
+        else:
+            task_str = prompt
+        q = asyncio.Queue()
+        task = asyncio.create_task(run_agent_task(task_str, q))
+        final_text = ""
+        while True:
+            try:
+                ev = await asyncio.wait_for(q.get(), timeout=0.05)
+            except asyncio.TimeoutError:
+                if task.done():
+                    break
+                continue
+            if ev["type"] == "tool_call":
+                yield {"type": "tool_call", "name": ev["name"],
+                       "arguments": ev.get("arguments", {}), "query": ev.get("query", "")}
+            elif ev["type"] == "tool_result":
+                yield {"type": "tool_result", "name": ev["name"], "result": ev.get("result"),
+                       "formatted": ev.get("formatted", ""), "latency_ms": ev.get("latency_ms", 0),
+                       "source": ev.get("source", "")}
+        final_text = await task
+        if not isinstance(final_text, str):
+            final_text = str(final_text)
+        if "<tool_call>" in final_text or "<arg_" in final_text:
+            final_text = _strip_tool_xml(final_text)
+        final_text = re.sub(r"<[^>]+>", " ", final_text)
+        final_text = " ".join(final_text.split())
+        if not final_text.strip():
+            final_text = "Sorry, I could not find a clear answer to that."
+        _t0 = time.time(); _sf = ""
+        for tok in final_text:
+            _sf += tok
+            yield {"type": "llm_token", "token": tok, "text_so_far": _sf,
+                   "latency_ms": int((time.time()-_t0)*1000) if len(_sf) == len(tok) else 20}
+            await asyncio.sleep(0)
+        yield {"type": "llm_done", "text": final_text}
+
+    async def _legacy_chat_with_tools(self, history: List[Dict], prompt: str, max_new_tokens: int = 256) -> AsyncGenerator[dict, None]:
         """Multi-turn tool-aware chat using NATIVE tool calling (OpenAI tools=[] on llama-server).
         Loop: model emits tool_call JSON -> we run web_search -> inject tool result -> model answers."""
         try:
@@ -254,8 +316,18 @@ class LingStreaming:
         messages.append({"role": "user", "content": prompt})
         _tools = TOOL_DEFS
 
-        for _round in range(1):  # ONE native tool round (model decides query + whether to search) — then answer. No refine-re-search doubling.
-            # — run model with tools (native) —
+        # ---- Agent harness: bounded multi-round loop ----
+        # R1: model decides tool calls. R2 (only when needed): relevance-gated refinement,
+        # or a forced search when the model skipped an obviously needed tool.
+        MAX_ROUNDS = 2
+        WALL_BUDGET_MS = 18000
+        t_agent_start = time.time()
+        _weak_search = False
+        _saw_web = False
+        for _round in range(MAX_ROUNDS):
+            if (time.time() - t_agent_start) * 1000 > WALL_BUDGET_MS:
+                logger.info("agent wall budget reached -> final answer")
+                break
             # — run model with tools (native) —
             text = ""
             acc: dict[int, dict] = {}
@@ -311,12 +383,22 @@ class LingStreaming:
                         logger.info(f"[LLM Tool] native web_search '{query}'")
                         yield {"type": "tool_call", "name": "web_search", "arguments": _args, "query": query}
                         t_tool = time.time()
+                        _saw_web = True
                         try:
                             search_res = await web_search(query, count=5)
                             formatted = format_results(search_res["results"])
                             yield {"type": "tool_result", "name": "web_search", "result": search_res, "formatted": formatted,
                                    "latency_ms": int((time.time()-t_tool)*1000),
                                    "source": search_res.get("source", "")}
+                            if search_res.get("source") != "wttr.in":
+                                try:
+                                    from tools.web_search import _relevance_score as _rs
+                                    _sc = _rs(query, search_res.get("results", []))
+                                except Exception:
+                                    _sc = 0.99
+                                if _sc < 0.5:
+                                    _weak_search = True
+                                    logger.info(f"[Agent] weak search '{query}' score {_sc:.2f} -> refine")
                         except Exception as e:
                             logger.exception(f"LLM tool search failed {e}")
                             formatted = f"web search failed for '{query}': {e}"
@@ -332,7 +414,18 @@ class LingStreaming:
                     for x in _exec:
                         if "tool_call_id" in x:
                             messages.append({"role": "tool", **x})
-                    continue
+                    # agent decision: another round?
+                    if _round + 1 >= MAX_ROUNDS:
+                        break
+                    if _weak_search:
+                        messages.append({"role": "user", "content":
+                            "The web search results above were weak. Please run web_search again with a shorter, different query about the same topic."})
+                        continue
+                    if not _saw_web and _intent_wants_search(prompt):
+                        messages.append({"role": "user", "content":
+                            f'The answer needs current information. Please call web_search with a simple query about: "{prompt.strip()[:80]}"'})
+                        continue
+                    break
 
             # Ling sometimes emits the tool call as TEMPLATE XML in content instead of delta.tool_calls
             # (e.g. <tool_call><arg_key>query</arg_key><arg_value>Paris weather</arg_value></tool_call>).
@@ -373,6 +466,11 @@ class LingStreaming:
                     return
                 continue
 
+            # no tool call this round
+            if _round + 1 < MAX_ROUNDS and _intent_wants_search(prompt) and not _saw_web:
+                messages.append({"role": "user", "content":
+                    f'The answer needs current information. Please call web_search with a simple query about: "{prompt.strip()[:80]}"'})
+                continue
             # no tool call -> stream final answer
             final_text = ""
             if text:

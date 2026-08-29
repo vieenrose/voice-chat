@@ -1,0 +1,172 @@
+"""
+Agent harness (smolagents 1.26) for the voice chat.
+
+ToolCallingAgent + OpenAI-compatible llama-server (granite-4.2-3b).
+Tools: web_search (SearXNG + wttr.in), get_current_datetime.
+Runs the agent in a worker thread with an OpenAI-compatible model; tool
+executions emit {tool_call, tool_result} events back to the async caller.
+"""
+import asyncio
+import importlib  # noqa: F401  (py3.14: makes importlib.resources visible)
+import importlib.resources
+import json
+import re
+import time
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from typing import List
+
+from loguru import logger
+from smolagents import Tool, ToolCallingAgent, OpenAIServerModel
+
+API_BASE = "http://127.0.0.1:11435/v1"
+MODEL_ID = "granite-4.2-3b"
+MAX_STEPS = 3
+
+
+class GraniteModel(OpenAIServerModel):
+    def __init__(self, *args, **kwargs):
+        # Move chat_template_kwargs into extra_body for openai>=2.28 compatibility
+        ct = kwargs.pop("chat_template_kwargs", None)
+        if ct is not None:
+            eb = kwargs.get("extra_body") or {}
+            eb = dict(eb)
+            eb["chat_template_kwargs"] = ct
+            kwargs["extra_body"] = eb
+        super().__init__(*args, **kwargs)
+
+    def _prepare_completion_kwargs(self, messages, stop_sequences=None, response_format=None, tools_to_call_from=None, custom_role_conversions=None, convert_images_to_image_urls=False, tool_choice=None, **kwargs):
+        if tool_choice is None:
+            tool_choice = "auto"
+        # Ensure chat_template_kwargs is sent via extra_body, not top-level (openai>=2.28 rejects top-level)
+        extra = dict(kwargs.pop("extra_body", {}) or {})
+        # Also check self.kwargs for extra_body from __init__
+        if "chat_template_kwargs" not in extra:
+            self_extra = {}
+            if hasattr(self, "kwargs") and isinstance(self.kwargs.get("extra_body"), dict):
+                self_extra = self.kwargs.get("extra_body", {})
+            if "chat_template_kwargs" in self_extra:
+                extra["chat_template_kwargs"] = self_extra["chat_template_kwargs"]
+            else:
+                extra["chat_template_kwargs"] = {"enable_thinking": False}
+        # Also handle legacy top-level chat_template_kwargs if caller passed it directly
+        if "chat_template_kwargs" in kwargs:
+            extra["chat_template_kwargs"] = kwargs.pop("chat_template_kwargs")
+        kwargs["extra_body"] = extra
+        return super()._prepare_completion_kwargs(messages, stop_sequences, response_format, tools_to_call_from, custom_role_conversions, convert_images_to_image_urls, tool_choice, **kwargs)
+
+
+class _EventEmitter:
+    def __init__(self):
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._q: asyncio.Queue | None = None
+
+    def attach(self, loop: asyncio.AbstractEventLoop, q: asyncio.Queue):
+        self._loop = loop
+        self._q = q
+
+    def emit(self, ev: dict):
+        if self._loop and self._q:
+            self._loop.call_soon_threadsafe(self._q.put_nowait, ev)
+
+_EMIT = _EventEmitter()
+
+
+class WebSearchTool(Tool):
+    name = "web_search"
+    description = "Search the web for current info (weather, news, facts, people, definitions). Returns ranked results with snippets."
+    inputs = {
+        "query": {"type": "string", "description": "search query 3-8 words"},
+        "count": {"type": "integer", "description": "number of results", "nullable": True, "default": 5},
+    }
+    output_type = "string"
+
+    def forward(self, query: str, count: int = 5) -> str:
+        from tools.web_search import web_search_sync, format_results
+        t0 = time.time()
+        _EMIT.emit({"type": "tool_call", "name": "web_search", "arguments": {"query": query}, "query": query})
+        res = web_search_sync(query, count=count)
+        results = res.get("results") or []
+        formatted = format_results(results) if results else "No results found."
+        _EMIT.emit({"type": "tool_result", "name": "web_search", "result": res,
+                    "formatted": formatted, "latency_ms": int((time.time()-t0)*1000),
+                    "source": res.get("source", "")})
+        return formatted
+
+
+class DateTimeTool(Tool):
+    name = "get_current_datetime"
+    description = "Get the current date and time (UTC). Use ONLY for questions about what day/date/time it is (星期几/几号/几点/what day/date). NEVER for weather."
+    inputs = {"timezone": {"type": "string", "description": "optional IANA timezone (e.g. Asia/Taipei); default UTC", "nullable": True}}
+    output_type = "string"
+
+    def forward(self, timezone: str | None = None) -> str:
+        _EMIT.emit({"type": "tool_call", "name": "get_current_datetime", "arguments": {"timezone": timezone or "UTC"}})
+        tz = timezone or "UTC"
+        try:
+            now = datetime.now(ZoneInfo(tz))
+        except Exception:
+            now = datetime.utcnow()
+            tz = "UTC"
+        tom = now + timedelta(days=1)
+        yest = now - timedelta(days=1)
+        fmt = (f"Current date and time: {now.strftime('%A')}, {now.strftime('%Y-%m-%d')} {now.strftime('%H:%M:%S')} ({tz}). "
+               f"Today is {now.strftime('%A')} ({now.strftime('%Y-%m-%d')}). "
+               f"Tomorrow is {tom.strftime('%A')} ({tom.strftime('%Y-%m-%d')}). "
+               f"Yesterday was {yest.strftime('%A')} ({yest.strftime('%Y-%m-%d')}).")
+        _EMIT.emit({"type": "tool_result", "name": "get_current_datetime",
+                    "result": {"date": now.strftime("%Y-%m-%d"), "weekday": now.strftime("%A"),
+                               "time": now.strftime("%H:%M:%S"), "timezone": tz},
+                    "formatted": fmt, "latency_ms": 1, "source": "datetime"})
+        return fmt
+
+
+class _Agent:
+    def __init__(self):
+        self.model = GraniteModel(model_id=MODEL_ID, api_base=API_BASE, api_key="none",
+                                  temperature=1.0, top_p=0.95,
+                                  chat_template_kwargs={"enable_thinking": False})
+        self.agent = ToolCallingAgent(tools=[WebSearchTool(), DateTimeTool()], model=self.model, max_steps=MAX_STEPS, verbosity_level=0, add_base_tools=False, instructions="For greetings respond directly; for weather/news use web_search; for date/time use get_current_datetime.")
+
+    def run(self, task: str) -> str:
+        # Fast path for plain greetings - no tools needed, avoids agent overhead
+        _tl = task.strip().lower()
+        if re.match(r'^\s*(hi|hello|hey|你好|您好|hola|bonjour)\b', _tl, re.I) and len(_tl) < 50 and not re.search(r'(weather|news|search|find|what is|who is|how|can you|please|today|tomorrow|星期|几号|天气|新闻)', _tl, re.I):
+            return "Hello! How can I help you today?" if not re.search(r'[\u4e00-\u9fff]', task) else "你好！有什么可以帮你的？"
+        out = self.agent.run(task, reset=True)
+        return out if isinstance(out, str) else (out.final_answer if hasattr(out, "final_answer") else str(out))
+
+
+_AGENT = None
+
+
+def _get_agent():
+    global _AGENT
+    if _AGENT is None:
+        _AGENT = _Agent()
+    return _AGENT
+
+
+def agent_alive() -> bool:
+    try:
+        import httpx
+        with httpx.Client(timeout=3.0) as c:
+            return c.get(f"{API_BASE}/models").status_code == 200
+    except Exception:
+        return False
+
+
+async def run_agent_task(task: str, event_q: asyncio.Queue | None = None) -> str:
+    """Run the smolagents loop for one user prompt; may emit tool events into event_q."""
+    loop = asyncio.get_running_loop()
+    _EMIT.attach(loop, event_q)
+
+    def _worker():
+        agent = _get_agent()
+        try:
+            return agent.run(task)
+        except Exception as e:
+            logger.exception(f"agent.run failed: {e}")
+            return f"(agent error: {e})"
+
+    return await asyncio.to_thread(_worker)
