@@ -113,6 +113,22 @@ CONTACTS: List[Dict] = [
     {"name": "劉建國", "ext": "1098", "dept": "行銷部", "pinyin": "liu jian guo"},
     {"name": "蔡建國", "ext": "1099", "dept": "客服部", "pinyin": "cai jian guo"},
     {"name": "楊建中", "ext": "1100", "dept": "財務部", "pinyin": "yang jian zhong"},
+    # Mixed zh-TW + en (common in Taiwan offices: English first name + Chinese surname, or vice versa)
+    {"name": "Michael 陳", "ext": "1101", "dept": "研發部", "pinyin": "Michael chen"},
+    {"name": "David 王", "ext": "1102", "dept": "業務部", "pinyin": "David wang"},
+    {"name": "Sarah 林", "ext": "1103", "dept": "行銷部", "pinyin": "Sarah lin"},
+    {"name": "Kevin 黃", "ext": "1104", "dept": "研發部", "pinyin": "Kevin huang"},
+    {"name": "Amy 蔡", "ext": "1105", "dept": "設計部", "pinyin": "Amy cai"},
+    {"name": "John 張", "ext": "1106", "dept": "財務部", "pinyin": "John zhang"},
+    {"name": "陳 Michael", "ext": "1107", "dept": "研發部", "pinyin": "chen Michael"},
+    {"name": "王 David", "ext": "1108", "dept": "客服部", "pinyin": "wang David"},
+    {"name": "林 Sarah", "ext": "1109", "dept": "人資部", "pinyin": "lin Sarah"},
+    {"name": "黃 Kevin", "ext": "1110", "dept": "業務部", "pinyin": "huang Kevin"},
+    {"name": "Emily 劉", "ext": "1111", "dept": "行銷部", "pinyin": "Emily liu"},
+    {"name": "劉 Emily", "ext": "1112", "dept": "客服部", "pinyin": "liu Emily"},
+    {"name": "Chris 吳", "ext": "1113", "dept": "研發部", "pinyin": "Chris wu"},
+    {"name": "吳 Chris", "ext": "1114", "dept": "設計部", "pinyin": "wu Chris"},
+    {"name": "Jennifer 蔡", "ext": "1115", "dept": "業務部", "pinyin": "Jennifer cai"},
 ]
 
 # Build lookup dicts
@@ -122,14 +138,26 @@ for c in CONTACTS:
     _PINYIN_TO_CONTACTS.setdefault(c["pinyin"], []).append(c)
 
 def _to_bopomofo(text: str) -> str:
-    """Convert zh to bopomofo (zhuyin) using pypinyin Style.BOPOMOFO, fallback to char map. Bopomofo is zh-TW standard (ㄅㄆㄇㄈ), better than pinyin for TW ASR."""
+    """Convert zh to bopomofo (zhuyin) using pypinyin Style.BOPOMOFO. For mixed zh+en like 'Michael 陳', keep English lowercased and Chinese as bopomofo.
+    For pure English pinyin like 'Michael Chen' (Chen = 陳), keep as lowercased English for cross-script matching.
+    """
+    has_en = bool(re.search(r"[A-Za-z]", text))
+    has_zh = bool(re.search(r"[\u4e00-\u9fff]", text))
     try:
         from pypinyin import pinyin, Style
-        # BOPOMOFO includes tone marks, e.g. 王->ㄨㄤˊ, 小->ㄒㄧㄠˇ, 明->ㄇㄧㄥˊ
-        pys = pinyin(text, style=Style.BOPOMOFO, errors='ignore')
-        # pys is List[List[str]], flatten and join with space
-        flat = [item[0] for sub in pys for item in [sub] if sub]
-        return " ".join(flat)
+        # For mixed, use BOPOMOFO for zh part, keep en as is (lowercased) for matching
+        if has_zh:
+            pys = pinyin(text, style=Style.BOPOMOFO, errors='ignore')
+            flat = [item[0] for sub in pys for item in [sub] if sub]
+            # If has_en, also append original en lowercased for cross-script (e.g., Michael Chen vs Michael 陳)
+            if has_en:
+                en_parts = re.findall(r"[A-Za-z]+", text)
+                # Add en lowercased as fallback for matching English pinyin surnames
+                return " ".join(flat + [e.lower() for e in en_parts])
+            return " ".join(flat)
+        else:
+            # Pure English like "Michael Chen" - keep lowercased for matching
+            return text.lower()
     except:
         pass
     # Fallback: char -> bopomofo via CONTACTS bopomofo map (if pypinyin not available)
@@ -157,14 +185,18 @@ def find_contact(query: str, top_k: int = 3, threshold: float = 0.65) -> List[Tu
     Handles: 王小明 vs 王小名 (ming vs ming with typo), 陳/程 (chen vs cheng), 黃/王 pinyin confusion, etc.
     """
     query = query.strip()
-    # Extract potential name from sentence: keep 2-4 consecutive zh chars that look like name
-    # e.g., "請幫我查王小明的分機" -> "王小明"
-    m = re.findall(r"[\u4e00-\u9fff]{2,4}", query)
+    # Extract potential name from sentence: handle zh, en, and mixed like "Michael 陳"
+    # e.g., "請幫我查王小明的分機" -> "王小明", "Michael 陳的分機" -> "Michael 陳"
+    m = re.findall(r"[\u4e00-\u9fff]{1,4}(?:\s*[A-Za-z]+)?|[A-Za-z]+(?:\s*[\u4e00-\u9fff]{1,2})?", query)
+    # Also try pure zh 2-4 char names
+    m2 = re.findall(r"[\u4e00-\u9fff]{2,4}", query)
+    m = list(set(m + m2))
     candidates_query = [query]  # original
     if m:
-        # Prefer longest zh substring that could be name
-        for cand in sorted(m, key=len, reverse=True):
-            candidates_query.append(cand)
+        # Prefer longest substring that could be name (mixed or pure zh)
+        for cand in sorted([c.strip() for c in m if c.strip()], key=len, reverse=True):
+            if len(cand) >= 2:
+                candidates_query.append(cand)
     # Also try removing common particles
     query_clean = re.sub(r"[請幫我查問一下的分機是幾號嗎呢啊？?]", "", query).strip()
     if query_clean and query_clean != query:
@@ -194,12 +226,30 @@ def find_contact(query: str, top_k: int = 3, threshold: float = 0.65) -> List[Tu
             # Cache bopomofo per contact (compute once)
             if "bopomofo" not in contact:
                 contact["bopomofo"] = _to_bopomofo(name)
+                # Also cache pinyin for cross-script English pinyin matching (e.g., Michael Chen vs Michael 陳)
+                try:
+                    from pypinyin import lazy_pinyin
+                    contact["pinyin_alt"] = " ".join(lazy_pinyin(name)).lower()
+                except:
+                    contact["pinyin_alt"] = contact["pinyin"]
             c_bpmf = contact["bopomofo"]
+            c_pinyin_alt = contact.get("pinyin_alt", contact["pinyin"])
             # Character-level Jaccard + pinyin similarity
             # Char similarity
             import difflib
             char_sim = difflib.SequenceMatcher(None, q, name).ratio()
             bpmf_sim = _similarity(q_bpmf, c_bpmf)
+            # For mixed en+zh, also check pinyin_alt for English pinyin surnames (Michael Chen vs Michael 陳)
+            q_lower = q.lower()
+            if re.search(r"[A-Za-z]", q):
+                # Query has English, compare also via pinyin_alt (e.g., chen vs ㄔㄣˊ)
+                try:
+                    from pypinyin import lazy_pinyin
+                    q_pinyin_alt = " ".join(lazy_pinyin(q)).lower() if re.search(r"[\u4e00-\u9fff]", q) else q_lower
+                except:
+                    q_pinyin_alt = q_lower
+                pinyin_sim = _similarity(q_pinyin_alt, c_pinyin_alt)
+                bpmf_sim = max(bpmf_sim, pinyin_sim)
             # Weighted: bopomofo more important for TW ASR homophones (ㄨㄤˊ vs ㄨㄤˋ tone, ㄔㄣˊ vs ㄔㄥˊ)
             score = 0.35 * char_sim + 0.65 * bpmf_sim
             # Boost if pinyin edit distance 1 (tone confusion etc.)
