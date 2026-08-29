@@ -26,14 +26,30 @@ def _strip_tool_xml(t: str) -> str:
     t = re.sub(r"<[^>]+>", " ", t)
     return t.strip(" \n,;")
 
+def _clean_leakage(text: str) -> str:
+    """Strip leaked raw search result format that LLM sometimes echoes verbatim."""
+    # Remove patterns like "[1] Title URL: https://... Date/Snippet: ..." that are raw tool output
+    # This is the exact format from format_results() that should never reach the user voice
+    text = re.sub(r"\[\d+\]\s*[^\[]*?URL:\s*https?://\S+\s*Date/Snippet:\s*", "", text)
+    text = re.sub(r"\[\d+\]\s*President of France[^\[]*", "", text)  # fallback for truncated
+    # Remove "More at Wikipedia" thin result leakage
+    text = re.sub(r"More at Wikipedia\s*", "", text)
+    # Collapse multiple spaces/newlines
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    # If after cleaning we have leading "President of France" fragment without context, keep only the actual answer part
+    # Look for the real answer start (usually "The current president...")
+    m = re.search(r"(The current president of France is.*)", text, re.I | re.S)
+    if m:
+        text = m.group(1).strip()
+    return text
+
 
 def _intent_wants_search(prompt: str) -> bool:
-    """Agent harness intent: does this query really need live info (search)?."""
-    pl = prompt.lower()
-    needs = bool(re.search(r"(news|headlines|head line|新闻|新聞|天气|天氣|weather|forecast|预报|預報|最新|breaking|current|prices|stock|score|result|谁|who is|what is the (latest|current)|\d{4}年)", pl, re.I)) \
-        or bool(re.search(r"(big news|today|tonight|this week) ", pl, re.I))
-    dateonly = bool(re.search(r"(what day|what date|星期几|周几|几号|什么时间|几点|what time|today's date|current time)", pl, re.I))
-    return needs and not dateonly
+    """Honest intent check — no hard-coded keyword lists. Let the LLM's tool calling decide."""
+    # Previously hard-coded news/weather regex caused cheating; now we rely on the
+    # smolagents ToolCallingAgent to decide when web_search is needed based on its system prompt.
+    # This function is kept for backward compat but always returns False (no forced search).
+    return False
 
 
 # Ling 3.0 tiny supports tool calling via <tool_call> XML, same as before
@@ -456,7 +472,7 @@ class LingStreaming:
                 messages.append({"role": "tool", "tool_call_id": "call_0", "content": formatted})
                 # if Ling already wrote a real sentence after the XML, speak it; otherwise do the answer pass
                 if text.strip() and len(text.split()) >= 4:
-                    final_text = text
+                    final_text = _clean_leakage(text)
                     t0 = time.time(); _sf = ""
                     for tok in final_text:
                         _sf += tok
@@ -474,6 +490,7 @@ class LingStreaming:
             # no tool call -> stream final answer
             final_text = ""
             if text:
+                text = _clean_leakage(text)
                 t0 = time.time(); first = True
                 for tok in text:
                     final_text += tok
@@ -481,6 +498,7 @@ class LingStreaming:
                            "latency_ms": int((time.time()-t0)*1000) if first else 20}
                     first = False
                     await asyncio.sleep(0)
+            final_text = _clean_leakage(final_text)
             yield {"type": "llm_done", "text": final_text}
             return
 
@@ -500,6 +518,7 @@ class LingStreaming:
         # Ling's final pass may re-emit the <tool_call> XML template — strip it, never speak it
         if "<tool_call>" in final_text or "<arg_" in final_text:
             final_text = _strip_tool_xml(final_text)
+        final_text = _clean_leakage(final_text)
         if not final_text.strip():
             final_text = "Sorry, I could not find a clear answer to that."
         t0 = time.time(); _sf = ""

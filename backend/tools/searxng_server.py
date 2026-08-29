@@ -32,17 +32,38 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from loguru import logger
 
-# Import the same search logic — robust to cwd
+# Import search backends directly — avoid recursion (web_search -> _try_searxng -> http://localhost:8888 -> web_search loop)
 import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
 try:
-    from web_search import web_search, format_results
+    from web_search import _try_ddgs, _try_lite_scrape, _mock_search, format_results
+    async def _direct_search(q, count=5):
+        # Minimal server: try DDG/lite directly, no SearXNG loop, no wttr (wttr is handled in main web_search)
+        for fn in (_try_ddgs, _try_lite_scrape):
+            try:
+                res = await fn(q, count)
+                if res:
+                    return {"query": q, "results": res[:count], "source": fn.__name__, "latency_ms": 50}
+            except Exception:
+                continue
+        # Fallback mock (clearly flagged, no curated cheating)
+        res = _mock_search(q, count)
+        return {"query": q, "results": res, "source": "mock-offline", "latency_ms": 5}
 except ImportError:
     try:
-        from tools.web_search import web_search, format_results
+        from tools.web_search import _try_ddgs, _try_lite_scrape, _mock_search, format_results
+        async def _direct_search(q, count=5):
+            for fn in (_try_ddgs, _try_lite_scrape):
+                try:
+                    res = await fn(q, count)
+                    if res:
+                        return {"query": q, "results": res[:count], "source": fn.__name__, "latency_ms": 50}
+                except Exception:
+                    continue
+            res = _mock_search(q, count)
+            return {"query": q, "results": res, "source": "mock-offline", "latency_ms": 5}
     except ImportError:
-        # last resort: mock
-        async def web_search(q, count=5):
+        async def _direct_search(q, count=5):
             return {"query": q, "results": [{"title": f"Mock for {q}", "url": "https://example.com", "content": "mock"}], "source": "mock", "latency_ms": 5}
         def format_results(r): return str(r)
 
@@ -106,7 +127,7 @@ async def search(
         pass
 
     t0 = time.time()
-    result = await web_search(q, count=count)
+    result = await _direct_search(q, count=count)
     latency_ms = result["latency_ms"]
 
     # SearXNG JSON shape (subset)

@@ -1,5 +1,16 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
+  let s2tConverter = null;
+  let toTraditional = (text) => text;
+  async function initOpenCC(){
+    try{
+      const OpenCC = await import('opencc-js');
+      s2tConverter = OpenCC.Converter({ from: 'cn', to: 'tw' });
+      toTraditional = (text) => {
+        try { return text && /[\u4e00-\u9fff]/.test(text) ? s2tConverter(text) : text; } catch(e) { return text; }
+      };
+    }catch(e){ console.warn('OpenCC not loaded', e); }
+  }
   let connected = $state(false);
   let connecting = $state(false);
   let listening = $state(false);
@@ -61,9 +72,9 @@
   let searxngOk = $state(false);
   function handleServerMessage(msg){
     switch(msg.type){
-      case 'stt_partial': sttPartial = msg.text; break;
-      case 'stt_final': sttFinal = msg.text; sttPartial = ''; chatHistory = [...chatHistory, {role:'user', text: msg.text}]; llmStreaming = ''; ttsText = ''; toolStatus = ''; break;
-      case 'llm_token': llmStreaming = msg.text_so_far; break;
+      case 'stt_partial': sttPartial = toTraditional(msg.text); break;
+      case 'stt_final': sttFinal = toTraditional(msg.text); sttPartial = ''; chatHistory = [...chatHistory, {role:'user', text: toTraditional(msg.text)}]; llmStreaming = ''; ttsText = ''; toolStatus = ''; break;
+      case 'llm_token': llmStreaming = toTraditional(msg.text_so_far); break;
       case 'tool_call': {
           const tn = msg.name || 'tool'; const q = msg.query || msg.arguments?.query || msg.arguments?.timezone || '';
           if(tn === 'web_search'){ toolStatus = `🔍 web_search("${q}")`; chatHistory = [...chatHistory, {role:'tool', text: `🔍 Searching "${q}"…`}]; }
@@ -73,22 +84,25 @@
           const src = msg.source || msg.result?.source || 'searxng'; const latency = msg.latency_ms || 0; const count = msg.result?.results?.length || 3;
           toolStatus = `✓ ${count} results via ${src} · ${latency}ms`; lastSearchResults = msg.result?.results || [];
           let preview = (msg.formatted||'').slice(0,200).replace(/\n/g,' '); chatHistory = [...chatHistory, {role:'tool', text: `✓ ${src} · ${latency}ms — ${preview}`}]; } break;
-      case 'tts_chunk': ttsText = msg.text; if(msg.pcm){ try{ const pcm = base64ToInt16(msg.pcm); queueAudio(pcm, msg.sampleRate || 16000); }catch(e){ audioError = String(e).slice(0,120); } } updateAssistantStreaming(); break;
+      case 'tts_chunk': ttsText = toTraditional(msg.text); if(msg.pcm){ try{ const pcm = base64ToInt16(msg.pcm); queueAudio(pcm, msg.sampleRate || 16000); }catch(e){ audioError = String(e).slice(0,120); } } updateAssistantStreaming(); break;
       case 'tts_start': preRollStarted = false; preRollQueue.length = 0; speaking = true; break;
       case 'tts_end': flushPreRoll(); speaking = false; finalizeAssistant(); toolStatus = ''; break;
       case 'latency': latency = msg; break;
     }
   }
   function updateAssistantStreaming(){
-    if(llmStreaming){
+    const displayText = toTraditional(llmStreaming);
+    if(displayText){
       if(chatHistory.length && chatHistory[chatHistory.length-1].role==='assistant' && chatHistory[chatHistory.length-1].streaming){
-        chatHistory[chatHistory.length-1].text = llmStreaming; chatHistory = [...chatHistory];
-      } else { chatHistory = [...chatHistory, {role:'assistant', text: llmStreaming, streaming:true}]; }
+        chatHistory[chatHistory.length-1].text = displayText;
+        chatHistory = [...chatHistory];
+      } else { chatHistory = [...chatHistory, {role:'assistant', text: displayText, streaming:true}]; }
     }
   }
   function finalizeAssistant(){
-    if(chatHistory.length && chatHistory[chatHistory.length-1].streaming){ chatHistory[chatHistory.length-1].streaming = false; chatHistory = [...chatHistory]; }
-    else if(llmStreaming){ chatHistory = [...chatHistory, {role:'assistant', text: llmStreaming}]; }
+    const displayText = toTraditional(llmStreaming);
+    if(chatHistory.length && chatHistory[chatHistory.length-1].streaming){ chatHistory[chatHistory.length-1].streaming = false; chatHistory[chatHistory.length-1].text = displayText; chatHistory = [...chatHistory]; }
+    else if(displayText){ chatHistory = [...chatHistory, {role:'assistant', text: displayText}]; }
     llmStreaming='';
   }
   function base64ToInt16(b64){ const bin = atob(b64); const bytes = new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i); return new Int16Array(bytes.buffer); }
@@ -143,7 +157,7 @@
     if(!canvasEl || !analyser) return; const ctx = canvasEl.getContext('2d'); const data = new Uint8Array(analyser.frequencyBinCount);
     const draw = ()=>{ animId=requestAnimationFrame(draw); analyser.getByteFrequencyData(data); ctx.clearRect(0,0,canvasEl.width,canvasEl.height); const w=canvasEl.width,h=canvasEl.height; const barW=w/data.length*2.2; let x=0; for(let i=0;i<data.length;i+=2){ const v=data[i]/255; const bh=v*h*0.85; ctx.fillStyle=listening?`hsla(265,90%,65%,${0.45+v*0.5})`:`hsla(220,8%,45%,0.5)`; ctx.fillRect(x,h-bh,barW,bh); x+=barW+1; if(x>=w) break; } ctx.fillStyle=listening?'#7c5cff':'#3a3a44'; ctx.fillRect(0,h-3,w*audioLevel,3); }; draw();
   }
-  onMount(()=>{ fetchHealth(); statsInterval=setInterval(fetchHealth,3000); });
+  onMount(()=>{ fetchHealth(); statsInterval=setInterval(fetchHealth,3000); initOpenCC(); });
   onDestroy(()=>{ disconnect(); if(statsInterval) clearInterval(statsInterval); if(animId) cancelAnimationFrame(animId); });
   let micError = $state('');
   let textInput = $state('');
@@ -223,7 +237,7 @@
       <div class="logo">🎙️</div>
       <div style="min-width:0">
         <div class="title">Voice Chat</div>
-        <div class="subtitle">X-ASR · Granite-4.2-3B · Qwen3-TTS · smolagents</div>
+        <div class="subtitle">X-ASR · Apodex-1.0-2B · Qwen3-TTS · smolagents</div>
       </div>
     </div>
     <div class="header-actions">
@@ -272,7 +286,7 @@
       <div class="card">
         <h3>Stack</h3>
         <div style="font-size:12px; line-height:1.6; opacity:0.85">
-          <div><b>STT</b> X-ASR sherpa 160ms · <b>LLM</b> Granite-4.2-3B · <b>Agent</b> smolagents · <b>TTS</b> Qwen3-TTS Q8 24k</div>
+          <div><b>STT</b> X-ASR sherpa 160ms · <b>LLM</b> Apodex-1.0-2B · <b>Agent</b> smolagents · <b>TTS</b> Qwen3-TTS Q8 24k</div>
           <div class="subtle">SearXNG :8888 + wttr.in · Tools: web_search · get_current_datetime · 2 steps max · honest search</div>
         </div>
       </div>
@@ -297,14 +311,14 @@
           <button class="tool-chip" onclick={()=>testSearch('What is the weather in Paris today?')}>Paris</button>
           <button class="tool-chip" onclick={()=>testSearch('Search latest AI news')}>News</button>
           <button class="tool-chip" onclick={()=>testSearch('Who is the president of France?')}>Who is…</button>
-          <button class="tool-chip" onclick={()=>testSearch('今天星期几？')}>今天</button>
+          <button class="tool-chip" onclick={()=>testSearch('今天是星期幾？')}>今天</button>
         </div>
         {#if lastSearchResults.length}
           <div style="margin-top:10px; padding:8px; background:rgba(0,0,0,0.2); border-radius:8px; max-height:140px; overflow:auto; border:1px solid #1e1e28">
             {#each lastSearchResults.slice(0,2) as r}
               <div style="font-size:11px; margin-bottom:6px; padding:6px; background:rgba(255,255,255,0.04); border-radius:6px">
-                <a href={r.url} target="_blank" style="color:#8ea6ff; font-weight:600; text-decoration:none">{r.title}</a><br/>
-                <span style="opacity:0.6">{r.content.slice(0,120)}…</span>
+                <a href={r.url} target="_blank" style="color:#8ea6ff; font-weight:600; text-decoration:none">{toTraditional(r.title)}</a><br/>
+                <span style="opacity:0.6">{toTraditional(r.content.slice(0,120))}…</span>
               </div>
             {/each}
           </div>
@@ -314,6 +328,6 @@
   </div>
 
   <div style="text-align:center; font-size:11px; opacity:0.4; margin-top:16px">
-    Silero VAD · X-ASR · Granite-4.2-3B · Qwen3-TTS · <a href="https://github.com/vieenrose/voice-chat" style="color:inherit">GitHub</a>
+    Silero VAD · X-ASR · Apodex-1.0-2B · Qwen3-TTS · <a href="https://github.com/vieenrose/voice-chat" style="color:inherit">GitHub</a>
   </div>
 </div>
