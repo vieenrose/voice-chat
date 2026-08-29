@@ -74,10 +74,10 @@ if not HF_OFFICIAL:
     # TTFA ~20ms, GGML CUDA. Speaks whole sentences (app.py flush), prosody pauses capped by _compress_silence.
     # Fallback 1: Kokoro-1.0 82M ONNX. Fallback 2: MOSS-TTS-Nano-100M ONNX (CUDA EP).
     try:
-        from tts.primetts_streaming_real import StreamingPrimeTTSReal as StreamingPrimeTTS
-        from tts.primetts_streaming_real import SAMPLE_RATE as TTS_SR
-        TTS_NAME = "PrimeTTS-v2-streaming"
-        print(f"[TTS] Using PrimeTTS v2 streaming 16k (Luigi/PrimeTTS v21_streaming ONNX, TRUE streaming, 16k) — more stable")
+        from tts.qwen3_streaming import StreamingPrimeTTS
+        from tts.qwen3_streaming import SAMPLE_RATE as TTS_SR
+        TTS_NAME = "Qwen3-TTS-0.6b-CustomVoice-Q8"
+        print(f"[TTS] Using Qwen3-TTS 12Hz 0.6B CustomVoice Q8_0 (faster_qwen3_tts cu124, TRUE streaming, 24k)")
     except ImportError as e_q3:
         print(f"[TTS] Qwen3-TTS not ready {e_q3}, fallback Kokoro-1.0 82M")
         try:
@@ -144,7 +144,7 @@ class HFSpeechToSpeechPipeline:
         try:
             import os
             _llm_base = os.getenv("LLM_API_BASE", "http://127.0.0.1:11435/v1")
-            self.llm = MiniCPMStreaming(model_id="unsloth/Qwen3.5-0.8B-GGUF", api_base=_llm_base, model_name="qwen3.5-2b", device=device, mock=False)
+            self.llm = MiniCPMStreaming(model_id="unsloth/Qwen3.5-2B-GGUF", api_base=_llm_base, model_name="qwen3.5-2b", device=device, mock=False)
             # If it still ended up in mock due to server not ready, keep it but log
             if getattr(self.llm, 'mock', False):
                 logger.info(f"LLM {LLM_NAME} not ready (llama-server down), using mock fallback — will become real once GGUF downloaded and server up")
