@@ -20,7 +20,7 @@ from loguru import logger
 from smolagents import Tool, ToolCallingAgent, OpenAIServerModel
 
 API_BASE = "http://127.0.0.1:11435/v1"
-MODEL_ID = "qwen3.5-2b"
+MODEL_ID = "apodex-1.0-0.8b"
 MAX_STEPS = 2  # voice: 1 tool + final answer; keeps e2e <4s
 
 

@@ -127,14 +127,17 @@ class QwenDateTime(BaseTool):
 
 def _make_agent():
     llm_cfg = {
-        'model': 'qwen3.5-2b',
+        'model': 'apodex-1.0-0.8b',
         'model_server': 'http://127.0.0.1:11435/v1',
         'api_key': 'none',
         'generate_cfg': {
-            'max_tokens': 256,
+            'max_tokens': 1024,
             'temperature': 0.7,
             'top_p': 0.9,
-        }
+            'chat_template_kwargs': {'enable_thinking': True},
+        },
+        # Thinking enabled: reasoning_content will be in delta but we filter it in run_agent_task (only final assistant content)
+        'enable_thinking': True
     }
     return Assistant(
         llm=llm_cfg,
