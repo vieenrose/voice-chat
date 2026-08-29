@@ -127,7 +127,7 @@ class QwenDateTime(BaseTool):
 
 def _make_agent():
     llm_cfg = {
-        'model': 'apodex-1.0-0.8b',
+        'model': 'qwen3.5-0.8b',
         'model_server': 'http://127.0.0.1:11435/v1',
         'api_key': 'none',
         'generate_cfg': {
