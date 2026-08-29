@@ -248,16 +248,12 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="default
                 elif t == "barge_in":
                     logger.info("barge_in received")
                 elif t == "text_input":
-                    # Barge-in on new textual input: cancel current TTS/sender if speaking (like audio barge-in)
-                    if speaking:
-                        logger.info(f"text_input barge-in: cancelling TTS for new query '{data.get('text','')[:30]}'")
-                        # Signal barge-in to frontend and clear TTS queue
-                        try:
-                            await websocket.send_text(json.dumps({"type": "barge_in", "reason": "text_input"}))
-                        except: pass
-                        # Clear any pending TTS in sender_loop by resetting nextPlayTime is frontend-side, but we also stop current direct_tts tasks
-                        # Cancel previous direct_tts if any (best effort)
-                        pass
+                    # Barge-in on new textual input: cancel current TTS/sender (like audio barge-in)
+                    # Note: speaking state is frontend-side, but we signal barge-in anyway to clear TTS queue
+                    logger.info(f"text_input barge-in: new query '{data.get('text','')[:30]}'")
+                    try:
+                        await websocket.send_text(json.dumps({"type": "barge_in", "reason": "text_input"}))
+                    except: pass
                     txt = data.get("text","")
                     _req_voice = data.get("voice") or ""
                     async def direct_tts():
