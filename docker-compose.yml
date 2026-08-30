@@ -24,7 +24,7 @@ services:
 
   llm:
     image: ghcr.io/ggerganov/llama.cpp:server-cuda
-    command: -m /models/llm/Qwen3.5-0.8B-Q8_0.gguf --host 0.0.0.0 --port 8080 -c 16384 --alias qwen3.5-0.8b --n-gpu-layers 99 --jinja
+    command: -m /models/llm/Qwen3.5-2B-Q4_K_M.gguf --host 0.0.0.0 --port 8080 -c 16384 --alias qwen3.5-2b --n-gpu-layers 99 --jinja
     volumes:
       - ./models/llm:/models/llm:ro
     environment:

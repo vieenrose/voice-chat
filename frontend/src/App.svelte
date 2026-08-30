@@ -3,8 +3,19 @@
   import { marked } from 'marked';
   import DOMPurify from 'dompurify';
   marked.setOptions({ breaks: true, gfm: true });
+  function safeUrl(url){
+    // Search results come from SearXNG (untrusted, internet-sourced) — only ever let
+    // real http(s) links into an href; a javascript: URI would execute on click.
+    try{ return /^https?:\/\//i.test(url) ? url : '#'; }catch(e){ return '#'; }
+  }
+  function escapeHtml(text){
+    return (text||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+  }
   function renderMarkdown(text){
-    try{ const html = marked.parse(text || ''); return DOMPurify.sanitize(html); }catch(e){ return (text||'').replace(/\n/g,'<br/>'); }
+    // text can contain untrusted content (web search results, tool output) that reaches
+    // the DOM via {@html} below — if marked/DOMPurify ever throw, the fallback MUST still
+    // be sanitized (escape first, then <br/>), not raw text, or it's a stored-XSS hole.
+    try{ const html = marked.parse(text || ''); return DOMPurify.sanitize(html); }catch(e){ return escapeHtml(text).replace(/\n/g,'<br/>'); }
   }
   let s2tConverter = null;
   let toTraditional = (text) => text;
@@ -59,6 +70,14 @@
   async function connect(){
     if (connected || connecting) return;
     connecting = true;
+    // A fresh connection means a fresh backend turn_id sequence (the backend's counter
+    // is scoped to its own pipeline instance/process, not to this tab) — e.g. a backend
+    // restart between disconnect and reconnect resets it to 0, while this tab's
+    // activeTurnId could already be far higher from before, which would permanently
+    // misclassify every new turn as stale. There is no in-flight audio to preserve
+    // across a reconnect anyway (the old connection is gone), so resetting here is safe.
+    activeTurnId = -1;
+    killedTurnIds = new Set();
     let url = wsUrl;
     const qp = new URLSearchParams(location.search);
     if (qp.get('ws')) url = qp.get('ws');
@@ -76,24 +95,50 @@
   let audioError = $state('');
   let lastSearchResults = $state([]);
   let searxngOk = $state(false);
+  // Turn staleness tracking: every assistant-response event (llm_token/tool_*/tts_*)
+  // carries a monotonic turn_id from the backend. A turn_id lower than the highest
+  // one we've seen is definitely from an already-superseded (barged-in) reply — drop
+  // it. killedTurnIds additionally blacklists the turn we just locally interrupted,
+  // closing the brief network-race window before the new turn's first message (which
+  // would otherwise arrive with the SAME turn_id as the one we're killing). This
+  // replaces a fixed "ignore audio for 800ms" timer, which — being duration-based, not
+  // turn-based — would also silently drop the start of the *new* reply if it began
+  // streaming inside that window.
+  let activeTurnId = -1;
+  let killedTurnIds = new Set();
+  function isStaleTurn(turnId){
+    if(turnId === undefined || turnId === null) return false;
+    if(turnId > activeTurnId){
+      activeTurnId = turnId;
+      // Prune ids we'll never need again: turn_id is monotonic, so once activeTurnId
+      // has passed a killed id the `turnId < activeTurnId` check below already keeps
+      // classifying it stale forever — without this, a long session with many
+      // barge-ins would grow this Set without bound.
+      for(const k of killedTurnIds){ if(k < activeTurnId) killedTurnIds.delete(k); }
+    }
+    return turnId < activeTurnId || killedTurnIds.has(turnId);
+  }
   function handleServerMessage(msg){
     switch(msg.type){
       case 'stt_partial': sttPartial = toTraditional(msg.text); break;
       case 'stt_final': sttFinal = toTraditional(msg.text); sttPartial = ''; chatHistory = [...chatHistory, {role:'user', text: toTraditional(msg.text)}]; llmStreaming = ''; ttsText = ''; toolStatus = ''; break;
-      case 'llm_token': llmStreaming = toTraditional(msg.text_so_far); break;
+      case 'llm_token': if(isStaleTurn(msg.turn_id)) break; llmStreaming = toTraditional(msg.text_so_far); break;
       case 'tool_call': {
+          if(isStaleTurn(msg.turn_id)) break;
           const tn = msg.name || 'tool'; const q = msg.query || msg.arguments?.query || msg.arguments?.timezone || '';
           if(tn === 'web_search'){ toolStatus = `🔍 web_search("${q}")`; chatHistory = [...chatHistory, {role:'tool', text: `🔍 Searching "${q}"…`}]; }
           else { toolStatus = `🕐 ${tn}()`; chatHistory = [...chatHistory, {role:'tool', text: `🕐 ${tn}()`}]; }
         } break;
       case 'tool_result': {
+          if(isStaleTurn(msg.turn_id)) break;
           const src = msg.source || msg.result?.source || 'searxng'; const latency = msg.latency_ms || 0; const count = msg.result?.results?.length || 3;
           toolStatus = `✓ ${count} results via ${src} · ${latency}ms`; lastSearchResults = msg.result?.results || [];
           let preview = (msg.formatted||'').slice(0,200).replace(/\n/g,' '); chatHistory = [...chatHistory, {role:'tool', text: `✓ ${src} · ${latency}ms — ${preview}`}]; } break;
-      case 'tts_chunk': if(Date.now() < ignoreTtsUntil) break; ttsText = toTraditional(msg.text); if(msg.pcm){ try{ const pcm = base64ToInt16(msg.pcm); queueAudio(pcm, msg.sampleRate || 16000); }catch(e){ audioError = String(e).slice(0,120); } } updateAssistantStreaming(); break;
-      case 'tts_start': preRollStarted = false; preRollQueue.length = 0; speaking = true; break;
-      case 'tts_end': flushPreRoll(); speaking = false; finalizeAssistant(); toolStatus = ''; break;
-      case 'latency': latency = msg; break;
+      case 'tts_chunk': if(isStaleTurn(msg.turn_id)) break; ttsText = toTraditional(msg.text); if(msg.pcm){ try{ const pcm = base64ToInt16(msg.pcm); queueAudio(pcm, msg.sampleRate || 16000); }catch(e){ audioError = String(e).slice(0,120); } } updateAssistantStreaming(); break;
+      case 'tts_start': if(isStaleTurn(msg.turn_id)) break; preRollStarted = false; preRollQueue.length = 0; speaking = true; break;
+      case 'tts_end': if(isStaleTurn(msg.turn_id)) break; flushPreRoll(); speaking = false; finalizeAssistant(); toolStatus = ''; break;
+      case 'latency': if(isStaleTurn(msg.turn_id)) break; latency = msg; break;
+      case 'barge_in': killedTurnIds.add(msg.turn_id ?? activeTurnId); stopPlayback(); break;
     }
   }
   function updateAssistantStreaming(){
@@ -141,15 +186,15 @@
   }
   function stopMic(){ listening=false; if(animId) cancelAnimationFrame(animId); if(workletNode){ try{workletNode.disconnect();}catch(e){} workletNode=null; } if(mediaStream){ mediaStream.getTracks().forEach(t=>t.stop()); mediaStream=null; } if(audioCtx){ try{audioCtx.close();}catch(e){} audioCtx=null; } audioLevel=0; if(ws && ws.readyState===1) ws.send(JSON.stringify({type:'stop'})); }
   function sendPCM(pcm16){ if(!ws || ws.readyState!==1) return; const header = new Uint8Array(1); header[0]=0x01; const out = new Uint8Array(1 + pcm16.byteLength); out.set(header,0); out.set(new Uint8Array(pcm16.buffer),1); try{ ws.send(out); }catch(e){ const b64 = btoa(String.fromCharCode(...new Uint8Array(pcm16.buffer))); ws.send(JSON.stringify({type:'audio_chunk', pcm:b64, sampleRate:16000})); } }
-  function sendText(text){ if(!ws || ws.readyState!==1){ connect(); setTimeout(()=>sendText(text),500); return; } if(speaking) bargeIn(); generationId++; ws.send(JSON.stringify({type:'text_input', text})); chatHistory=[...chatHistory, {role:'user', text}]; llmStreaming=''; }
+  function sendText(text){ if(!ws || ws.readyState!==1){ connect(); setTimeout(()=>sendText(text),500); return; } if(speaking) bargeIn(); ws.send(JSON.stringify({type:'text_input', text})); chatHistory=[...chatHistory, {role:'user', text}]; llmStreaming=''; }
   let activeSources = [];
   let bargeInLock = false;
-  let generationId = 0;
-  let ignoreTtsUntil = 0;
-  function bargeIn(){ if(bargeInLock) return; bargeInLock=true; setTimeout(()=>bargeInLock=false, 300);
-    generationId++; // increment to ignore old TTS chunks from previous generation
-    ignoreTtsUntil = Date.now() + 800; // ignore any TTS chunks that were already in flight for old generation
-    if(ws && ws.readyState===1) ws.send(JSON.stringify({type:'barge_in'}));
+  // Stop whatever audio is currently playing/queued locally. Called both when *we*
+  // decide to interrupt (bargeIn, below) and when the server tells us it already
+  // interrupted a voice-triggered reply (the 'barge_in' case in handleServerMessage) —
+  // in the latter case the server has already stopped generating, so there's nothing
+  // to send back, just our own speakers to silence.
+  function stopPlayback(){
     // Aggressive: stop all scheduled sources including future ones
     for(const s of [...activeSources]){ try{ s.stop(); }catch(e){} try{ s.disconnect(); }catch(e){} }
     activeSources=[];
@@ -162,6 +207,11 @@
     ttsText=''; llmStreaming='';
     // Force speaking false even if onended fires late
     setTimeout(()=>{ speaking=false; }, 50);
+  }
+  function bargeIn(){ if(bargeInLock) return; bargeInLock=true; setTimeout(()=>bargeInLock=false, 300);
+    killedTurnIds.add(activeTurnId); // blacklist the turn we're interrupting (see isStaleTurn)
+    if(ws && ws.readyState===1) ws.send(JSON.stringify({type:'barge_in'}));
+    stopPlayback();
   }
   let playCtx = null;
   function ensurePlayCtx(sampleRate){
@@ -355,7 +405,7 @@
           <div style="margin-top:10px; padding:8px; background:rgba(0,0,0,0.2); border-radius:8px; max-height:140px; overflow:auto; border:1px solid #1e1e28">
             {#each lastSearchResults.slice(0,2) as r}
               <div style="font-size:11px; margin-bottom:6px; padding:6px; background:rgba(255,255,255,0.04); border-radius:6px">
-                <a href={r.url} target="_blank" style="color:#8ea6ff; font-weight:600; text-decoration:none">{toTraditional(r.title)}</a><br/>
+                <a href={safeUrl(r.url)} target="_blank" rel="noopener noreferrer" style="color:#8ea6ff; font-weight:600; text-decoration:none">{toTraditional(r.title)}</a><br/>
                 <span style="opacity:0.6">{toTraditional(r.content.slice(0,120))}…</span>
               </div>
             {/each}
@@ -366,6 +416,6 @@
   </div>
 
   <div style="text-align:center; font-size:11px; opacity:0.4; margin-top:16px">
-    Silero VAD · X-ASR-int8 · Qwen3.5-2B Q4 · Granite-97M Q8 · Qwen3-TTS 0.6B · Qwen-Agent · <a href="https://github.com/vieenrose/voice-chat" style="color:inherit">GitHub</a>
+    Endpoint Detection · X-ASR-int8 · Qwen3.5-2B Q4 · Granite-97M Q8 · Qwen3-TTS 0.6B · Qwen-Agent · <a href="https://github.com/vieenrose/voice-chat" style="color:inherit">GitHub</a>
   </div>
 </div>

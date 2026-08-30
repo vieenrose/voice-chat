@@ -3,7 +3,7 @@ server:
   base_url: http://127.0.0.1:8888/
   port: 8888
   bind_address: 127.0.0.1
-  secret_key: "change_this_to_something_random_12345_for_searxng_official_full_all_china_disabled"
+  secret_key: "c8a9bf8a06160b9e61a20f761ff79cbfdb4eb53434ed778b0a30bec3a0582ac3"
   limiter: false
   image_proxy: false
   http_protocol_version: "1.0"

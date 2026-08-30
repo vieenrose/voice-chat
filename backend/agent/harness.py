@@ -57,20 +57,21 @@ class GraniteModel(OpenAIServerModel):
         return super()._prepare_completion_kwargs(messages, stop_sequences, response_format, tools_to_call_from, custom_role_conversions, convert_images_to_image_urls, tool_choice, **kwargs)
 
 
-class _EventEmitter:
-    def __init__(self):
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._q: asyncio.Queue | None = None
+# Per-call (loop, queue) target, NOT a mutable global — see the identical comment in
+# agent/qwen_harness.py: _AGENT below is a single shared instance reused across every
+# session/turn, so a global "last attach() wins" singleton would cross-deliver one
+# turn's tool_call/tool_result events into a different (concurrent, or barge-in'd and
+# still finishing) turn's WS queue. asyncio.to_thread() copies the current contextvars
+# context into its worker thread, so this correctly stays call-scoped instead.
+import contextvars
+_emit_ctx: "contextvars.ContextVar[tuple | None]" = contextvars.ContextVar("_emit_ctx", default=None)
 
-    def attach(self, loop: asyncio.AbstractEventLoop, q: asyncio.Queue):
-        self._loop = loop
-        self._q = q
-
-    def emit(self, ev: dict):
-        if self._loop and self._q:
-            self._loop.call_soon_threadsafe(self._q.put_nowait, ev)
-
-_EMIT = _EventEmitter()
+def _emit(ev: dict):
+    ctx = _emit_ctx.get()
+    if ctx:
+        loop, q = ctx
+        if loop and q:
+            loop.call_soon_threadsafe(q.put_nowait, ev)
 
 
 class WebSearchTool(Tool):
@@ -112,7 +113,7 @@ class WebSearchTool(Tool):
             for q in queries:
                 if not q or not str(q).strip():
                     continue
-                _EMIT.emit({"type": "tool_call", "name": "web_search", "arguments": {"query": str(q)}, "query": str(q)})
+                _emit({"type": "tool_call", "name": "web_search", "arguments": {"query": str(q)}, "query": str(q)})
                 t0 = time.time()
                 res = web_search_sync(str(q).strip(), count=count)
                 results = res.get("results") or []
@@ -122,7 +123,7 @@ class WebSearchTool(Tool):
                         continue
                     seen.add(url)
                     all_results.append(r)
-                _EMIT.emit({"type": "tool_result", "name": "web_search", "result": {"results": results, "source": res.get("source","")},
+                _emit({"type": "tool_result", "name": "web_search", "result": {"results": results, "source": res.get("source","")},
                             "formatted": format_results(results) if results else "No results", "latency_ms": int((time.time()-t0)*1000), "source": res.get("source","")})
                 if len(all_results) >= count * 2:
                     break
@@ -130,11 +131,11 @@ class WebSearchTool(Tool):
             return formatted
         # Single query
         t0 = time.time()
-        _EMIT.emit({"type": "tool_call", "name": "web_search", "arguments": {"query": query}, "query": query})
+        _emit({"type": "tool_call", "name": "web_search", "arguments": {"query": query}, "query": query})
         res = web_search_sync(query, count=count)
         results = res.get("results") or []
         formatted = format_results(results) if results else "No results found."
-        _EMIT.emit({"type": "tool_result", "name": "web_search", "result": res,
+        _emit({"type": "tool_result", "name": "web_search", "result": res,
                     "formatted": formatted, "latency_ms": int((time.time()-t0)*1000),
                     "source": res.get("source", "")})
         return formatted
@@ -155,12 +156,12 @@ class GetWeatherTool(Tool):
         date_map = {"today": "", "tomorrow": "明天", "day_after_tomorrow": "後天"}
         dphrase = date_map.get(date, "")
         q = f"{location} {dphrase} 天气".strip() if any('\u4e00' <= c <= '\u9fff' for c in location) else f"weather in {location} {date}".strip()
-        _EMIT.emit({"type": "tool_call", "name": "get_weather", "arguments": {"location": location, "date": date}, "query": q})
+        _emit({"type": "tool_call", "name": "get_weather", "arguments": {"location": location, "date": date}, "query": q})
         t0 = time.time()
         # Directly call web_search which already handles wttr.in for weather queries
         res = web_search_sync(q, count=5)
         formatted = format_results(res.get("results", [])) if res.get("results") else "No weather data"
-        _EMIT.emit({"type": "tool_result", "name": "get_weather", "result": res, "formatted": formatted, "latency_ms": int((time.time()-t0)*1000), "source": res.get("source","")})
+        _emit({"type": "tool_result", "name": "get_weather", "result": res, "formatted": formatted, "latency_ms": int((time.time()-t0)*1000), "source": res.get("source","")})
         return formatted
 
 class DateTimeTool(Tool):
@@ -170,7 +171,7 @@ class DateTimeTool(Tool):
     output_type = "string"
 
     def forward(self, timezone: str | None = None) -> str:
-        _EMIT.emit({"type": "tool_call", "name": "get_current_datetime", "arguments": {"timezone": timezone or "UTC"}})
+        _emit({"type": "tool_call", "name": "get_current_datetime", "arguments": {"timezone": timezone or "UTC"}})
         tz = timezone or "UTC"
         try:
             now = datetime.now(ZoneInfo(tz))
@@ -183,7 +184,7 @@ class DateTimeTool(Tool):
                f"Today is {now.strftime('%A')} ({now.strftime('%Y-%m-%d')}). "
                f"Tomorrow is {tom.strftime('%A')} ({tom.strftime('%Y-%m-%d')}). "
                f"Yesterday was {yest.strftime('%A')} ({yest.strftime('%Y-%m-%d')}).")
-        _EMIT.emit({"type": "tool_result", "name": "get_current_datetime",
+        _emit({"type": "tool_result", "name": "get_current_datetime",
                     "result": {"date": now.strftime("%Y-%m-%d"), "weekday": now.strftime("%A"),
                                "time": now.strftime("%H:%M:%S"), "timezone": tz},
                     "formatted": fmt, "latency_ms": 1, "source": "datetime"})
@@ -235,7 +236,7 @@ def agent_alive() -> bool:
 async def run_agent_task(task: str, event_q: asyncio.Queue | None = None) -> str:
     """Run the smolagents loop for one user prompt; may emit tool events into event_q."""
     loop = asyncio.get_running_loop()
-    _EMIT.attach(loop, event_q)
+    _emit_ctx.set((loop, event_q))
 
     def _worker():
         agent = _get_agent()

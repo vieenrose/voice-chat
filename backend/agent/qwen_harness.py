@@ -5,6 +5,7 @@ Wraps Qwen-Agent's Assistant with our SearXNG + wttr + granite tools.
 import os
 os.environ["QWEN_AGENT_MAX_LLM_CALL_PER_RUN"] = "3"  # voice: cap at 3 LLM calls (1 tool + final) to prevent 8× loop
 import asyncio
+import contextvars
 from loguru import logger
 from qwen_agent.agents import Assistant
 from qwen_agent.tools.base import BaseTool, register_tool
@@ -20,17 +21,23 @@ except ImportError:
 
 # Shared event emitter for WS streaming
 import asyncio as _asyncio
-class _EventEmitter:
-    def __init__(self):
-        self._loop = None
-        self._q = None
-    def attach(self, loop, q):
-        self._loop = loop
-        self._q = q
-    def emit(self, ev: dict):
-        if self._loop and self._q:
-            self._loop.call_soon_threadsafe(self._q.put_nowait, ev)
-_EMIT = _EventEmitter()
+# Per-call (loop, queue) target, NOT a mutable global: _agent below is a single shared
+# Assistant reused across every session/turn, so two calls to run_agent_task() can be
+# in flight at once (two sessions chatting concurrently, or an old barge-in'd turn's
+# background thread still finishing when a new turn starts). A plain "last attach() wins"
+# singleton would silently deliver one turn's tool_call/tool_result events into another
+# turn's WS queue. asyncio.to_thread() copies the current contextvars context into the
+# worker thread, so setting this per-call in run_agent_task (before to_thread) and
+# reading it from the tool .call() methods (which execute on that thread) keeps each
+# call's events routed to its own queue.
+_emit_ctx: "contextvars.ContextVar[tuple | None]" = contextvars.ContextVar("_emit_ctx", default=None)
+
+def _emit(ev: dict):
+    ctx = _emit_ctx.get()
+    if ctx:
+        loop, q = ctx
+        if loop and q:
+            loop.call_soon_threadsafe(q.put_nowait, ev)
 
 @register_tool('web_search', allow_overwrite=True)
 class QwenWebSearch(BaseTool):
@@ -61,12 +68,12 @@ class QwenWebSearch(BaseTool):
                 query = s
         else:
             query = params.get('query', '') if isinstance(params, dict) else ''
-        _EMIT.emit({"type": "tool_call", "name": "web_search", "arguments": {"query": query}, "query": query})
+        _emit({"type": "tool_call", "name": "web_search", "arguments": {"query": query}, "query": query})
         # Use sync version for Qwen-Agent (which is sync)
         from tools.web_search import web_search_sync, format_results
         res = web_search_sync(query, count=5)
         formatted = format_results(res.get("results", [])) if res.get("results") else "No results"
-        _EMIT.emit({"type": "tool_result", "name": "web_search", "result": res, "formatted": formatted, "latency_ms": res.get("latency_ms", 0), "source": res.get("source","")})
+        _emit({"type": "tool_result", "name": "web_search", "result": res, "formatted": formatted, "latency_ms": res.get("latency_ms", 0), "source": res.get("source","")})
         return formatted
 
 @register_tool('get_weather', allow_overwrite=True)
@@ -90,11 +97,11 @@ class QwenGetWeather(BaseTool):
         date = params.get('date','today') if isinstance(params, dict) else 'today'
         dmap = {'today':'', 'tomorrow':'明天', 'day_after_tomorrow':'後天'}
         q = f"{loc} {dmap.get(date,'')} 天气".strip() if any('\u4e00' <= c <= '\u9fff' for c in loc) else f"weather in {loc} {date}".strip()
-        _EMIT.emit({"type": "tool_call", "name": "get_weather", "arguments": {"location": loc, "date": date}, "query": q})
+        _emit({"type": "tool_call", "name": "get_weather", "arguments": {"location": loc, "date": date}, "query": q})
         from tools.web_search import web_search_sync, format_results
         res = web_search_sync(q, count=5)
         formatted = format_results(res.get("results", [])) if res.get("results") else "No weather data"
-        _EMIT.emit({"type": "tool_result", "name": "get_weather", "result": res, "formatted": formatted, "latency_ms": res.get("latency_ms",0), "source": res.get("source","")})
+        _emit({"type": "tool_result", "name": "get_weather", "result": res, "formatted": formatted, "latency_ms": res.get("latency_ms",0), "source": res.get("source","")})
         return formatted
 
 @register_tool('get_current_datetime', allow_overwrite=True)
@@ -123,8 +130,8 @@ class QwenDateTime(BaseTool):
             tz = "UTC"
         tom = now + timedelta(days=1)
         fmt = f"Current: {now.strftime('%A %Y-%m-%d %H:%M:%S')} ({tz}). Today {now.strftime('%A')} {now.strftime('%Y-%m-%d')}, Tomorrow {tom.strftime('%A')} {tom.strftime('%Y-%m-%d')}."
-        _EMIT.emit({"type": "tool_call", "name": "get_current_datetime", "arguments": {"timezone": tz}})
-        _EMIT.emit({"type": "tool_result", "name": "get_current_datetime", "result": {"date": now.strftime("%Y-%m-%d")}, "formatted": fmt, "latency_ms": 1, "source": "datetime"})
+        _emit({"type": "tool_call", "name": "get_current_datetime", "arguments": {"timezone": tz}})
+        _emit({"type": "tool_result", "name": "get_current_datetime", "result": {"date": now.strftime("%Y-%m-%d")}, "formatted": fmt, "latency_ms": 1, "source": "datetime"})
         return fmt
 
 def _make_agent():
@@ -159,7 +166,7 @@ def _get_agent():
 
 async def run_agent_task(task: str, event_q=None) -> str:
     loop = _asyncio.get_running_loop()
-    _EMIT.attach(loop, event_q)
+    _emit_ctx.set((loop, event_q))
     agent = _get_agent()
     def _run():
         try:

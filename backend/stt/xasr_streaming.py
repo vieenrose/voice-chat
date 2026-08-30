@@ -4,6 +4,7 @@ True streaming: 160ms / 480ms / 960ms chunks, 16kHz, endpoint detection
 Replaces whisper fallback with real X-ASR streaming.
 """
 import asyncio
+import os
 import time
 import numpy as np
 from pathlib import Path
@@ -35,8 +36,12 @@ class StreamingXASR:
             # Choose chunk size
             # Prefer 160ms for lowest latency, fallback to 480ms
             chunk = chunk_ms if chunk_ms in [160, 480, 960, 1920] else 160
-            # Try local /tmp/XASR first (already downloaded)
-            local_base = Path(f"/tmp/XASR/deployment/models/chunk-{chunk}ms-model")
+            # Try local dir first (already downloaded). STT_MODEL_DIR (set by
+            # Dockerfile/docker-compose to /models/stt) overrides the bare-metal dev
+            # default of /tmp/XASR/deployment/models — without this, the Docker image
+            # never found its mounted model volume and always fell through to whisper/mock.
+            stt_base_dir = os.getenv("STT_MODEL_DIR", "/tmp/XASR/deployment/models")
+            local_base = Path(stt_base_dir) / f"chunk-{chunk}ms-model"
             if local_base.exists():
                 # Prefer int8 quantized models if available (153M vs 587M total, ~3.9× smaller)
                 enc_int8 = local_base / f"encoder-{chunk}ms.int8.onnx"

@@ -6,6 +6,7 @@ Loads GGUF talker + codec directly from /tmp/qwen3_tts (downloaded via curl to a
 Output: 24 kHz mono int16 (Qwen3-TTS 12Hz -> 24000 Hz).
 """
 import asyncio
+import os
 import time
 import re
 import threading
@@ -28,8 +29,12 @@ class StreamingPrimeTTS:
         self.sample_rate = SAMPLE_RATE
         self.speaker = "Aiden"
         # --- load GGML model (0.6B CustomVoice Q8_0, 924M -> STABLE + 9 built-in speakers; 1.7B cstr Q8_0 2.04G has arch mismatch qwen3tts vs qwen3-tts, needs reconvert) ---
-        talker = Path("/tmp/qwen3_tts/talker_cv_q8.gguf")
-        codec = Path("/tmp/qwen3_tts/codec.gguf")
+        # TTS_MODEL_DIR (set by Dockerfile/docker-compose to /models/tts) overrides the
+        # bare-metal dev default of /tmp/qwen3_tts — without this, the Docker image never
+        # found its mounted model volume and always fell through to the ONNX fallback chain.
+        tts_dir = Path(os.getenv("TTS_MODEL_DIR", "/tmp/qwen3_tts"))
+        talker = tts_dir / "talker_cv_q8.gguf"
+        codec = tts_dir / "codec.gguf"
         if not talker.exists() or not codec.exists():
             raise RuntimeError(f"Qwen3-TTS GGUF missing: {talker.exists()} {codec.exists()} — run /tmp/dl_curl.sh")
         try:
@@ -189,16 +194,22 @@ class StreamingPrimeTTS:
 
     async def synthesize_streaming(self, text: str, chunk_frames: int = 24) -> AsyncGenerator[np.ndarray, None]:
         """TRUE token-streaming via generate_custom_voice_streaming (TTFA ~20ms, like HF framework).
-        chunk_frames=24 -> ~1.7s audio per chunk (bigger chunks = fewer jitter boundaries)."""
+        chunk_frames=24 -> ~1.7s audio per chunk (bigger chunks = fewer jitter boundaries).
+
+        Generation runs on a background thread (the GGML runtime is synchronous). `stop_flag`
+        lets a cancelled consumer tell that thread to stop early instead of running the whole
+        sentence to completion in the background after being abandoned (barge-in); the `.result()`
+        timeouts below bound the thread's lifetime even if the flag isn't noticed promptly.
+        """
         q: asyncio.Queue = asyncio.Queue(maxsize=16)
         loop = asyncio.get_running_loop()
+        stop_flag = threading.Event()
 
         def _run():
             try:
                 preset = self.VOICE_PRESETS[self._vv]
                 if preset.get("type") == "clone":
                     # 台湾腔 streaming via voice-clone generator
-                    import asyncio as _a
                     fut = asyncio.run_coroutine_threadsafe(self._ensure_voice_ref(preset), loop)
                     fut.result(timeout=120)
                     gen = self.model.generate_voice_clone_streaming(
@@ -216,16 +227,34 @@ class StreamingPrimeTTS:
                         chunk_size=max(4, int(chunk_frames)),
                     )
                 for chunk, sr, meta in gen:
+                    if stop_flag.is_set():
+                        break
                     arr = np.array(chunk, dtype=np.float32).squeeze()
                     arr = np.nan_to_num(arr)
                     arr = np.clip(arr, -1.0, 1.0)
                     pcm16 = (arr * 32767).astype(np.int16)
-                    asyncio.run_coroutine_threadsafe(q.put(("pcm", pcm16, meta)), loop).result()
+                    try:
+                        asyncio.run_coroutine_threadsafe(q.put(("pcm", pcm16, meta)), loop).result(timeout=5)
+                    except Exception:
+                        break  # consumer gone / queue never drained (cancelled) — stop generating
+                    if stop_flag.is_set():
+                        break
+                try:
+                    if hasattr(gen, "close"):
+                        gen.close()
+                except Exception:
+                    pass
             except Exception as e:
                 logger.error(f"Qwen streaming error {e}")
-                asyncio.run_coroutine_threadsafe(q.put(("err", e, {})), loop).result()
+                try:
+                    asyncio.run_coroutine_threadsafe(q.put(("err", e, {})), loop).result(timeout=5)
+                except Exception:
+                    pass
             finally:
-                asyncio.run_coroutine_threadsafe(q.put(("done", None, {})), loop).result()
+                try:
+                    asyncio.run_coroutine_threadsafe(q.put(("done", None, {})), loop).result(timeout=5)
+                except Exception:
+                    pass
 
         threading.Thread(target=_run, daemon=True).start()
         # POOL the runtime's tiny ramp chunks (0.08-0.64s) into stable ~1.2s chunks:
@@ -234,23 +263,32 @@ class StreamingPrimeTTS:
         MIN_CHUNK_S = 1.2
         _buf = np.zeros(0, dtype=np.int16)
         _ttfa_logged = False
-        while True:
-            kind, payload, meta = await q.get()
-            if kind == "done":
-                break
-            if kind == "err":
-                raise payload
-            if meta and meta.get("chunk_index") == 0 and not _ttfa_logged:
-                ttfa = float(meta.get("total_ms", 0) or 0)
-                logger.info(f"Qwen3-TTS TTFA {ttfa:.0f}ms (first frame @{self.sample_rate}Hz)")
-                _ttfa_logged = True
-            _buf = np.concatenate([_buf, payload])
-            if len(_buf) / self.sample_rate >= MIN_CHUNK_S:
+        try:
+            while True:
+                kind, payload, meta = await q.get()
+                if kind == "done":
+                    break
+                if kind == "err":
+                    raise payload
+                if meta and meta.get("chunk_index") == 0 and not _ttfa_logged:
+                    ttfa = float(meta.get("total_ms", 0) or 0)
+                    logger.info(f"Qwen3-TTS TTFA {ttfa:.0f}ms (first frame @{self.sample_rate}Hz)")
+                    _ttfa_logged = True
+                _buf = np.concatenate([_buf, payload])
+                if len(_buf) / self.sample_rate >= MIN_CHUNK_S:
+                    yield self._compress_silence(_buf)
+                    _buf = np.zeros(0, dtype=np.int16)
+            if len(_buf):
                 yield self._compress_silence(_buf)
-                _buf = np.zeros(0, dtype=np.int16)
-        if len(_buf):
-            yield self._compress_silence(_buf)
-        _buf = np.zeros(0, dtype=np.int16)
+        finally:
+            # Runs on normal completion AND on cancellation (barge-in): tell the
+            # background thread to stop, and drain so it isn't stuck blocking on q.put().
+            stop_flag.set()
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                except Exception:
+                    break
 
     async def stream_tts(self, token_stream: AsyncGenerator[dict, None]) -> AsyncGenerator[dict, None]:
         buf = ""; token_count = 0

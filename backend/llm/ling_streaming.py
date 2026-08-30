@@ -97,7 +97,6 @@ class LingStreaming:
         self.model_name = model_name
         self.backend = f"llm-gguf:{model_name}"
         self.mock = mock
-        self.client = httpx.AsyncClient(timeout=60.0)
         # Check if server is up, if not, fallback to mock
         if mock:
             logger.info("Ling: MOCK mode (requested)")
@@ -289,21 +288,31 @@ class LingStreaming:
         q = asyncio.Queue()
         task = asyncio.create_task(run_agent_task(task_str, q))
         final_text = ""
-        while True:
-            try:
-                ev = await asyncio.wait_for(q.get(), timeout=0.05)
-            except asyncio.TimeoutError:
-                if task.done():
-                    break
-                continue
-            if ev["type"] == "tool_call":
-                yield {"type": "tool_call", "name": ev["name"],
-                       "arguments": ev.get("arguments", {}), "query": ev.get("query", "")}
-            elif ev["type"] == "tool_result":
-                yield {"type": "tool_result", "name": ev["name"], "result": ev.get("result"),
-                       "formatted": ev.get("formatted", ""), "latency_ms": ev.get("latency_ms", 0),
-                       "source": ev.get("source", "")}
-        final_text = await task
+        try:
+            while True:
+                try:
+                    ev = await asyncio.wait_for(q.get(), timeout=0.05)
+                except asyncio.TimeoutError:
+                    if task.done():
+                        break
+                    continue
+                if ev["type"] == "tool_call":
+                    yield {"type": "tool_call", "name": ev["name"],
+                           "arguments": ev.get("arguments", {}), "query": ev.get("query", "")}
+                elif ev["type"] == "tool_result":
+                    yield {"type": "tool_result", "name": ev["name"], "result": ev.get("result"),
+                           "formatted": ev.get("formatted", ""), "latency_ms": ev.get("latency_ms", 0),
+                           "source": ev.get("source", "")}
+            final_text = await task
+        finally:
+            # If we're being cancelled (barge-in) mid-loop, `task` would otherwise be
+            # orphaned: never awaited, silently running to completion in the background
+            # (its own `agent.run()` call happens in a thread via asyncio.to_thread, which
+            # can't be interrupted mid-call either way, but at least stop *waiting* on it
+            # and don't leak an unretrieved exception).
+            if not task.done():
+                task.cancel()
+            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
         if not isinstance(final_text, str):
             final_text = str(final_text)
         if "<tool_call>" in final_text or "<arg_" in final_text:

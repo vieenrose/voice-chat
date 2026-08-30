@@ -192,14 +192,70 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="default
     logger.info(f"WS connected session={session_id}")
     pcm_queue: asyncio.Queue = asyncio.Queue()
     stop_event = asyncio.Event()
+    # Shared with the voice pipeline (stream_chat_interleaved) so an explicit barge-in
+    # here and a voice-triggered barge-in there cancel through the same signal.
+    active_tts_tasks = set()
+    barge_in_event = asyncio.Event()
+    # Serializes set()->cancel->await->clear() sequences on barge_in_event between this
+    # function and the pipeline's own voice-triggered cancel_current_turn (a new stt_final
+    # superseding an in-flight reply) — without it, an explicit barge-in here and a voice
+    # barge-in there could interleave their clear()s, letting one stray chunk slip past
+    # the is_set() check for a turn that turn_id filtering would otherwise still be the
+    # only thing catching downstream.
+    barge_in_lock = asyncio.Lock()
+
+    async def do_barge_in(reason: str):
+        """Cancel whatever is currently generating/speaking for this session — the
+        text_input path (active_tts_tasks) and/or the live voice-turn task — and wait
+        for it to actually stop before returning, so callers can rely on it being done
+        (rather than clearing the event immediately, which let cancelled tasks observe
+        it as already-False and made the cooperative checks throughout a no-op)."""
+        async with barge_in_lock:
+            tasks = list(active_tts_tasks)
+            voice_task = pipeline._voice_response_tasks.get(session_id)
+            if voice_task is not None and not voice_task.done():
+                tasks.append(voice_task)
+            if not tasks:
+                return
+            logger.info(f"barge_in ({reason}): cancelling {len(tasks)} in-flight task(s)")
+            barge_in_event.set()
+            for task in tasks:
+                task.cancel()
+            active_tts_tasks.clear()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            pipeline._voice_response_tasks.pop(session_id, None)
+            barge_in_event.clear()
+        try:
+            await websocket.send_text(json.dumps({"type": "barge_in", "reason": reason}))
+        except Exception:
+            pass
+
+    async def cancel_text_input_tasks():
+        """Symmetric counterpart to do_barge_in: called by the voice pipeline right
+        before it starts a new turn from a fresh stt_final, so a spoken utterance
+        correctly supersedes an in-flight text_input reply — without this, someone
+        speaking while a typed reply is still playing would leave both the new voice
+        turn and the old direct_tts task running concurrently, each writing tts_chunks
+        for a different turn_id to the same socket."""
+        async with barge_in_lock:
+            tasks = list(active_tts_tasks)
+            if not tasks:
+                return
+            logger.info(f"barge_in (voice superseding text_input): cancelling {len(tasks)} task(s)")
+            barge_in_event.set()
+            for task in tasks:
+                task.cancel()
+            active_tts_tasks.clear()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            barge_in_event.clear()
 
     async def sender_loop():
         try:
-            async for event in pipeline.stream_chat_interleaved(pcm_queue, stop_event, session_id):
+            async for event in pipeline.stream_chat_interleaved(pcm_queue, stop_event, session_id, barge_in_event=barge_in_event, barge_in_lock=barge_in_lock, on_new_voice_turn=cancel_text_input_tasks):
                 etype = event["type"]
                 if etype == "tts_chunk":
                     pcm = event["pcm"]
-                    payload = {"type": "tts_chunk", "pcm": pcm_to_base64(pcm), "text": event["text"], "sampleRate": event["sampleRate"], "latency_ms": event.get("latency_ms", 0)}
+                    payload = {"type": "tts_chunk", "pcm": pcm_to_base64(pcm), "text": event["text"], "sampleRate": event["sampleRate"], "latency_ms": event.get("latency_ms", 0), "turn_id": event.get("turn_id")}
                     await websocket.send_text(json.dumps(payload))
                 elif etype == "tts_start":
                     await websocket.send_text(json.dumps(event))
@@ -220,9 +276,6 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="default
             logger.exception(f"sender_loop error {e}")
 
     sender_task = asyncio.create_task(sender_loop())
-    # Track active direct_tts tasks for barge-in cancellation
-    active_tts_tasks = set()
-    barge_in_event = asyncio.Event()
     try:
         while True:
             try:
@@ -249,33 +302,16 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="default
                 elif t == "stop":
                     await pcm_queue.put({"type":"flush"})
                 elif t == "barge_in":
-                    logger.info("barge_in received — cancelling active TTS")
-                    barge_in_event.set()
-                    for task in list(active_tts_tasks):
-                        task.cancel()
-                    active_tts_tasks.clear()
-                    barge_in_event.clear()
-                    try:
-                        await websocket.send_text(json.dumps({"type": "barge_in", "reason": "audio"}))
-                    except: pass
+                    await do_barge_in("audio")
                 elif t == "text_input":
-                    # Barge-in: cancel previous TTS/LLM generation before starting new one
-                    if active_tts_tasks:
-                        logger.info(f"text_input barge-in: cancelling {len(active_tts_tasks)} active TTS tasks for new query '{data.get('text','')[:30]}'")
-                        barge_in_event.set()
-                        for task in list(active_tts_tasks):
-                            task.cancel()
-                        active_tts_tasks.clear()
-                        # Give cancelled tasks a moment to exit
-                        await asyncio.sleep(0.1)
-                        barge_in_event.clear()
-                    try:
-                        await websocket.send_text(json.dumps({"type": "barge_in", "reason": "text_input"}))
-                    except: pass
+                    # Barge-in: cancel previous TTS/LLM generation (typed or spoken) before starting new one
+                    await do_barge_in("text_input")
                     txt = data.get("text","")
                     _req_voice = data.get("voice") or ""
                     async def direct_tts():
                         start = time.time()
+                        my_turn_id = pipeline.next_turn_id(session_id)
+                        sent_tts_start = False
                         if _req_voice and hasattr(pipeline.tts, "set_voice"):
                             try:
                                 pipeline.tts.set_voice(_req_voice)
@@ -305,18 +341,18 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="default
                                 logger.info("direct_tts cancelled by barge-in")
                                 break
                             if ev["type"] == "tool_call":
-                                await websocket.send_text(json.dumps({"type":"tool_call","name":ev["name"],"arguments":ev.get("arguments",{}), "query": ev.get("query","")}, ensure_ascii=False))
+                                await websocket.send_text(json.dumps({"type":"tool_call","name":ev["name"],"arguments":ev.get("arguments",{}), "query": ev.get("query",""), "turn_id": my_turn_id}, ensure_ascii=False))
                                 stats["tool_calls"] += 1
                             elif ev["type"] == "tool_result":
                                 # forward lightweight result to frontend (omit large content for WS size, but include formatted)
-                                await websocket.send_text(json.dumps({"type":"tool_result","name":ev["name"],"latency_ms":ev.get("latency_ms",0),"source":ev.get("result",{}).get("source","") if isinstance(ev.get("result"),dict) else "", "formatted":ev.get("formatted","")[:600]}, ensure_ascii=False))
+                                await websocket.send_text(json.dumps({"type":"tool_result","name":ev["name"],"latency_ms":ev.get("latency_ms",0),"source":ev.get("result",{}).get("source","") if isinstance(ev.get("result"),dict) else "", "formatted":ev.get("formatted","")[:600], "turn_id": my_turn_id}, ensure_ascii=False))
                             elif ev["type"] == "llm_token":
                                 # Filter tool call XML from TTS/history
                                 _tok = ev.get("token","")
                                 if "<tool_call" in _tok or "<arg_" in _tok or "</" in _tok or "tool_call" in _tok.lower() or ("<" in _tok and ">" in _tok):
                                     continue
                                 if first_llm is None: first_llm = time.time()
-                                await websocket.send_text(json.dumps(ev, ensure_ascii=False))
+                                await websocket.send_text(json.dumps({**ev, "turn_id": my_turn_id}, ensure_ascii=False))
                                 llm_text_so_far = ev.get("text_so_far", llm_text_so_far + _tok)
                                 # Also filter TTS buffer
                                 if "<tool" in _tok.lower() or ("<" in _tok and ">" in _tok):
@@ -363,13 +399,16 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="default
                                         # Skip silence chunks
                                         if len(pcm_chunk) == int(pipeline.tts.sample_rate*0.3) and int(np.max(np.abs(pcm_chunk))) == 0:
                                             continue
+                                        if not sent_tts_start:
+                                            await websocket.send_text(json.dumps({"type":"tts_start","sampleRate":pipeline.tts.sample_rate,"turn_id":my_turn_id}))
+                                            sent_tts_start = True
                                         if first_chunk:
                                             if first_tts is None: first_tts = time.time()
-                                            await websocket.send_text(json.dumps({"type":"tts_chunk","pcm":pcm_to_base64(pcm_chunk),"text":txt_s,"sampleRate":pipeline.tts.sample_rate,"latency_ms":40}))
-                                            await websocket.send_text(json.dumps({"type":"latency","stt_ms":0,"llm_ttft_ms":int((first_llm-llm_start)*1000) if first_llm else 0,"tts_ttfb_ms":int((first_tts-llm_start)*1000) if first_tts else 0,"e2e_ms":int((first_tts-start)*1000)}))  # interim e2e = first audio
+                                            await websocket.send_text(json.dumps({"type":"tts_chunk","pcm":pcm_to_base64(pcm_chunk),"text":txt_s,"sampleRate":pipeline.tts.sample_rate,"latency_ms":40,"turn_id":my_turn_id}))
+                                            await websocket.send_text(json.dumps({"type":"latency","stt_ms":0,"llm_ttft_ms":int((first_llm-llm_start)*1000) if first_llm else 0,"tts_ttfb_ms":int((first_tts-llm_start)*1000) if first_tts else 0,"e2e_ms":int((first_tts-start)*1000),"turn_id":my_turn_id}))  # interim e2e = first audio
                                             first_chunk = False
                                         else:
-                                            await websocket.send_text(json.dumps({"type":"tts_chunk","pcm":pcm_to_base64(pcm_chunk),"text":txt_s,"sampleRate":pipeline.tts.sample_rate,"latency_ms":40}))
+                                            await websocket.send_text(json.dumps({"type":"tts_chunk","pcm":pcm_to_base64(pcm_chunk),"text":txt_s,"sampleRate":pipeline.tts.sample_rate,"latency_ms":40,"turn_id":my_turn_id}))
                                     continue
                             elif ev["type"] == "llm_done":
                                 if tts_buf.strip():
@@ -382,7 +421,10 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="default
                                         async for pcm_chunk in pipeline.tts.synthesize_streaming(_rem):
                                             if len(pcm_chunk) == int(pipeline.tts.sample_rate*0.3) and int(np.max(np.abs(pcm_chunk))) == 0:
                                                 continue
-                                            await websocket.send_text(json.dumps({"type":"tts_chunk","pcm":pcm_to_base64(pcm_chunk),"text":_rem,"sampleRate":pipeline.tts.sample_rate,"latency_ms":40}))
+                                            if not sent_tts_start:
+                                                await websocket.send_text(json.dumps({"type":"tts_start","sampleRate":pipeline.tts.sample_rate,"turn_id":my_turn_id}))
+                                                sent_tts_start = True
+                                            await websocket.send_text(json.dumps({"type":"tts_chunk","pcm":pcm_to_base64(pcm_chunk),"text":_rem,"sampleRate":pipeline.tts.sample_rate,"latency_ms":40,"turn_id":my_turn_id}))
                                 # Update multi-turn history for Ling chat template
                                 try:
                                     from llm.ling_streaming import SYSTEM_PROMPT
@@ -397,8 +439,8 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="default
                                 except Exception as e:
                                     logger.debug(f"history update failed {e}")
                                 # REAL end-to-end: speech finished -> final latency event (overwrites the interim first-audio e2e)
-                                await websocket.send_text(json.dumps({"type":"latency","stt_ms":0,"llm_ttft_ms":int((first_llm-llm_start)*1000) if first_llm else 0,"tts_ttfb_ms":int((first_tts-llm_start)*1000) if first_tts else 0,"e2e_ms":int((time.time()-start)*1000)}))
-                                await websocket.send_text(json.dumps({"type":"tts_end"}))
+                                await websocket.send_text(json.dumps({"type":"latency","stt_ms":0,"llm_ttft_ms":int((first_llm-llm_start)*1000) if first_llm else 0,"tts_ttfb_ms":int((first_tts-llm_start)*1000) if first_tts else 0,"e2e_ms":int((time.time()-start)*1000),"turn_id":my_turn_id}))
+                                await websocket.send_text(json.dumps({"type":"tts_end","turn_id":my_turn_id}))
                                 break
                         # also record latency if we had tool calls
                     _task = asyncio.create_task(direct_tts())
@@ -423,12 +465,19 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="default
                 elif header == 0x02:
                     await pcm_queue.put({"type":"flush"})
                 elif header == 0x03:
-                    logger.info("binary barge_in")
+                    await do_barge_in("binary")
                 else:
                     pcm = np.frombuffer(b, dtype=np.int16)
                     await pcm_queue.put(pcm)
     except WebSocketDisconnect:
         logger.info(f"WS disconnected {session_id}")
+    except RuntimeError as e:
+        if "disconnect message" in str(e):
+            # Benign Starlette race: client closed between our own WebSocketDisconnect
+            # handling and its internal post-handler receive() — not an app error.
+            logger.info(f"WS disconnected (race) {session_id}")
+        else:
+            logger.exception(f"WS error {e}")
     except Exception as e:
         logger.exception(f"WS error {e}")
     finally:

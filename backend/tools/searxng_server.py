@@ -24,6 +24,7 @@ satisfies "self-host searxng to support it".
 """
 import argparse
 import asyncio
+import html as _html
 import time
 from typing import Optional
 from fastapi import FastAPI, Query, Request
@@ -157,17 +158,22 @@ async def search(
     if fmt == "json":
         return JSONResponse(searx_json)
     else:
-        # html — very minimal
+        # html — very minimal. q and every result field are attacker-influenceable
+        # (q is the raw querystring; title/url/content come from external search
+        # backends), so everything interpolated into the markup MUST be escaped —
+        # this used to be raw f-string interpolation, a reflected-XSS hole
+        # (GET /search?q=<script>...&format=html echoed the script unescaped).
+        q_esc = _html.escape(q)
         html_results = "".join([
-            f'<div style="margin:12px 0; padding:12px; background:#14141c; border-radius:8px"><a href="{r["url"]}" style="color:#7c5cff; font-weight:700">{r["title"]}</a><div style="opacity:0.6; font-size:12px">{r["url"]}</div><div style="margin-top:6px">{r["content"][:280]}</div></div>'
+            f'<div style="margin:12px 0; padding:12px; background:#14141c; border-radius:8px"><a href="{_html.escape(r["url"])}" style="color:#7c5cff; font-weight:700">{_html.escape(r["title"])}</a><div style="opacity:0.6; font-size:12px">{_html.escape(r["url"])}</div><div style="margin-top:6px">{_html.escape(r["content"][:280])}</div></div>'
             for r in result["results"]
         ])
         return HTMLResponse(f"""
-        <html><head><title>{q} — SearXNG</title></head>
+        <html><head><title>{q_esc} — SearXNG</title></head>
         <body style="font-family: sans-serif; max-width:800px; margin:20px auto; background:#0a0a0f; color:#eee">
-          <h2>🔍 {q}</h2><div>found {len(result["results"])} via {result["source"]} in {latency_ms}ms</div>
+          <h2>🔍 {q_esc}</h2><div>found {len(result["results"])} via {_html.escape(result["source"])} in {latency_ms}ms</div>
           {html_results}
-          <p style="opacity:0.5">SearXNG minimal — <a href="/search?q={q}&format=json" style="color:#7c5cff">json</a></p>
+          <p style="opacity:0.5">SearXNG minimal — <a href="/search?q={q_esc}&format=json" style="color:#7c5cff">json</a></p>
         </body></html>
         """)
 

@@ -292,11 +292,11 @@ class StreamingPrimeTTSReal:
             pcm = await self.synthesize(text)
             yield pcm
             return
-        # Check for cancellation before even starting (for barge-in)
-        try:
-            await asyncio.sleep(0)  # yield to allow cancellation
-        except asyncio.CancelledError:
-            return
+        # Yield to the event loop so a pending task.cancel() (barge-in) is delivered here
+        # rather than mid-decode. Must NOT catch CancelledError below — swallowing it here
+        # would abort only this generator while leaving the caller's task un-cancelled,
+        # so it keeps running as if nothing happened.
+        await asyncio.sleep(0)
         try:
             # Offload encode to thread, then stream chunks
             o = await asyncio.to_thread(self._text_to_ids, text)
@@ -318,11 +318,8 @@ class StreamingPrimeTTSReal:
             z = await asyncio.to_thread(_enc)
             T = z.shape[2]
             for a in range(0, T, CHUNK):
-                # Check for barge-in cancellation before each chunk
-                try:
-                    await asyncio.sleep(0)
-                except asyncio.CancelledError:
-                    return
+                # Cancellation point for barge-in — let it propagate, don't catch it
+                await asyncio.sleep(0)
                 b = min(a + CHUNK, T)
                 s0 = max(0, a - LEFT)
                 e = min(T, b + RIGHT)
@@ -334,16 +331,10 @@ class StreamingPrimeTTSReal:
                     peak = np.max(np.abs(chunk)) if chunk.size else 1
                     # Don't normalize per chunk, keep consistent with full
                     return (chunk * 32767).astype(np.int16)
-                try:
-                    pcm_chunk = await asyncio.to_thread(_dec)
-                except asyncio.CancelledError:
-                    return
+                pcm_chunk = await asyncio.to_thread(_dec)
                 yield pcm_chunk
                 # Small yield to allow event loop and cancellation
-                try:
-                    await asyncio.sleep(0)
-                except asyncio.CancelledError:
-                    return
+                await asyncio.sleep(0)
         except Exception as e:
             logger.warning(f"streaming failed {e}, fallback")
             pcm = await self.synthesize(text)
