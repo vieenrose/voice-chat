@@ -94,6 +94,9 @@ async def run_agent_task(task: str, event_q=None) -> str:
                 result = agent.run_sync(task)
             return result.output if hasattr(result, 'output') else str(result)
         except Exception as e:
+            # Spoken via TTS with no filtering for an "error"-looking string (see the
+            # identical note in qwen_harness.py) — log the real detail, return a clean
+            # generic fallback instead of the raw exception text.
             logger.exception(f"pydantic agent failed: {e}")
-            return f"(agent error: {e})"
+            return "Sorry, I ran into a problem answering that. Please try again."
     return await asyncio.to_thread(_run)

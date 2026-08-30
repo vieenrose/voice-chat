@@ -386,113 +386,129 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="default
                         import re as _re
                         _zh = bool(_re.search(r'[\u4e00-\u9fff]', txt))
                         _lang_hint = "\n（请用简体中文简洁回答，不要使用英文。）" if _zh else "\nAnswer briefly in English."
-                        async for ev in pipeline.llm.generate_chat_with_tools(history, txt + _lang_hint) if hasattr(pipeline.llm, 'generate_chat_with_tools') else pipeline.llm.generate_with_tools(txt):
-                            # Check for barge-in cancellation
-                            if barge_in_event.is_set():
-                                logger.info("direct_tts cancelled by barge-in")
-                                break
-                            if ev["type"] == "tool_call":
-                                await websocket.send_text(json.dumps({"type":"tool_call","name":ev["name"],"arguments":ev.get("arguments",{}), "query": ev.get("query",""), "turn_id": my_turn_id}, ensure_ascii=False))
-                                stats["tool_calls"] += 1
-                            elif ev["type"] == "tool_result":
-                                # forward lightweight result to frontend (omit large content for WS size, but include formatted)
-                                await websocket.send_text(json.dumps({"type":"tool_result","name":ev["name"],"latency_ms":ev.get("latency_ms",0),"source":ev.get("result",{}).get("source","") if isinstance(ev.get("result"),dict) else "", "formatted":ev.get("formatted","")[:600], "turn_id": my_turn_id}, ensure_ascii=False))
-                            elif ev["type"] == "llm_token":
-                                # Filter tool call XML from TTS/history
-                                _tok = ev.get("token","")
-                                if "<tool_call" in _tok or "<arg_" in _tok or "</" in _tok or "tool_call" in _tok.lower() or ("<" in _tok and ">" in _tok):
-                                    continue
-                                if first_llm is None: first_llm = time.time()
-                                await websocket.send_text(json.dumps({**ev, "turn_id": my_turn_id}, ensure_ascii=False))
-                                llm_text_so_far = ev.get("text_so_far", llm_text_so_far + _tok)
-                                # Also filter TTS buffer
-                                if "<tool" in _tok.lower() or ("<" in _tok and ">" in _tok):
-                                    continue
-                                tts_buf += _tok
-                                cnt += 1
-                                flush = False
-                                if SENT_END.search(ev["token"]): flush=True
-                                elif cnt>=300: flush=True  # safety cap ONLY — never the old >=8+' ,' (8-char flush paced the speech)
+                        try:
+                            async for ev in pipeline.llm.generate_chat_with_tools(history, txt + _lang_hint) if hasattr(pipeline.llm, 'generate_chat_with_tools') else pipeline.llm.generate_with_tools(txt):
+                                # Check for barge-in cancellation
                                 if barge_in_event.is_set():
-                                    logger.info("direct_tts barge-in: aborting LLM->TTS flush")
+                                    logger.info("direct_tts cancelled by barge-in")
                                     break
-                                if flush and tts_buf.strip():
-                                    if barge_in_event.is_set():
-                                        break
-                                    txt_s = tts_buf.strip()
-                                    # Skip tool call artifacts and silence - more aggressive
-                                    _low = txt_s.lower()
-                                    if ("<" in txt_s and ">" in txt_s) or "tool_call" in _low or "arg_key" in _low or "arg_value" in _low or txt_s.strip().lower() in ["web_search", "query"] or ("web_search" in _low and len(txt_s.split()) < 4):
-                                        tts_buf=""; cnt=0
+                                if ev["type"] == "tool_call":
+                                    await websocket.send_text(json.dumps({"type":"tool_call","name":ev["name"],"arguments":ev.get("arguments",{}), "query": ev.get("query",""), "turn_id": my_turn_id}, ensure_ascii=False))
+                                    stats["tool_calls"] += 1
+                                elif ev["type"] == "tool_result":
+                                    # forward lightweight result to frontend (omit large content for WS size, but include formatted)
+                                    await websocket.send_text(json.dumps({"type":"tool_result","name":ev["name"],"latency_ms":ev.get("latency_ms",0),"source":ev.get("result",{}).get("source","") if isinstance(ev.get("result"),dict) else "", "formatted":ev.get("formatted","")[:600], "turn_id": my_turn_id}, ensure_ascii=False))
+                                elif ev["type"] == "llm_token":
+                                    # Filter tool call XML from TTS/history
+                                    _tok = ev.get("token","")
+                                    if "<tool_call" in _tok or "<arg_" in _tok or "</" in _tok or "tool_call" in _tok.lower() or ("<" in _tok and ">" in _tok):
                                         continue
-                                    if txt_s.strip().startswith("<") or "tool_call" in _low:
-                                        tts_buf=""; cnt=0
+                                    if first_llm is None: first_llm = time.time()
+                                    await websocket.send_text(json.dumps({**ev, "turn_id": my_turn_id}, ensure_ascii=False))
+                                    llm_text_so_far = ev.get("text_so_far", llm_text_so_far + _tok)
+                                    # Also filter TTS buffer
+                                    if "<tool" in _tok.lower() or ("<" in _tok and ">" in _tok):
                                         continue
-                                    # Skip tool query like "Who is the president of France 2024" when in tool context
-                                    if txt_s.strip().lower().startswith("who is the president") and len(txt_s.split()) < 10:
-                                        # Check if recent history had tool call
-                                        try:
-                                            hist_str = str(history).lower()
-                                            if "tool" in hist_str and "web_search" in hist_str:
-                                                tts_buf=""; cnt=0
-                                                continue
-                                        except: pass
-                                    tts_buf=""; cnt=0
-                                    # Check again before TTS (long speech may have been barged)
+                                    tts_buf += _tok
+                                    cnt += 1
+                                    flush = False
+                                    if SENT_END.search(ev["token"]): flush=True
+                                    elif cnt>=300: flush=True  # safety cap ONLY — never the old >=8+' ,' (8-char flush paced the speech)
                                     if barge_in_event.is_set():
+                                        logger.info("direct_tts barge-in: aborting LLM->TTS flush")
                                         break
-                                    # Use streaming to avoid large WS messages (>1MB)
-                                    first_chunk = True
-                                    async for pcm_chunk in pipeline.tts.synthesize_streaming(txt_s):
+                                    if flush and tts_buf.strip():
                                         if barge_in_event.is_set():
-                                            logger.info("direct_tts barge-in: aborting TTS streaming mid-sentence")
                                             break
-                                        # Skip silence chunks
-                                        if len(pcm_chunk) == 0 or int(np.max(np.abs(pcm_chunk))) == 0:
+                                        txt_s = tts_buf.strip()
+                                        # Skip tool call artifacts and silence - more aggressive
+                                        _low = txt_s.lower()
+                                        if ("<" in txt_s and ">" in txt_s) or "tool_call" in _low or "arg_key" in _low or "arg_value" in _low or txt_s.strip().lower() in ["web_search", "query"] or ("web_search" in _low and len(txt_s.split()) < 4):
+                                            tts_buf=""; cnt=0
                                             continue
-                                        if not sent_tts_start:
-                                            await websocket.send_text(json.dumps({"type":"tts_start","sampleRate":pipeline.tts.sample_rate,"turn_id":my_turn_id}))
-                                            sent_tts_start = True
-                                        if first_chunk:
-                                            if first_tts is None: first_tts = time.time()
-                                            await websocket.send_text(json.dumps({"type":"tts_chunk","pcm":pcm_to_base64(pcm_chunk),"text":txt_s,"sampleRate":pipeline.tts.sample_rate,"latency_ms":40,"turn_id":my_turn_id}))
-                                            await websocket.send_text(json.dumps({"type":"latency","stt_ms":0,"llm_ttft_ms":int((first_llm-llm_start)*1000) if first_llm else 0,"tts_ttfb_ms":int((first_tts-llm_start)*1000) if first_tts else 0,"e2e_ms":int((first_tts-start)*1000),"turn_id":my_turn_id}))  # interim e2e = first audio
-                                            first_chunk = False
-                                        else:
-                                            await websocket.send_text(json.dumps({"type":"tts_chunk","pcm":pcm_to_base64(pcm_chunk),"text":txt_s,"sampleRate":pipeline.tts.sample_rate,"latency_ms":40,"turn_id":my_turn_id}))
-                                    continue
-                            elif ev["type"] == "llm_done":
-                                if tts_buf.strip():
-                                    _rem = tts_buf.strip()
-                                    if "<" in _rem and ">" in _rem:
-                                        pass
-                                    elif "tool_call" in _rem.lower() or _rem.strip().startswith("<"):
-                                        pass
-                                    else:
-                                        async for pcm_chunk in pipeline.tts.synthesize_streaming(_rem):
+                                        if txt_s.strip().startswith("<") or "tool_call" in _low:
+                                            tts_buf=""; cnt=0
+                                            continue
+                                        # Skip tool query like "Who is the president of France 2024" when in tool context
+                                        if txt_s.strip().lower().startswith("who is the president") and len(txt_s.split()) < 10:
+                                            # Check if recent history had tool call
+                                            try:
+                                                hist_str = str(history).lower()
+                                                if "tool" in hist_str and "web_search" in hist_str:
+                                                    tts_buf=""; cnt=0
+                                                    continue
+                                            except: pass
+                                        tts_buf=""; cnt=0
+                                        # Check again before TTS (long speech may have been barged)
+                                        if barge_in_event.is_set():
+                                            break
+                                        # Use streaming to avoid large WS messages (>1MB)
+                                        first_chunk = True
+                                        async for pcm_chunk in pipeline.tts.synthesize_streaming(txt_s):
+                                            if barge_in_event.is_set():
+                                                logger.info("direct_tts barge-in: aborting TTS streaming mid-sentence")
+                                                break
+                                            # Skip silence chunks
                                             if len(pcm_chunk) == 0 or int(np.max(np.abs(pcm_chunk))) == 0:
                                                 continue
                                             if not sent_tts_start:
                                                 await websocket.send_text(json.dumps({"type":"tts_start","sampleRate":pipeline.tts.sample_rate,"turn_id":my_turn_id}))
                                                 sent_tts_start = True
-                                            await websocket.send_text(json.dumps({"type":"tts_chunk","pcm":pcm_to_base64(pcm_chunk),"text":_rem,"sampleRate":pipeline.tts.sample_rate,"latency_ms":40,"turn_id":my_turn_id}))
-                                # Update multi-turn history for Ling chat template
-                                try:
-                                    from llm.ling_streaming import SYSTEM_PROMPT
-                                    hist = pipeline._get_history(session_id)
-                                    if not hist or hist[0].get("role") != "system":
-                                        hist.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
-                                    hist.append({"role": "user", "content": txt})
-                                    assistant_text = llm_text_so_far or ev.get("text") or ""
-                                    if assistant_text:
-                                        hist.append({"role": "assistant", "content": assistant_text})
-                                    pipeline.sessions[session_id] = pipeline._trim_history(hist)
-                                except Exception as e:
-                                    logger.debug(f"history update failed {e}")
-                                # REAL end-to-end: speech finished -> final latency event (overwrites the interim first-audio e2e)
-                                await websocket.send_text(json.dumps({"type":"latency","stt_ms":0,"llm_ttft_ms":int((first_llm-llm_start)*1000) if first_llm else 0,"tts_ttfb_ms":int((first_tts-llm_start)*1000) if first_tts else 0,"e2e_ms":int((time.time()-start)*1000),"turn_id":my_turn_id}))
+                                            if first_chunk:
+                                                if first_tts is None: first_tts = time.time()
+                                                await websocket.send_text(json.dumps({"type":"tts_chunk","pcm":pcm_to_base64(pcm_chunk),"text":txt_s,"sampleRate":pipeline.tts.sample_rate,"latency_ms":40,"turn_id":my_turn_id}))
+                                                await websocket.send_text(json.dumps({"type":"latency","stt_ms":0,"llm_ttft_ms":int((first_llm-llm_start)*1000) if first_llm else 0,"tts_ttfb_ms":int((first_tts-llm_start)*1000) if first_tts else 0,"e2e_ms":int((first_tts-start)*1000),"turn_id":my_turn_id}))  # interim e2e = first audio
+                                                first_chunk = False
+                                            else:
+                                                await websocket.send_text(json.dumps({"type":"tts_chunk","pcm":pcm_to_base64(pcm_chunk),"text":txt_s,"sampleRate":pipeline.tts.sample_rate,"latency_ms":40,"turn_id":my_turn_id}))
+                                        continue
+                                elif ev["type"] == "llm_done":
+                                    if tts_buf.strip():
+                                        _rem = tts_buf.strip()
+                                        if "<" in _rem and ">" in _rem:
+                                            pass
+                                        elif "tool_call" in _rem.lower() or _rem.strip().startswith("<"):
+                                            pass
+                                        else:
+                                            async for pcm_chunk in pipeline.tts.synthesize_streaming(_rem):
+                                                if len(pcm_chunk) == 0 or int(np.max(np.abs(pcm_chunk))) == 0:
+                                                    continue
+                                                if not sent_tts_start:
+                                                    await websocket.send_text(json.dumps({"type":"tts_start","sampleRate":pipeline.tts.sample_rate,"turn_id":my_turn_id}))
+                                                    sent_tts_start = True
+                                                await websocket.send_text(json.dumps({"type":"tts_chunk","pcm":pcm_to_base64(pcm_chunk),"text":_rem,"sampleRate":pipeline.tts.sample_rate,"latency_ms":40,"turn_id":my_turn_id}))
+                                    # Update multi-turn history for Ling chat template
+                                    try:
+                                        from llm.ling_streaming import SYSTEM_PROMPT
+                                        hist = pipeline._get_history(session_id)
+                                        if not hist or hist[0].get("role") != "system":
+                                            hist.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+                                        hist.append({"role": "user", "content": txt})
+                                        assistant_text = llm_text_so_far or ev.get("text") or ""
+                                        if assistant_text:
+                                            hist.append({"role": "assistant", "content": assistant_text})
+                                        pipeline.sessions[session_id] = pipeline._trim_history(hist)
+                                    except Exception as e:
+                                        logger.debug(f"history update failed {e}")
+                                    # REAL end-to-end: speech finished -> final latency event (overwrites the interim first-audio e2e)
+                                    await websocket.send_text(json.dumps({"type":"latency","stt_ms":0,"llm_ttft_ms":int((first_llm-llm_start)*1000) if first_llm else 0,"tts_ttfb_ms":int((first_tts-llm_start)*1000) if first_tts else 0,"e2e_ms":int((time.time()-start)*1000),"turn_id":my_turn_id}))
+                                    await websocket.send_text(json.dumps({"type":"tts_end","turn_id":my_turn_id}))
+                                    break
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as e:
+                            # The LLM/TTS backend failed independently mid-turn (e.g. a model
+                            # switch via POST /api/model killed the llama-server connection this
+                            # generation was using) — without this, the exception would vanish as
+                            # an unretrieved-task-exception warning (the _done_callback below only
+                            # discards this task from active_tts_tasks, it doesn't inspect the
+                            # result) and the client would hang forever waiting for a tts_end that
+                            # will never arrive.
+                            logger.warning(f"direct_tts: LLM/TTS generation failed mid-turn: {e!r}")
+                            try:
                                 await websocket.send_text(json.dumps({"type":"tts_end","turn_id":my_turn_id}))
-                                break
+                            except Exception:
+                                pass
                         # also record latency if we had tool calls
                     _task = asyncio.create_task(direct_tts())
                     active_tts_tasks.add(_task)

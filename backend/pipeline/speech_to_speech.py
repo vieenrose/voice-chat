@@ -329,82 +329,93 @@ class HFSpeechToSpeechPipeline:
 
             # Use Ling multi-turn tool-aware generation (history + current prompt)
             # LingStreaming handles web_search via SearXNG and full chat template (<role>SYSTEM/HUMAN/ASSISTANT + <tool_call>)
-            llm_gen = self.llm.generate_chat_with_tools(turn_history, stt_final_text) if hasattr(self.llm, 'generate_chat_with_tools') else self.llm.generate_with_tools(stt_final_text)
-            async for llm_event in llm_gen:
-                if llm_event["type"] == "tool_call":
-                    await emit({"type": "tool_call", "name": llm_event["name"], "arguments": llm_event.get("arguments", {}), "query": llm_event.get("query","")})
-                    continue
-                if llm_event["type"] == "tool_result":
-                    await emit({"type": "tool_result", "name": llm_event["name"], "result": llm_event.get("result"), "formatted": llm_event.get("formatted",""), "latency_ms": llm_event.get("latency_ms",0), "source": llm_event.get("result",{}).get("source","") if isinstance(llm_event.get("result"), dict) else ""})
-                    continue
-                if llm_event["type"] == "llm_token":
-                    # Filter tool call artifacts from TTS/history - they are XML, not natural language
-                    _tok = llm_event.get("token","")
-                    if "<tool_call" in _tok or "<arg_" in _tok or "</" in _tok or "tool_call" in _tok.lower():
+            try:
+                llm_gen = self.llm.generate_chat_with_tools(turn_history, stt_final_text) if hasattr(self.llm, 'generate_chat_with_tools') else self.llm.generate_with_tools(stt_final_text)
+                async for llm_event in llm_gen:
+                    if llm_event["type"] == "tool_call":
+                        await emit({"type": "tool_call", "name": llm_event["name"], "arguments": llm_event.get("arguments", {}), "query": llm_event.get("query","")})
                         continue
-                    if first_llm_t is None:
-                        first_llm_t = time.time()
-                        llm_ttft = int((first_llm_t - llm_start)*1000)
-                    await emit(llm_event)
-                    llm_text_so_far = llm_event["text_so_far"]
-                    tok = llm_event["token"]
-                    if "<tool" in tok.lower() or ("<" in tok and ">" in tok):
+                    if llm_event["type"] == "tool_result":
+                        await emit({"type": "tool_result", "name": llm_event["name"], "result": llm_event.get("result"), "formatted": llm_event.get("formatted",""), "latency_ms": llm_event.get("latency_ms",0), "source": llm_event.get("result",{}).get("source","") if isinstance(llm_event.get("result"), dict) else ""})
                         continue
-                    tts_buffer += tok
-                    tts_token_count += 1
-                    should_flush = False
-                    if SENT_END.search(tok):
-                        should_flush = True
-                    elif tts_token_count >= 300:
-                        # safety cap only — never chop mid-sentence (the old >=8 + ' ,' rule fragmented
-                        # every sentence into ~2-word TTS chunks -> deterministic mid-sentence pauses)
-                        should_flush = True
+                    if llm_event["type"] == "llm_token":
+                        # Filter tool call artifacts from TTS/history - they are XML, not natural language
+                        _tok = llm_event.get("token","")
+                        if "<tool_call" in _tok or "<arg_" in _tok or "</" in _tok or "tool_call" in _tok.lower():
+                            continue
+                        if first_llm_t is None:
+                            first_llm_t = time.time()
+                            llm_ttft = int((first_llm_t - llm_start)*1000)
+                        await emit(llm_event)
+                        llm_text_so_far = llm_event["text_so_far"]
+                        tok = llm_event["token"]
+                        if "<tool" in tok.lower() or ("<" in tok and ">" in tok):
+                            continue
+                        tts_buffer += tok
+                        tts_token_count += 1
+                        should_flush = False
+                        if SENT_END.search(tok):
+                            should_flush = True
+                        elif tts_token_count >= 300:
+                            # safety cap only — never chop mid-sentence (the old >=8 + ' ,' rule fragmented
+                            # every sentence into ~2-word TTS chunks -> deterministic mid-sentence pauses)
+                            should_flush = True
 
-                    if should_flush and tts_buffer.strip():
-                        text_to_synth = tts_buffer.strip()
-                        _low = text_to_synth.lower()
-                        if ("<" in text_to_synth and ">" in text_to_synth) or "tool_call" in _low or "arg_key" in _low or "arg_value" in _low or text_to_synth.strip().lower() in ["web_search", "query"] or "web_search" in _low and len(text_to_synth.split()) < 4:
-                            logger.info(f"Skip TTS for tool artifact: {text_to_synth[:60]}")
+                        if should_flush and tts_buffer.strip():
+                            text_to_synth = tts_buffer.strip()
+                            _low = text_to_synth.lower()
+                            if ("<" in text_to_synth and ">" in text_to_synth) or "tool_call" in _low or "arg_key" in _low or "arg_value" in _low or text_to_synth.strip().lower() in ["web_search", "query"] or "web_search" in _low and len(text_to_synth.split()) < 4:
+                                logger.info(f"Skip TTS for tool artifact: {text_to_synth[:60]}")
+                                tts_buffer = ""
+                                tts_token_count = 0
+                                continue
+                            if text_to_synth.strip().startswith("<") or "tool_call" in _low:
+                                logger.info(f"Skip TTS for tool call: {text_to_synth[:60]}")
+                                tts_buffer = ""
+                                tts_token_count = 0
+                                continue
+                            # Also skip pure tool queries like "Who is the president of France 2024" when it's from tool call context
+                            if text_to_synth.strip().lower().startswith("who is the president") and len(text_to_synth.split()) < 10 and "tool" in str(turn_history).lower():
+                                logger.info(f"Skip TTS for tool query: {text_to_synth[:60]}")
+                                tts_buffer = ""
+                                tts_token_count = 0
+                                continue
                             tts_buffer = ""
                             tts_token_count = 0
-                            continue
-                        if text_to_synth.strip().startswith("<") or "tool_call" in _low:
-                            logger.info(f"Skip TTS for tool call: {text_to_synth[:60]}")
-                            tts_buffer = ""
-                            tts_token_count = 0
-                            continue
-                        # Also skip pure tool queries like "Who is the president of France 2024" when it's from tool call context
-                        if text_to_synth.strip().lower().startswith("who is the president") and len(text_to_synth.split()) < 10 and "tool" in str(turn_history).lower():
-                            logger.info(f"Skip TTS for tool query: {text_to_synth[:60]}")
-                            tts_buffer = ""
-                            tts_token_count = 0
-                            continue
-                        tts_buffer = ""
-                        tts_token_count = 0
-                        logger.info(f"[TTS flush] trig='{tok!r}' text='{text_to_synth[:60]}'")
-                        await synth_and_emit(text_to_synth)
+                            logger.info(f"[TTS flush] trig='{tok!r}' text='{text_to_synth[:60]}'")
+                            await synth_and_emit(text_to_synth)
 
-                elif llm_event["type"] == "llm_done":
-                    # flush remainder
-                    if tts_buffer.strip():
-                        _remainder = tts_buffer.strip()
-                        if ("<" in _remainder and ">" in _remainder) or _remainder.strip().startswith("<") or "tool_call" in _remainder.lower():
-                            logger.info(f"Skip TTS remainder tool artifact: {_remainder[:60]}")
-                        else:
-                            await synth_and_emit(_remainder)
-                    # Update multi-turn history for Ling 3.0 chat template (system + turns)
-                    try:
-                        from llm.ling_streaming import SYSTEM_PROMPT
-                        hist = self._get_history(session_id)
-                        if not hist or hist[0].get("role") != "system":
-                            hist.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
-                        hist.append({"role": "user", "content": stt_final_text})
-                        hist.append({"role": "assistant", "content": llm_text_so_far})
-                        self.sessions[session_id] = self._trim_history(hist)
-                    except Exception as e:
-                        logger.debug(f"history update failed {e}")
-                    await emit({"type": "tts_end"})
-                    return
+                    elif llm_event["type"] == "llm_done":
+                        # flush remainder
+                        if tts_buffer.strip():
+                            _remainder = tts_buffer.strip()
+                            if ("<" in _remainder and ">" in _remainder) or _remainder.strip().startswith("<") or "tool_call" in _remainder.lower():
+                                logger.info(f"Skip TTS remainder tool artifact: {_remainder[:60]}")
+                            else:
+                                await synth_and_emit(_remainder)
+                        # Update multi-turn history for Ling 3.0 chat template (system + turns)
+                        try:
+                            from llm.ling_streaming import SYSTEM_PROMPT
+                            hist = self._get_history(session_id)
+                            if not hist or hist[0].get("role") != "system":
+                                hist.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+                            hist.append({"role": "user", "content": stt_final_text})
+                            hist.append({"role": "assistant", "content": llm_text_so_far})
+                            self.sessions[session_id] = self._trim_history(hist)
+                        except Exception as e:
+                            logger.debug(f"history update failed {e}")
+                        await emit({"type": "tts_end"})
+                        return
+            except asyncio.CancelledError:
+                raise  # real barge-in cancellation — let it propagate normally, don't treat as a backend failure
+            except Exception as e:
+                # The LLM/TTS backend failed independently mid-turn (e.g. a model switch via
+                # POST /api/model killed the llama-server connection this generation was using)
+                # — without this, the exception would vanish as an unretrieved-task-exception
+                # warning (nothing else awaits this task during normal operation) and the client
+                # would hang forever waiting for a tts_end that will never arrive.
+                logger.warning(f"run_turn: LLM/TTS generation failed mid-turn: {e!r}")
+                await emit({"type": "tts_end"})
 
         async def cancel_current_turn(task: asyncio.Task):
             async with barge_in_lock:

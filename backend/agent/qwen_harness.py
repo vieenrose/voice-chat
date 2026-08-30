@@ -216,6 +216,11 @@ async def run_agent_task(task: str, event_q=None) -> str:
                             return c
             return "Sorry, I could not find an answer."
         except Exception as e:
+            # This return value is spoken via TTS (generate_chat_with_tools tokenizes it
+            # char-by-char with no filtering for an "error"-looking string) — a raw
+            # exception message here (e.g. an httpx connection error from a model switch
+            # killing the server mid-request) would get read aloud verbatim. Log the real
+            # detail server-side; return a clean, generic fallback for the user to hear.
             logger.exception(f"qwen agent failed: {e}")
-            return f"(agent error: {e})"
+            return "Sorry, I ran into a problem answering that. Please try again."
     return await asyncio.to_thread(_run)

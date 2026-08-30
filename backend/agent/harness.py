@@ -246,7 +246,10 @@ async def run_agent_task(task: str, event_q: asyncio.Queue | None = None) -> str
         try:
             return agent.run(task)
         except Exception as e:
+            # Spoken via TTS with no filtering for an "error"-looking string (see the
+            # identical note in qwen_harness.py) — log the real detail, return a clean
+            # generic fallback instead of the raw exception text.
             logger.exception(f"agent.run failed: {e}")
-            return f"(agent error: {e})"
+            return "Sorry, I ran into a problem answering that. Please try again."
 
     return await asyncio.to_thread(_worker)
