@@ -55,16 +55,50 @@
   let canvasEl;
   let animId;
   function log(msg, obj) { console.log('[UI]', msg, obj||''); }
+  function apiUrl(path){ return location.protocol==='https:' ? path : `http://${location.hostname}:8000${path}`; }
+  // Live model info, sourced from /health's llm_manager block — replaces what used to be
+  // three separately hardcoded copies of the model name (header subtitle, Stack card,
+  // footer) that each went stale the last time the deployed model actually changed.
+  let llmModels = $state([]);
+  let currentModelId = $state('');
+  let selectedModelId = $state('');
+  let modelSwitching = $state(false);
+  let modelSwitchStatus = $state('');
+  let sttBackend = $state('');
+  let ttsBackend = $state('');
   async function fetchHealth(){
     try{
-      const healthUrl = location.protocol==='https:' ? '/health' : `http://${location.hostname}:8000/health`;
-      const r = await fetch(healthUrl);
+      const r = await fetch(apiUrl('/health'));
       const j = await r.json();
       rssMb = j.rss_mb;
       mode = j.mock ? 'mock' : 'real';
       searxngOk = j.searxng?.ok || false;
+      sttBackend = j.models_loaded?.stt || '';
+      ttsBackend = j.models_loaded?.tts || '';
+      const lm = j.llm_manager;
+      if(lm){
+        llmModels = lm.available || [];
+        currentModelId = lm.current_model_id || '';
+        if(!modelSwitching && !selectedModelId) selectedModelId = currentModelId;
+        // Reflect a switch made from elsewhere (another tab, curl, etc.) without
+        // stomping on a switch this tab itself is mid-flight on.
+        if(!modelSwitching) modelSwitching = !!lm.switching;
+      }
       return j;
     }catch(e){ rssMb=0; return null; }
+  }
+  async function switchModel(){
+    if(modelSwitching || !selectedModelId || selectedModelId===currentModelId) return;
+    modelSwitching = true; modelSwitchStatus = `Loading ${selectedModelId}…`;
+    try{
+      const r = await fetch(apiUrl('/api/model'), {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({model_id: selectedModelId})});
+      const j = await r.json();
+      if(!r.ok){ modelSwitchStatus = `Failed: ${j.error||r.status}`; }
+      else{ currentModelId = j.model_id; modelSwitchStatus = `Loaded ${j.label} (${j.took_s ?? '?'}s)`; }
+    }catch(e){ modelSwitchStatus = `Failed: ${e}`; }
+    modelSwitching = false;
+    await fetchHealth();
+    setTimeout(()=>{ if(!modelSwitching) modelSwitchStatus=''; }, 4000);
   }
   async function testSearch(q){ sendText(q); }
   async function connect(){
@@ -203,6 +237,13 @@
     preRollQueue.length=0; preRollStarted=false;
     jitterQueue=[]; nextPlayTime=0; speaking=false;
     if(playCtx){ try{ playCtx.suspend(); }catch(e){} try{ playCtx.close(); }catch(e){} playCtx=null; }
+    // Freeze whatever text had already streamed instead of leaving its bubble stuck
+    // showing a "▌" cursor forever — generation genuinely stopped here, it's not
+    // still in flight, so there's no more "streaming" state left to represent.
+    if(chatHistory.length && chatHistory[chatHistory.length-1].streaming){
+      chatHistory[chatHistory.length-1].streaming = false;
+      chatHistory = [...chatHistory];
+    }
     // Clear any queued TTS chunks and LLM streaming
     ttsText=''; llmStreaming='';
     // Force speaking false even if onended fires late
@@ -261,7 +302,13 @@
   :global(body.light) .pill{background:#fff; border-color:#e3e4ee; color:#555}
   :global(body.light) .pill.ok{border-color:#7c5cff; color:#6a4beb}
   .grid{display:grid; grid-template-columns: 380px 1fr; gap:16px}
-  @media(max-width:900px){ .grid{grid-template-columns:1fr} .header{flex-direction:column; align-items:stretch} }
+  @media(max-width:900px){
+    .grid{grid-template-columns:1fr}
+    .header{flex-direction:column; align-items:stretch}
+    /* Conversation is the primary surface — show it before the controls/model cards
+       once the layout collapses to one column, instead of forcing a scroll past them. */
+    .chat-col{order:-1}
+  }
   .card{background:#14141c; border:1px solid #1e1e28; border-radius:14px; padding:14px}
   :global(body.light) .card{background:#fff; border-color:#e8eaf0; box-shadow:0 1px 3px rgba(0,0,0,0.06)}
   .card h3{font-size:11px; font-weight:600; letter-spacing:0.07em; text-transform:uppercase; opacity:0.6; margin:0 0 10px 0}
@@ -281,6 +328,13 @@
   :global(body.light) .lat{background:#f8f9fc; border-color:#eef0f6}
   .wave{width:100%; height:64px; border-radius:10px; background:#0a0a0f; border:1px solid #1e1e28; margin:10px 0; display:block}
   :global(body.light) .wave{background:#f0f1f8; border-color:#eef0f6}
+  .status-banner{display:flex; gap:8px; align-items:center; font-size:12px; padding:8px 10px; border-radius:8px; margin:8px 0}
+  .status-speaking{background:#14101f; border:1px solid #2a2242; color:#c7b8ff}
+  :global(body.light) .status-speaking{background:#f3f0ff; border-color:#ded4ff; color:#5a3fc0}
+  .status-banner .dot{animation:pulse 1.2s infinite; color:#7c5cff}
+  .model-picker{margin-top:10px; padding-top:10px; border-top:1px solid #1e1e28}
+  :global(body.light) .model-picker{border-color:#e8eaf0}
+  select.input{-webkit-appearance:none; appearance:none}
   .chat{height:420px; overflow:auto; display:flex; flex-direction:column; gap:8px; padding:4px; scroll-behavior:smooth}
   .bubble{max-width:82%; padding:10px 12px; border-radius:12px; font-size:13px; line-height:1.5; word-break:break-word}
   .bubble.user{align-self:flex-end; background:#7c5cff; color:#fff; border-bottom-right-radius:4px}
@@ -321,18 +375,18 @@
       <div class="logo">🎙️</div>
       <div style="min-width:0">
         <div class="title">Voice Chat</div>
-        <div class="subtitle">X-ASR-int8 · Qwen3.5-2B Q4 · Granite-97M Q8 (CUDA) · Qwen3-TTS 0.6B Q8_0 24kHz · Qwen-Agent</div>
+        <div class="subtitle">Real-time bilingual voice assistant · barge-in either direction · tool-aware</div>
       </div>
     </div>
     <div class="header-actions">
       <span class="pill {connected ? 'ok' : ''}">{connected ? '● Live' : '○ Offline'} · {mode.toUpperCase()}</span>
       <span class="pill" style="font-variant-numeric:tabular-nums">{rssMb} MB</span>
-      <button class="ghost" style="padding:6px 10px; font-size:12px" onclick={toggleTheme}>{theme==='dark' ? '☀️' : '🌙'}</button>
+      <button class="ghost" style="padding:6px 10px; font-size:12px" onclick={toggleTheme} aria-label={theme==='dark' ? 'Switch to light theme' : 'Switch to dark theme'}>{theme==='dark' ? '☀️' : '🌙'}</button>
     </div>
   </header>
 
   <div class="grid">
-    <div class="stack">
+    <div class="stack controls-col">
       <div class="card">
         <h3>Realtime</h3>
         <div class="controls">
@@ -342,17 +396,22 @@
             <button class="ghost" onclick={disconnect}>Disconnect</button>
           {/if}
           {#if !listening}
-            <button class="primary" onclick={startMic} disabled={!connected}>🎤 Listen</button>
+            <button class="primary" onclick={startMic} disabled={!connected} aria-label="Start listening on microphone">🎤 Listen</button>
           {:else}
             <button class="danger" onclick={stopMic}>Stop</button>
-            <button class="ghost" onclick={bargeIn}>Barge-in</button>
           {/if}
-          <button class="ghost" onclick={()=>{vadEnabled=!vadEnabled}}>{vadEnabled ? 'VAD' : 'VAD off'}</button>
+          {#if speaking}
+            <button class="ghost" onclick={bargeIn} aria-label="Interrupt the assistant's reply">⏹ Stop reply</button>
+          {/if}
+          <button class="ghost" onclick={()=>{vadEnabled=!vadEnabled}} aria-pressed={vadEnabled}>{vadEnabled ? 'VAD' : 'VAD off'}</button>
         </div>
         {#if micError}
           <div style="margin:8px 0; padding:10px; background:#1a0f14; border:1px solid #3a1a1a; border-radius:8px; font-size:12px; color:#ffb3b3">{micError}</div>
         {/if}
         <canvas bind:this={canvasEl} class="wave" width="640" height="64"></canvas>
+        {#if speaking}
+          <div class="status-banner status-speaking"><span class="dot" aria-hidden="true">●</span> Assistant is speaking — say something or hit Stop reply to interrupt</div>
+        {/if}
         <div class="lat-grid">
           <div class="lat"><b>{latency.stt_ms||0}</b><span>STT</span></div>
           <div class="lat"><b>{latency.llm_ttft_ms||0}</b><span>LLM</span></div>
@@ -364,19 +423,32 @@
           <div>{sttPartial || '—'}</div>
           <div>{llmStreaming ? llmStreaming.slice(0,32)+'…' : '—'}</div>
         </div>
-        <p class="subtle" style="margin-top:10px">Svelte 5 · AudioWorklet · Binary WS · barge-in · pre-roll 0.6s</p>
+        <p class="subtle" style="margin-top:10px">Svelte 5 · AudioWorklet · Binary WS · pre-roll 0.6s</p>
       </div>
 
       <div class="card">
-        <h3>Stack</h3>
+        <h3>Model</h3>
         <div style="font-size:12px; line-height:1.6; opacity:0.85">
-          <div><b>STT</b> X-ASR 160ms-int8 (16k, zh+en) · <b>LLM</b> Qwen3.5-2B Q4 · <b>Embed</b> Granite-97M Q8 (CUDA, 384d) · <b>TTS</b> Qwen3-TTS 0.6B Q8_0 24kHz</div>
-          <div class="subtle">Agent <b>Qwen-Agent</b> (3 tools) · SearXNG self-host + wttr.in + Bing · Tools: web_search · get_weather · get_current_datetime · honest search</div>
+          <div><b>STT</b> {sttBackend || '—'} · <b>Embed</b> Granite-97M Q8 (CUDA, 384d) · <b>TTS</b> {ttsBackend || '—'}</div>
+          <div class="subtle">Agent <b>Qwen-Agent</b> (3 tools) · SearXNG self-host + wttr.in + Bing</div>
+        </div>
+        <div class="model-picker">
+          <label for="llm-select" class="subtle" style="display:block; margin-bottom:4px">LLM (text)</label>
+          <div style="display:flex; gap:8px">
+            <select id="llm-select" class="input" style="border-radius:8px" bind:value={selectedModelId} disabled={modelSwitching}>
+              {#each llmModels as m}
+                <option value={m.id} disabled={!m.exists}>{m.label}{m.id===currentModelId ? ' (loaded)' : ''}{!m.exists ? ' — file missing' : ''}</option>
+              {/each}
+            </select>
+            <button class="ghost" onclick={switchModel} disabled={modelSwitching || !selectedModelId || selectedModelId===currentModelId}>{modelSwitching ? 'Loading…' : 'Load'}</button>
+          </div>
+          {#if modelSwitchStatus}<div class="subtle" style="margin-top:6px">{modelSwitchStatus}</div>{/if}
+          <div class="subtle" style="margin-top:6px">Switching stops and restarts the LLM server — voice/text replies pause for a few seconds while the new model loads.</div>
         </div>
       </div>
     </div>
 
-    <div class="stack">
+    <div class="stack chat-col">
       <div class="card" style="display:flex; flex-direction:column; min-height:500px">
         <h3>Conversation <span style="margin-left:auto; font-size:11px; opacity:0.5; text-transform:none; letter-spacing:0">{chatHistory.length} msgs</span> <button class="ghost" style="padding:4px 8px; font-size:11px; margin-left:8px" onclick={clearChat}>Clear</button></h3>
         <div class="chat" id="chat">
@@ -416,6 +488,6 @@
   </div>
 
   <div style="text-align:center; font-size:11px; opacity:0.4; margin-top:16px">
-    Endpoint Detection · X-ASR-int8 · Qwen3.5-2B Q4 · Granite-97M Q8 · Qwen3-TTS 0.6B · Qwen-Agent · <a href="https://github.com/vieenrose/voice-chat" style="color:inherit">GitHub</a>
+    Full-duplex speech-to-speech, self-hosted, no cloud APIs · <a href="https://github.com/vieenrose/voice-chat" style="color:inherit">GitHub</a>
   </div>
 </div>

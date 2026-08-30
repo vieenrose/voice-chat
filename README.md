@@ -17,7 +17,7 @@ Mic 16k ──► Endpoint detect (sherpa-onnx) ──► STT (X-ASR-int8 160ms,
 |---|---|---|
 | **Turn-taking** | sherpa-onnx rule-based endpointing | Trailing-silence rules (`rule1`/`rule2`/`rule3`) drive `stt_final`; no separate VAD model in the loop |
 | **STT** | `GilgameshWind/X-ASR-zh-en` int8 | sherpa-onnx Zipformer, 160ms streaming, `146M` encoder int8 (was `566M`), zh+en 16k, CUDA |
-| **LLM** | `Qwen/Qwen3.5-2B` Q4_K_M | `unsloth/Qwen3.5-2B-GGUF` `1.3G`, llama-server `:11435` `-c 16384` `Qwen-Agent` `thinking:True`, `3` tools |
+| **LLM** | `Qwen/Qwen3.5-2B` Q4_K_M (default) | `unsloth/Qwen3.5-2B-GGUF` `1.3G`, llama-server `:11435` `-c 16384` `Qwen-Agent` `thinking:True`, `3` tools — switchable at runtime between `0.8B Q8_0` / `2B Q4_K_M` / `4B Q4_K_M` via the UI or `POST /api/model` |
 | **Embedding** | `ibm-granite/granite-embedding-97m-multilingual` Q8_0 | `115M` GGUF `384d` `zh-TW+en`, `llama-server :11434` `CUDA` `8ms` batch rerank `0.34-0.65` |
 | **TTS** | `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` Q8_0 | `qwen-talker-0.6b-customvoice-Q8_0.gguf` `924M` + `codec.gguf` `343M`, `qwentts-cpp-python==0.3.1+cu124` GGML CUDA, true streaming, `24k` `~20ms` TTFA |
 | **Search** | SearXNG official `:8888` + wttr.in + Bing scrape | `180` engines `all - china` (`baidu`/`sogou`/`360search` disabled), `general`/`news`, honest `no curated mocks`, `wttr.in` real weather `+` `searxng` `+` `DDG`/`lite`/`Bing` fallback |
@@ -42,7 +42,9 @@ Measured on RTX 3060: STT 300ms partial · LLM TTFT 100–400ms · TTS TTFB 0.4�
   -m /tmp/granite-emb-gguf/granite-embedding-97M-multilingual-r2-Q8_0.gguf \
   --host 127.0.0.1 --port 11434 -c 8192 --alias granite-embedding --embedding --pooling mean --n-gpu-layers 99
 
-# 2) LLM (Qwen3.5-2B Q4_K_M, 1.3G, thinking)
+# 2) LLM (Qwen3.5-2B Q4_K_M, 1.3G, thinking) — OPTIONAL: the backend (step 4) now
+# spawns and owns this itself if nothing's listening on :11435 yet (see
+# backend/llm_manager.py), or adopts it if you start it manually first, as below.
 /home/user/llama.cpp/build/bin/llama-server \
   -m /tmp/llms/Qwen3.5-2B-Q4_K_M.gguf \
   --host 127.0.0.1 --port 11435 -c 16384 --alias qwen3.5-2b --n-gpu-layers 99 --jinja
@@ -83,9 +85,12 @@ See `docker-compose.yml` for volume mounts (`/models/llm`, `/models/tts`, `/mode
 | `POST /api/chat` | JSON chat (non-stream) |
 | `GET /api/search?q=…` | Honest SearXNG search (no curated mocks) |
 | `GET /stats` | Counters & latencies |
+| `GET /api/model` | Current + available text-LLM models (id, label, loaded, file present) |
+| `POST /api/model {"model_id":"…"}` | Switch the loaded text-LLM model — stops and restarts the llama-server (~1-2s observed), also selectable from the UI's Model card |
 
 ## Notes
 
+- **Switchable LLM size** — `backend/llm_manager.py` owns the llama-server subprocess for the text LLM (`qwen3.5-0.8b-q8` / `qwen3.5-2b-q4` / `qwen3.5-4b-q4`, see `MODEL_REGISTRY`) and can stop+restart it with a different GGUF on request. Only one size is loaded at a time — VRAM headroom on a 12GB card is tight enough with embedding+TTS+STT already resident that keeping all three warm simultaneously risked OOMing something else. On startup it adopts an already-running server on the configured port (this project's traditional manual-start workflow) rather than duplicating it; the first switch afterwards takes real ownership.
 - **Barge-in architecture** — `stream_chat_interleaved` (`backend/pipeline/speech_to_speech.py`) runs STT via a background pump task instead of blocking on the current turn's LLM/TTS, so new speech is recognized while a reply is still playing; a fresh utterance cancels the in-flight turn and starts a new one. A shared `asyncio.Lock` serializes that voice-triggered cancellation against the WS-level `do_barge_in` (button, `barge_in` message, or a new `text_input`) so the two paths can't race each other's `set()`/`clear()` on the shared cancellation event, and an `on_new_voice_turn` callback lets a fresh voice utterance also supersede an in-flight `text_input` reply (not just the reverse). Every response event carries a monotonic `turn_id`; the frontend drops any event from a turn lower than the highest it has seen (or explicitly blacklisted as just-interrupted), which correctly lets the *start* of a new reply through instead of dropping it under a fixed timing window.
 - **Honest search** — No hard-coded mocks. `SearXNG official` `30` results `~1.2s` `brave`/`google cse` `all - china`; DIY minimal (`DDGS`+`lite` only `3` engines) was root cause of `8.4s` `mock` `example.com`. `wttr.in` is real weather API (`Paris` `16-22°C`). `Bing` scrape fallback when `SearXNG` `rel<0.34`.
 - **Thinking without leakage** — `Qwen-Agent` `enable_thinking:True`, `reasoning_content` filtered from both TTS and chat history (was leaking a reasoning-loop on smaller quantizations).

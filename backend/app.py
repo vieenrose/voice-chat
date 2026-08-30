@@ -26,6 +26,7 @@ from loguru import logger
 import numpy as np
 
 from pipeline.speech_to_speech import HFSpeechToSpeechPipeline
+from llm_manager import llm_manager, MODEL_REGISTRY as LLM_MODEL_REGISTRY
 
 app = FastAPI(title="Voice Chat HF S2S + SearXNG Tools", version="1.1.0")
 
@@ -114,11 +115,42 @@ async def health():
             "llm": "mock" if MOCK_MODE else (pipeline.llm.backend if pipeline and hasattr(pipeline.llm, 'model') else "loaded"),
             "tts": pipeline.tts.backend if pipeline else "not_loaded",
         },
+        "llm_manager": llm_manager.status(),
         "rss_mb": round(mem.rss / 1024/1024, 1),
         "vms_mb": round(mem.vms / 1024/1024, 1),
         "searxng": {"url": SEARXNG_URL, "ok": searxng_ok, "self_hosted": True},
         "stats": stats
     }
+
+@app.get("/api/model")
+async def get_model():
+    return llm_manager.status()
+
+@app.post("/api/model")
+async def switch_model(payload: dict):
+    """Switch the loaded text-LLM model. Stops the current llama-server and
+    starts the requested one — the caller should expect this to take several
+    seconds and the pipeline's LLM to be briefly unavailable while it swaps."""
+    model_id = payload.get("model_id") or payload.get("model")
+    if not model_id:
+        return JSONResponse({"error": "model_id required"}, status_code=400)
+    if model_id not in LLM_MODEL_REGISTRY:
+        return JSONResponse({"error": f"unknown model_id {model_id!r}", "available": list(LLM_MODEL_REGISTRY)}, status_code=400)
+    if llm_manager.switching:
+        return JSONResponse({"error": "a model switch is already in progress"}, status_code=409)
+    try:
+        result = await llm_manager.switch_to(model_id)
+    except Exception as e:
+        logger.exception(f"model switch to {model_id} failed: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+    if pipeline is not None and result.get("alias"):
+        # LingStreaming reads self.model_name fresh on every request (it's not baked
+        # into a closure at construction), so updating these two attributes in place
+        # is enough to point the existing client at the newly-loaded server — no need
+        # to reconstruct it.
+        pipeline.llm.model_name = result["alias"]
+        pipeline.llm.mock = False
+    return result
 
 @app.get("/stats")
 async def get_stats():
@@ -586,7 +618,18 @@ def main():
         from fastapi.staticfiles import StaticFiles
         app.mount("/", StaticFiles(directory=_ui, html=True), name="ui")
         logger.info(f"UI mounted from {_ui}")
+    if not args.mock:
+        # Must run before HFSpeechToSpeechPipeline() below, whose LingStreaming client
+        # does its own synchronous readiness check against this same port at construction.
+        asyncio.run(llm_manager.ensure_started())
     pipeline = HFSpeechToSpeechPipeline(stt_model=args.stt_model, llm_model=args.llm, tts_model=args.tts, device=args.device, mock=args.mock)
+    if not args.mock and llm_manager.current_alias:
+        # Keep the freshly-constructed LLM client's requested model name in sync with
+        # whichever model llm_manager actually ended up serving (it may have adopted an
+        # already-running server whose alias differs from speech_to_speech.py's hardcoded
+        # default) — see the identical note in the /api/model handler above.
+        pipeline.llm.model_name = llm_manager.current_alias
+        pipeline.llm.mock = False
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, ws_max_size=16*1024*1024)
 
