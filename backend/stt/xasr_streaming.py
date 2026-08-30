@@ -274,7 +274,7 @@ class StreamingXASR:
     async def _transcribe_buffer(self, pcm_f32: np.ndarray) -> str:
         if hasattr(self, 'whisper_model') and self.whisper_model:
             def _infer():
-                segs, _ = self.whisper_model.transcribe(pcm_f32, language="en", beam_size=1, vad_filter=False, without_timestamps=True)
+                segs, _ = self.whisper_model.transcribe(pcm_f32, language=None, beam_size=1, vad_filter=False, without_timestamps=True)  # auto-detect per utterance — zh-TW is default, but never hardcode away English entirely
                 return " ".join([s.text.strip() for s in segs])
             return (await asyncio.to_thread(_infer)).strip()
         elif hasattr(self, 'pipe') and self.pipe:
@@ -300,7 +300,7 @@ class StreamingXASR:
                 logger.warning(f"X-ASR one-shot failed {e}")
         if hasattr(self, 'whisper_model') and self.whisper_model:
             def _infer():
-                segs, _ = self.whisper_model.transcribe(pcm_f32, language="en", beam_size=1, vad_filter=False, without_timestamps=True)
+                segs, _ = self.whisper_model.transcribe(pcm_f32, language=None, beam_size=1, vad_filter=False, without_timestamps=True)  # auto-detect per utterance — zh-TW is default, but never hardcode away English entirely
                 return " ".join([s.text.strip() for s in segs])
             return (await asyncio.to_thread(_infer)).strip()
         elif hasattr(self, 'pipe') and self.pipe:

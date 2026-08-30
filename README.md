@@ -2,7 +2,7 @@
 
 **X-ASR-int8 → Qwen3.5-2B Q4 (Qwen-Agent, thinking) → Qwen3-TTS** — real models, no mocks, low latency.
 
-A full-duplex voice chat demo: speak, get interrupted (by voice *or* text, either direction), search the web, and hear the answer. Bilingual (zh/en), multi-turn, tool-aware, and available at `https://training-machine.tailf63b31.ts.net` via Tailscale Funnel.
+A full-duplex voice chat demo: speak, get interrupted (by voice *or* text, either direction), search the web, and hear the answer. **Traditional Chinese (Taiwan, zh-TW) by default** — speech input and output default to zh-TW regardless of what language the question was asked in, with English mixed in only for proper nouns/terms that don't translate well. Multi-turn, tool-aware, and available at `https://training-machine.tailf63b31.ts.net` via Tailscale Funnel.
 
 ```
 Mic 16k ──► Endpoint detect (sherpa-onnx) ──► STT (X-ASR-int8 160ms, 146M) ──► LLM (Qwen3.5-2B Q4, Qwen-Agent, thinking) ──► TTS (Qwen3-TTS Q8_0, 24k) ──► Speaker
@@ -29,7 +29,7 @@ All components are real — `mock=false` everywhere. Exhaustive `14/14` `100%` r
 
 - **Full-duplex barge-in, either direction** — speaking over an in-progress reply cancels it immediately, whether that reply came from voice or a typed message, and vice versa. STT runs continuously in the background instead of blocking on the current turn, so a new utterance is recognized *while* the assistant is still talking. Every reply is tagged with a monotonic `turn_id`; the client drops any stray audio from a turn that lost a race with its own cancellation, and a shared lock serializes the (voice-triggered, text-triggered, and explicit button/WS) cancellation paths so they can't interleave.
 - **Tool-aware** — `web_search` (SearXNG + wttr.in weather) and `get_current_datetime` (IANA tz) via native function calling
-- **Bilingual** — zh/en auto-detected, zh-TW/zh-CN/en SearXNG routing
+- **zh-TW by default, English mixed in** — LLM prompts (both harness system messages and a per-turn reinforcement hint, `llm/ling_streaming.py:LANG_HINT`) unconditionally default every reply to Traditional Chinese (Taiwan usage), regardless of the input's language — English is kept only for untranslatable terms/proper nouns. TTS segments text by script and passes the correct explicit language per segment (`chinese`/`english`) instead of a single whole-utterance `"auto"` guess, so a name or term quoted mid-sentence doesn't get the wrong pronunciation. Default voice, UI text, and quick-demo chips are all zh-TW; the frontend's display-layer OpenCC conversion uses the phrase-aware `s2twp` preset (Taiwan vocabulary, not just Traditional glyphs) as a display-only safety net.
 - **Low latency** — Svelte 5 + AudioWorklet + binary WS, whole-sentence TTS flush, 0.6s pre-roll jitter buffer
 
 Measured on RTX 3060: STT 300ms partial · LLM TTFT 100–400ms · TTS TTFB 0.4–1.2s · E2E ~1s (plain) / ~3s (search).

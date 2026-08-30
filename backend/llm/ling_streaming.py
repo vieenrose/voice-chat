@@ -85,7 +85,14 @@ TOOL_DEFS = [
     }
 ]
 
-SYSTEM_PROMPT = "You are a helpful, informative voice assistant with web search. Be conversational and natural for voice chat. For casual chat keep under 80 words; for news/weather/factual queries be more detailed (up to 150 words) and highly informative. For ANY question about current events, news, weather, real-time info, or specific regional events (e.g., '今天台湾有什么重大事件', 'latest news'), you MUST use web_search tool to get the latest information — never refuse or say you cannot provide real-time info. Every new news/headline request needs a FRESH web_search, even short follow-ups like 'BBC headlines' or 'CNN now' — never answer from stale results of an earlier query. Use search results to answer. For questions about today's date, weekday, or current time (今天/星期几/几点), you MUST call the get_current_datetime tool instead of guessing. For ANY weather/forecast question (including 明天/後天/next week) you MUST call web_search — the search engine returns the forecast for the requested day, so do NOT call get_current_datetime for weather. For date/time questions call get_current_datetime. When both are needed, call both in the same turn. Always answer using the tool RESULTS verbatim (weekday, date, temperatures) — never from memory. Always respond in the user's language (Chinese for Chinese queries, English for English queries). IMPORTANT: when the web_search tool results contain the answer (weather numbers, news headlines, dates), be highly informative: quote specifics directly with numbers, names, dates, and sources. For news, list 3-4 concrete recent headlines with source + one-sentence summary each + date if available. Never claim results lack information they contain. Interpret loose phrasing generously (e.g. 'big news' = latest major news) instead of saying no such thing exists."
+SYSTEM_PROMPT = "You are a helpful, informative voice assistant with web search. Be conversational and natural for voice chat. For casual chat keep under 80 words; for news/weather/factual queries be more detailed (up to 150 words) and highly informative. For ANY question about current events, news, weather, real-time info, or specific regional events (e.g., '今天台湾有什么重大事件', 'latest news'), you MUST use web_search tool to get the latest information — never refuse or say you cannot provide real-time info. Every new news/headline request needs a FRESH web_search, even short follow-ups like 'BBC headlines' or 'CNN now' — never answer from stale results of an earlier query. Use search results to answer. For questions about today's date, weekday, or current time (今天/星期几/几点), you MUST call the get_current_datetime tool instead of guessing. For ANY weather/forecast question (including 明天/後天/next week) you MUST call web_search — the search engine returns the forecast for the requested day, so do NOT call get_current_datetime for weather. For date/time questions call get_current_datetime. When both are needed, call both in the same turn. Always answer using the tool RESULTS verbatim (weekday, date, temperatures) — never from memory. Always respond in Traditional Chinese (Taiwan usage, 繁體中文) by default, regardless of what language the question was asked in — only keep English for proper nouns, technical terms, or vocabulary that doesn't translate well; never answer a whole sentence in Simplified Chinese or English. IMPORTANT: when the web_search tool results contain the answer (weather numbers, news headlines, dates), be highly informative: quote specifics directly with numbers, names, dates, and sources. For news, list 3-4 concrete recent headlines with source + one-sentence summary each + date if available. Never claim results lack information they contain. Interpret loose phrasing generously (e.g. 'big news' = latest major news) instead of saying no such thing exists."
+
+# zh-TW is this app's default/primary language — appended to every turn's prompt (not
+# just relied on via SYSTEM_PROMPT above) since that's the most reliable way to keep a
+# small model from drifting into English or Simplified Chinese as context grows. Applied
+# unconditionally regardless of the input's own language (a confirmed product decision,
+# not reactive): English is only ever kept for terms/names that don't translate well.
+LANG_HINT = "\n（請一律使用繁體中文（台灣用語）簡潔回答；僅專有名詞、技術術語或無法翻譯的詞彙可保留英文原文，不要整句使用簡體中文或英文作答。）"
 
 # Heuristic for fast tool trigger — bilingual (en/zh) - includes Chinese triggers for Taiwan/news
 # (heuristic removed — tool calls are model-driven/native only)
@@ -252,7 +259,7 @@ class LingStreaming:
         except Exception as e:
             logger.exception(f"Ling generate_stream failed {e}, fallback to mock")
             # Fallback mock
-            fallback = "Sorry, Ling server had an error, but I'm still here via mock."
+            fallback = "抱歉，伺服器暫時發生錯誤，我仍在線上為您服務。"
             text_so_far = ""
             for tok in fallback.split(" "):
                 await asyncio.sleep(0.02)
@@ -320,7 +327,7 @@ class LingStreaming:
         final_text = re.sub(r"<[^>]+>", " ", final_text)
         final_text = " ".join(final_text.split())
         if not final_text.strip():
-            final_text = "Sorry, I could not find a clear answer to that."
+            final_text = "抱歉，我找不到明確的答案。"
         _t0 = time.time(); _sf = ""
         for tok in final_text:
             _sf += tok
@@ -535,7 +542,7 @@ class LingStreaming:
             final_text = _strip_tool_xml(final_text)
         final_text = _clean_leakage(final_text)
         if not final_text.strip():
-            final_text = "Sorry, I could not find a clear answer to that."
+            final_text = "抱歉，我找不到明確的答案。"
         t0 = time.time(); _sf = ""
         for tok in final_text:
             _sf += tok

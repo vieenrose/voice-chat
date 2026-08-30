@@ -330,7 +330,9 @@ class HFSpeechToSpeechPipeline:
             # Use Ling multi-turn tool-aware generation (history + current prompt)
             # LingStreaming handles web_search via SearXNG and full chat template (<role>SYSTEM/HUMAN/ASSISTANT + <tool_call>)
             try:
-                llm_gen = self.llm.generate_chat_with_tools(turn_history, stt_final_text) if hasattr(self.llm, 'generate_chat_with_tools') else self.llm.generate_with_tools(stt_final_text)
+                from llm.ling_streaming import LANG_HINT
+                prompt_with_hint = stt_final_text + LANG_HINT  # history keeps the raw transcript, not the hint
+                llm_gen = self.llm.generate_chat_with_tools(turn_history, prompt_with_hint) if hasattr(self.llm, 'generate_chat_with_tools') else self.llm.generate_with_tools(prompt_with_hint)
                 async for llm_event in llm_gen:
                     if llm_event["type"] == "tool_call":
                         await emit({"type": "tool_call", "name": llm_event["name"], "arguments": llm_event.get("arguments", {}), "query": llm_event.get("query","")})

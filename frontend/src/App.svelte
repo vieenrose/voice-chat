@@ -22,7 +22,11 @@
   async function initOpenCC(){
     try{
       const OpenCC = await import('opencc-js');
-      s2tConverter = OpenCC.Converter({ from: 'cn', to: 'tw' });
+      // 'twp' (not 'tw') also substitutes Taiwan-specific vocabulary (視頻→影片, 軟件→軟體,
+      // 網絡→網路, …), not just simplified→traditional glyphs — zh-TW is this app's default
+      // language, so this display-layer conversion should read as authentic Taiwan usage,
+      // not just Traditional-glyph-flavored Mainland phrasing.
+      s2tConverter = OpenCC.Converter({ from: 'cn', to: 'twp' });
       toTraditional = (text) => {
         try { return text && /[\u4e00-\u9fff]/.test(text) ? s2tConverter(text) : text; } catch(e) { return text; }
       };
@@ -95,13 +99,13 @@
   }
   async function switchModel(){
     if(modelSwitching || !selectedModelId || selectedModelId===currentModelId) return;
-    modelSwitching = true; modelSwitchStatus = `Loading ${selectedModelId}…`;
+    modelSwitching = true; modelSwitchStatus = `載入中：${selectedModelId}…`;
     try{
       const r = await fetch(apiUrl('/api/model'), {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({model_id: selectedModelId})});
       const j = await r.json();
-      if(!r.ok){ modelSwitchStatus = `Failed: ${j.error||r.status}`; }
-      else{ currentModelId = j.model_id; modelSwitchStatus = `Loaded ${j.label} (${j.took_s ?? '?'}s)`; }
-    }catch(e){ modelSwitchStatus = `Failed: ${e}`; }
+      if(!r.ok){ modelSwitchStatus = `載入失敗：${j.error||r.status}`; }
+      else{ currentModelId = j.model_id; modelSwitchStatus = `已載入 ${j.label}（${j.took_s ?? '?'} 秒）`; }
+    }catch(e){ modelSwitchStatus = `載入失敗：${e}`; }
     modelSwitching = false;
     await fetchHealth();
     setTimeout(()=>{ if(!modelSwitching) modelSwitchStatus=''; }, 4000);
@@ -385,7 +389,7 @@
       <div class="logo">🎙️</div>
       <div style="min-width:0">
         <div class="title">Voice Chat</div>
-        <div class="subtitle">Real-time bilingual voice assistant · barge-in either direction · tool-aware</div>
+        <div class="subtitle">即時雙語語音助理．雙向插話中斷．支援工具呼叫</div>
       </div>
     </div>
     <div class="header-actions">
@@ -398,31 +402,31 @@
   <div class="grid">
     <div class="stack controls-col">
       <div class="card">
-        <h3>Realtime</h3>
+        <h3>即時語音</h3>
         <div class="controls">
           {#if !connected}
-            <button class="primary" onclick={connect} disabled={connecting}>{connecting ? 'Connecting…' : 'Connect'}</button>
+            <button class="primary" onclick={connect} disabled={connecting}>{connecting ? '連線中…' : '連線'}</button>
           {:else}
-            <button class="ghost" onclick={disconnect}>Disconnect</button>
+            <button class="ghost" onclick={disconnect}>中斷連線</button>
           {/if}
           {#if !listening}
-            <button class="primary" onclick={startMic} disabled={!connected} aria-label="Start listening on microphone">🎤 Listen</button>
+            <button class="primary" onclick={startMic} disabled={!connected} aria-label="開始使用麥克風聆聽">🎤 聆聽</button>
           {:else}
-            <button class="danger" onclick={stopMic}>Stop</button>
+            <button class="danger" onclick={stopMic}>停止</button>
           {/if}
           {#if turnActive}
-            <button class="ghost" onclick={bargeIn} aria-label="Interrupt the assistant's reply">⏹ Stop reply</button>
+            <button class="ghost" onclick={bargeIn} aria-label="中斷助理的回覆">⏹ 中斷回覆</button>
           {/if}
-          <button class="ghost" onclick={()=>{vadEnabled=!vadEnabled}} aria-pressed={vadEnabled}>{vadEnabled ? 'VAD' : 'VAD off'}</button>
+          <button class="ghost" onclick={()=>{vadEnabled=!vadEnabled}} aria-pressed={vadEnabled}>{vadEnabled ? 'VAD 開' : 'VAD 關'}</button>
         </div>
         {#if micError}
           <div style="margin:8px 0; padding:10px; background:#1a0f14; border:1px solid #3a1a1a; border-radius:8px; font-size:12px; color:#ffb3b3">{micError}</div>
         {/if}
         <canvas bind:this={canvasEl} class="wave" width="640" height="64"></canvas>
         {#if speaking}
-          <div class="status-banner status-speaking"><span class="dot" aria-hidden="true">●</span> Assistant is speaking — say something or hit Stop reply to interrupt</div>
+          <div class="status-banner status-speaking"><span class="dot" aria-hidden="true">●</span> 助理正在說話——開口說話或按下「中斷回覆」即可打斷</div>
         {:else if turnActive}
-          <div class="status-banner status-speaking"><span class="dot" aria-hidden="true">●</span> Thinking… (may include a web search) — say something or hit Stop reply to cancel</div>
+          <div class="status-banner status-speaking"><span class="dot" aria-hidden="true">●</span> 思考中…（可能包含網路搜尋）——開口說話或按下「中斷回覆」即可取消</div>
         {/if}
         <div class="lat-grid">
           <div class="lat"><b>{latency.stt_ms||0}</b><span>STT</span></div>
@@ -439,30 +443,30 @@
       </div>
 
       <div class="card">
-        <h3>Model</h3>
+        <h3>模型</h3>
         <div style="font-size:12px; line-height:1.6; opacity:0.85">
           <div><b>STT</b> {sttBackend || '—'} · <b>Embed</b> Granite-97M Q8 (CUDA, 384d) · <b>TTS</b> {ttsBackend || '—'}</div>
           <div class="subtle">Agent <b>Qwen-Agent</b> (3 tools) · SearXNG self-host + wttr.in + Bing</div>
         </div>
         <div class="model-picker">
-          <label for="llm-select" class="subtle" style="display:block; margin-bottom:4px">LLM (text)</label>
+          <label for="llm-select" class="subtle" style="display:block; margin-bottom:4px">語言模型（文字）</label>
           <div style="display:flex; gap:8px">
             <select id="llm-select" class="input" style="border-radius:8px" bind:value={selectedModelId} disabled={modelSwitching}>
               {#each llmModels as m}
-                <option value={m.id} disabled={!m.exists}>{m.label}{m.id===currentModelId ? ' (loaded)' : ''}{!m.exists ? ' — file missing' : ''}</option>
+                <option value={m.id} disabled={!m.exists}>{m.label}{m.id===currentModelId ? '（已載入）' : ''}{!m.exists ? ' — 檔案不存在' : ''}</option>
               {/each}
             </select>
-            <button class="ghost" onclick={switchModel} disabled={modelSwitching || !selectedModelId || selectedModelId===currentModelId}>{modelSwitching ? 'Loading…' : 'Load'}</button>
+            <button class="ghost" onclick={switchModel} disabled={modelSwitching || !selectedModelId || selectedModelId===currentModelId}>{modelSwitching ? '載入中…' : '載入'}</button>
           </div>
           {#if modelSwitchStatus}<div class="subtle" style="margin-top:6px">{modelSwitchStatus}</div>{/if}
-          <div class="subtle" style="margin-top:6px">Switching stops and restarts the LLM server — voice/text replies pause for a few seconds while the new model loads.</div>
+          <div class="subtle" style="margin-top:6px">切換模型會重新啟動語言模型伺服器——語音／文字回覆會暫停數秒，直到新模型載入完成。</div>
         </div>
       </div>
     </div>
 
     <div class="stack chat-col">
       <div class="card" style="display:flex; flex-direction:column; min-height:500px">
-        <h3>Conversation <span style="margin-left:auto; font-size:11px; opacity:0.5; text-transform:none; letter-spacing:0">{chatHistory.length} msgs</span> <button class="ghost" style="padding:4px 8px; font-size:11px; margin-left:8px" onclick={clearChat}>Clear</button></h3>
+        <h3>Conversation <span style="margin-left:auto; font-size:11px; opacity:0.5; text-transform:none; letter-spacing:0">{chatHistory.length} 則訊息</span> <button class="ghost" style="padding:4px 8px; font-size:11px; margin-left:8px" onclick={clearChat}>清除</button></h3>
         <div class="chat" id="chat">
           {#each chatHistory as m}
             {#if m.role==='assistant'}
@@ -471,19 +475,19 @@
               <div class="bubble {m.role} {m.streaming ? 'streaming' : ''}">{m.text}{#if m.streaming}<span style="opacity:0.6"> ▌</span>{/if}</div>
             {/if}
           {:else}
-            <div class="bubble system">No messages — hit <b>Listen</b> or type below.</div>
+            <div class="bubble system">尚無訊息——請按下「聆聽」或於下方輸入文字。</div>
           {/each}
         </div>
         {#if toolStatus}<div style="margin-top:8px; padding:8px 10px; background:#0e1a14; border:1px solid #1e3326; border-radius:8px; font-size:12px; color:#8fd9b0; display:flex; gap:8px; align-items:center"><span style="animation:pulse 1.2s infinite">●</span> {toolStatus}</div>{/if}
         <div class="row">
-          <input class="input" placeholder="Type a message…" bind:value={textInput} onkeydown={(e)=>{ if(e.key==='Enter' && textInput.trim()){ sendText(textInput.trim()); textInput=''; }}} />
-          <button class="primary" onclick={()=>{ if(textInput.trim()){ sendText(textInput.trim()); textInput=''; }}}>Send</button>
+          <input class="input" placeholder="輸入訊息…" bind:value={textInput} onkeydown={(e)=>{ if(e.key==='Enter' && textInput.trim()){ sendText(textInput.trim()); textInput=''; }}} />
+          <button class="primary" onclick={()=>{ if(textInput.trim()){ sendText(textInput.trim()); textInput=''; }}}>送出</button>
         </div>
         <div class="tool-bar">
-          <button class="tool-chip" onclick={()=>testSearch('What is the weather in Paris today?')}>Paris</button>
-          <button class="tool-chip" onclick={()=>testSearch('Search latest AI news')}>News</button>
-          <button class="tool-chip" onclick={()=>testSearch('Who is the president of France?')}>Who is…</button>
-          <button class="tool-chip" onclick={()=>testSearch('今天是星期幾？')}>今天</button>
+          <button class="tool-chip" onclick={()=>testSearch('台北今天天氣如何？')}>台北天氣</button>
+          <button class="tool-chip" onclick={()=>testSearch('搜尋最新的科技新聞')}>科技新聞</button>
+          <button class="tool-chip" onclick={()=>testSearch('法國現在的總統是誰？')}>法國總統</button>
+          <button class="tool-chip" onclick={()=>testSearch('今天是星期幾？')}>今天星期幾</button>
         </div>
         {#if lastSearchResults.length}
           <div style="margin-top:10px; padding:8px; background:rgba(0,0,0,0.2); border-radius:8px; max-height:140px; overflow:auto; border:1px solid #1e1e28">
@@ -500,6 +504,6 @@
   </div>
 
   <div style="text-align:center; font-size:11px; opacity:0.4; margin-top:16px">
-    Full-duplex speech-to-speech, self-hosted, no cloud APIs · <a href="https://github.com/vieenrose/voice-chat" style="color:inherit">GitHub</a>
+    全雙工語音對話．自架部署．無需雲端 API · <a href="https://github.com/vieenrose/voice-chat" style="color:inherit">GitHub</a>
   </div>
 </div>

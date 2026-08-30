@@ -191,7 +191,7 @@ class _Agent:
         self.model = GraniteModel(model_id=model_id, api_base=API_BASE, api_key="none",
                                   temperature=1.0, top_p=0.95,
                                   chat_template_kwargs={"enable_thinking": False})
-        self.agent = ToolCallingAgent(tools=[WebSearchTool(), GetWeatherTool(), DateTimeTool()], model=self.model, max_steps=MAX_STEPS, verbosity_level=0, add_base_tools=False, instructions="CRITICAL: For weather use get_weather(location, date) — never web_search. For general search use web_search. For date/time use get_current_datetime. Always answer in the user's language. When user says 'Search ...' call web_search. For greetings respond directly.")
+        self.agent = ToolCallingAgent(tools=[WebSearchTool(), GetWeatherTool(), DateTimeTool()], model=self.model, max_steps=MAX_STEPS, verbosity_level=0, add_base_tools=False, instructions="CRITICAL: For weather use get_weather(location, date) — never web_search. For general search use web_search. For date/time use get_current_datetime. Always default to Traditional Chinese (Taiwan usage, 繁體中文) regardless of what language the question was asked in — only keep English for proper nouns, technical terms, or vocabulary that doesn't translate well; never answer a whole sentence in Simplified Chinese or English. When user says 'Search ...' call web_search. For greetings respond directly.")
 
     def run(self, task: str) -> str:
         # Fast path for plain greetings - check only the current question, not the full history-wrapped task
@@ -200,11 +200,12 @@ class _Agent:
         _cur = m.group(1).strip() if m else task.strip()
         _tl = _cur.lower()
         # Greeting fast path: handle zh-TW fillers like 餵/喂/欸/嘿/哈囉 + 你好, and en hi/hello
-        if len(_tl) < 30 and re.search(r'(hi|hello|hey|hola|bonjour|你好|您好|哈囉|嗨|餵|喂|欸|嘿)', _tl, re.I) and not re.search(r'(weather|news|search|find|what is|who is|how|can you|please|today|tomorrow|星期|几号|天气|新聞|頭條|天氣|分機|電話)', _tl, re.I):
+        if len(_tl) < 30 and re.search(r'(hi|hello|hey|hola|bonjour|你好|您好|哈囉|嗨|餵|喂|欸|嘿)', _tl, re.I) and not re.search(r'(weather|news|search|find|what is|who is|how|can you|please|today|tomorrow|星期|几号|幾號|几点|幾點|天气|天氣|新聞|頭條|分機|電話)', _tl, re.I):
             # Ensure it's primarily a greeting, not a full sentence with greeting + question
             # If query is short (<15) and contains greeting, treat as greeting
             if len(_tl) < 15 or re.match(r'^\s*[\w\s]*(你好|您好|哈囉|嗨|餵|喂|hi|hello|hey)\b', _tl, re.I):
-                return "Hello! How can I help you today?" if not re.search(r'[\u4e00-\u9fff]', _cur) else "你好！有什麼可以幫你的？"
+                # zh-TW default: greet in Traditional Chinese even for an English "hello".
+                return "你好！有什麼可以幫你的？"
         with agent_call_lock:
             out = self.agent.run(task, reset=True)
         return out if isinstance(out, str) else (out.final_answer if hasattr(out, "final_answer") else str(out))
@@ -250,6 +251,6 @@ async def run_agent_task(task: str, event_q: asyncio.Queue | None = None) -> str
             # identical note in qwen_harness.py) — log the real detail, return a clean
             # generic fallback instead of the raw exception text.
             logger.exception(f"agent.run failed: {e}")
-            return "Sorry, I ran into a problem answering that. Please try again."
+            return "抱歉，這個問題我暫時無法回答，請再試一次。"
 
     return await asyncio.to_thread(_worker)

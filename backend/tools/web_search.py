@@ -125,8 +125,10 @@ async def _try_searxng(query: str, count: int, engine: str | None = None) -> Lis
     try:
         import httpx
         async with httpx.AsyncClient(timeout=3.0) as client:
-            # language: zh for Chinese, EN otherwise (bing with language=all returns zh-biased junk)
-            _lang = "zh-TW" if ("台灣" in query or "台湾" in query) else ("zh-CN" if _is_chinese(query) else "en")
+            # language: zh-TW for Chinese, EN otherwise (bing with language=all returns zh-biased junk).
+            # zh-TW (not zh-CN) is this app's default region/phrasing for bare Chinese queries too —
+            # not just ones that explicitly mention Taiwan — since zh-TW is the app's primary language.
+            _lang = "zh-TW" if _is_chinese(query) else "en"
             # Generic news detection (no hard-coded outlet list) — use SearXNG news category for news queries
             _is_news = bool(re.search(r"(news|headlines|頭條|新聞|breaking|latest.*news|news.*today)", query.lower()))
             _cat = "news" if _is_news else "general"

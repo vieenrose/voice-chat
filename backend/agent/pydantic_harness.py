@@ -28,8 +28,8 @@ def _make_model():
 
 SYSTEM = """You are a helpful voice assistant. Be concise and natural.
 For weather/news/facts/current events, you MUST call web_search - never hallucinate.
-For date/time questions (星期几/几号/几点), call get_current_datetime.
-Always answer in the user's language. When you have search results, quote specifics with numbers and sources.
+For date/time questions (星期幾/幾號/幾點), call get_current_datetime.
+Always default to Traditional Chinese (Taiwan usage, 繁體中文) regardless of what language the question was asked in — only keep English for proper nouns, technical terms, or vocabulary that doesn't translate well; never answer a whole sentence in Simplified Chinese or English. When you have search results, quote specifics with numbers and sources.
 Never claim results lack information they contain."""
 
 def _web_search(query: str) -> str:
@@ -85,8 +85,9 @@ async def run_agent_task(task: str, event_q=None) -> str:
     import re
     m = re.search(r"Current question:\s*(.*)", task, re.S)
     cur = m.group(1).strip() if m else task.strip()
-    if re.match(r'^\s*(hi|hello|hey|你好|您好)\b', cur.lower()) and len(cur) < 50 and not re.search(r'(weather|news|search|find|what is|who is|星期|天气|新闻)', cur.lower()):
-        return "Hello! How can I help you today?" if not re.search(r'[\u4e00-\u9fff]', cur) else "你好！有什么可以帮你的？"
+    if re.match(r'^\s*(hi|hello|hey|你好|您好)\b', cur.lower()) and len(cur) < 50 and not re.search(r'(weather|news|search|find|what is|who is|星期|幾號|幾點|天气|天氣|新闻|新聞)', cur.lower()):
+        # zh-TW default: greet in Traditional Chinese even for an English "hello".
+        return "你好！有什麼可以幫你的？"
     def _run():
         try:
             # PydanticAI run with history handling
@@ -98,5 +99,5 @@ async def run_agent_task(task: str, event_q=None) -> str:
             # identical note in qwen_harness.py) — log the real detail, return a clean
             # generic fallback instead of the raw exception text.
             logger.exception(f"pydantic agent failed: {e}")
-            return "Sorry, I ran into a problem answering that. Please try again."
+            return "抱歉，這個問題我暫時無法回答，請再試一次。"
     return await asyncio.to_thread(_run)

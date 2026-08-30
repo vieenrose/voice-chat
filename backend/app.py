@@ -382,10 +382,9 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="default
                         history = pipeline._get_history(session_id)
                         # Ensure history is trimmed and has system
                         history = pipeline._trim_history(history)
-                        # Enforce reply language at the prompt level (Ling-tiny ignores the system hint)
-                        import re as _re
-                        _zh = bool(_re.search(r'[\u4e00-\u9fff]', txt))
-                        _lang_hint = "\n（请用简体中文简洁回答，不要使用英文。）" if _zh else "\nAnswer briefly in English."
+                        # See llm/ling_streaming.py:LANG_HINT for why this is appended every turn
+                        # unconditionally (zh-TW default, English only for untranslatable terms).
+                        from llm.ling_streaming import LANG_HINT as _lang_hint
                         try:
                             async for ev in pipeline.llm.generate_chat_with_tools(history, txt + _lang_hint) if hasattr(pipeline.llm, 'generate_chat_with_tools') else pipeline.llm.generate_with_tools(txt):
                                 # Check for barge-in cancellation

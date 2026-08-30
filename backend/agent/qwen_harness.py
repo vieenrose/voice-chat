@@ -147,7 +147,7 @@ def _make_agent():
     return Assistant(
         llm=llm_cfg,
         function_list=['web_search', 'get_weather', 'get_current_datetime'],
-        system_message="You are a helpful voice assistant. For weather use get_weather(location, date) — 1 call max. For general search use web_search — 1 call max with 3-8 words, then answer. For date/time use get_current_datetime — 1 call max. Never do more than 2 tool calls per turn. Always answer in the user's language."
+        system_message="You are a helpful voice assistant. For weather use get_weather(location, date) — 1 call max. For general search use web_search — 1 call max with 3-8 words, then answer. For date/time use get_current_datetime — 1 call max. Never do more than 2 tool calls per turn. Always default to Traditional Chinese (Taiwan usage, 繁體中文) regardless of what language the question was asked in — only keep English for proper nouns, technical terms, or vocabulary that doesn't translate well; never answer a whole sentence in Simplified Chinese or English."
     )
 
 _agent = None
@@ -177,9 +177,11 @@ async def run_agent_task(task: str, event_q=None) -> str:
             m = re.search(r"Current question:\s*(.*)", task, re.S)
             _cur = m.group(1).strip() if m else task.strip()
             _tl = _cur.lower()
-            if len(_tl) < 30 and re.search(r'(hi|hello|hey|hola|bonjour|你好|您好|哈囉|嗨|餵|喂|欸|嘿)', _tl, re.I) and not re.search(r'(weather|news|search|find|what is|who is|how|can you|please|today|tomorrow|星期|几号|天气|新聞|頭條|天氣|分機|電話)', _tl, re.I):
+            if len(_tl) < 30 and re.search(r'(hi|hello|hey|hola|bonjour|你好|您好|哈囉|嗨|餵|喂|欸|嘿)', _tl, re.I) and not re.search(r'(weather|news|search|find|what is|who is|how|can you|please|today|tomorrow|星期|几号|幾號|几点|幾點|天气|天氣|新聞|頭條|分機|電話)', _tl, re.I):
                 if len(_tl) < 15 or re.match(r'^\s*[\w\s]*(你好|您好|哈囉|嗨|餵|喂|hi|hello|hey)\b', _tl, re.I):
-                    return "你好！有什麼可以幫你的？" if re.search(r'[\u4e00-\u9fff]', _cur) else "Hello! How can I help you today?"
+                    # zh-TW default: greet in Traditional Chinese even for an English "hello"
+                    # — matches this app's confirmed default-language behavior (LANG_HINT).
+                    return "你好！有什麼可以幫你的？"
             messages = [{'role': 'user', 'content': task}]
             all_resps = []
             last_resp = None
@@ -214,7 +216,7 @@ async def run_agent_task(task: str, event_q=None) -> str:
                         c = m['content']
                         if isinstance(c, str) and c.strip() and len(c.strip()) > 2 and not c.strip().startswith("["):
                             return c
-            return "Sorry, I could not find an answer."
+            return "抱歉，我找不到相關的答案。"
         except Exception as e:
             # This return value is spoken via TTS (generate_chat_with_tools tokenizes it
             # char-by-char with no filtering for an "error"-looking string) — a raw
@@ -222,5 +224,5 @@ async def run_agent_task(task: str, event_q=None) -> str:
             # killing the server mid-request) would get read aloud verbatim. Log the real
             # detail server-side; return a clean, generic fallback for the user to hear.
             logger.exception(f"qwen agent failed: {e}")
-            return "Sorry, I ran into a problem answering that. Please try again."
+            return "抱歉，這個問題我暫時無法回答，請再試一次。"
     return await asyncio.to_thread(_run)

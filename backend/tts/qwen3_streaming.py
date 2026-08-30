@@ -54,9 +54,9 @@ def _segment_by_language(text: str) -> list[tuple[str, str]]:
     costs one extra small engine call, which is a fine trade for correct pronunciation.
     """
     if not text.strip():
-        return [("english", text)]
+        return [("chinese", text)]
     runs: list[list[str]] = []  # [lang, chars] pairs
-    current_lang = "english"
+    current_lang = "chinese"  # zh-TW is this app's default/primary language (see LANG_HINT)
     for ch in text:
         if _CJK_RE.match(ch):
             lang = "chinese"
@@ -95,7 +95,7 @@ class StreamingPrimeTTS:
         self.backend = "qwen3-tts-0.6b"
         self.runtime = None
         self.sample_rate = SAMPLE_RATE
-        self.speaker = "Aiden"
+        self.speaker = "vivian"  # kept in sync with self._vv below via set_voice(); see VOICE_PRESETS
         # --- load GGML model (0.6B CustomVoice Q8_0, 924M -> STABLE + 9 built-in speakers; 1.7B cstr Q8_0 2.04G has arch mismatch qwen3tts vs qwen3-tts, needs reconvert) ---
         # TTS_MODEL_DIR (set by Dockerfile/docker-compose to /models/tts) overrides the
         # bare-metal dev default of /tmp/qwen3_tts — without this, the Docker image never
@@ -128,13 +128,18 @@ class StreamingPrimeTTS:
         # --- voice presets: CustomVoice built-in speakers (stable; clone refs are Base-only & unstable here) ---
         # speakers: serena, vivian, uncle_fu, ryan, aiden, ono_anna, sohee, eric, dylan
         self.VOICE_PRESETS = {
+            "台灣腔": {"type": "speaker", "name": "vivian"},
+            "中文女聲": {"type": "speaker", "name": "vivian"},
+            "中文男聲": {"type": "speaker", "name": "uncle_fu"},
             "Aiden": {"type": "speaker", "name": "Aiden"},
-            "中文女声": {"type": "speaker", "name": "vivian"},
-            "中文男声": {"type": "speaker", "name": "uncle_fu"},
         }
-        self.VOICE_PRESETS["台湾腔"] = {"type": "speaker", "name": "vivian"}
         self.voice_refs: dict[str, dict] = {}
-        self._vv = "Aiden"
+        # zh-TW is this app's default/primary language (see LANG_HINT) — default to the
+        # Chinese-labeled preset, not the English-named "Aiden", so the very first thing
+        # a user hears (before they've said/typed anything) matches that. set_voice() (not
+        # a direct assignment) keeps self.speaker in sync — a prior version set self._vv
+        # directly here while self.speaker stayed stuck at its earlier hardcoded default.
+        self.set_voice("台灣腔")
     @property
     def voice(self) -> str:
         return self._vv
@@ -169,7 +174,7 @@ class StreamingPrimeTTS:
     async def synthesize(self, text: str, reference_audio: str = None) -> np.ndarray:
         preset = self.VOICE_PRESETS[self._vv]
         try:
-            segments = [(lang, seg) for lang, seg in _segment_by_language(text) if seg.strip()] or [("english", text)]
+            segments = [(lang, seg) for lang, seg in _segment_by_language(text) if seg.strip()] or [("chinese", text)]
             pcm_parts = []
             if preset.get("type") == "clone":
                 # 台湾腔 via reference-audio cloning (same as MOSS voice_clone with zh_4.wav)
