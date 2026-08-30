@@ -287,10 +287,13 @@ class HFOfficialPipeline:
         if len(h) <= 1+max_turns*2: return h
         return [h[0]] + h[-(max_turns*2):]
 
-    async def stream_chat_interleaved(self, pcm_queue, stop_event, session_id="default", barge_in_event=None):
+    async def stream_chat_interleaved(self, pcm_queue, stop_event, session_id="default", barge_in_event=None, barge_in_lock=None, on_new_voice_turn=None):
         # NOTE: experimental/opt-in pipeline (HF_OFFICIAL flag, off by default) — accepts
-        # barge_in_event for interface parity with speech_to_speech.py's default pipeline
-        # but does not yet implement cancellation on it.
+        # barge_in_event/barge_in_lock/on_new_voice_turn for interface parity with
+        # speech_to_speech.py's default pipeline (app.py's sender_loop always passes all
+        # three) but does not yet implement cancellation on any of them. Without accepting
+        # them here, enabling HF_OFFICIAL would TypeError on the very first WS message
+        # instead of merely lacking barge-in support.
         # Reuse same logic as before but with HF components
         import re, time
         SENT_END = re.compile(r'[.!?。！？\n]')

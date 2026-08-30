@@ -178,7 +178,17 @@ class DateTimeTool(Tool):
 
 class _Agent:
     def __init__(self):
-        self.model = GraniteModel(model_id=MODEL_ID, api_base=API_BASE, api_key="none",
+        # Prefer the live alias llm_manager actually has loaded over the MODEL_ID
+        # constant frozen at import time, so a rebuilt agent (see reset_agent())
+        # after a POST /api/model switch points at the model that's really running.
+        model_id = MODEL_ID
+        try:
+            from llm_manager import llm_manager as _llm_mgr
+            if _llm_mgr.current_alias:
+                model_id = _llm_mgr.current_alias
+        except Exception:
+            pass
+        self.model = GraniteModel(model_id=model_id, api_base=API_BASE, api_key="none",
                                   temperature=1.0, top_p=0.95,
                                   chat_template_kwargs={"enable_thinking": False})
         self.agent = ToolCallingAgent(tools=[WebSearchTool(), GetWeatherTool(), DateTimeTool()], model=self.model, max_steps=MAX_STEPS, verbosity_level=0, add_base_tools=False, instructions="CRITICAL: For weather use get_weather(location, date) — never web_search. For general search use web_search. For date/time use get_current_datetime. Always answer in the user's language. When user says 'Search ...' call web_search. For greetings respond directly.")
@@ -208,6 +218,13 @@ def _get_agent():
     if _AGENT is None:
         _AGENT = _Agent()
     return _AGENT
+
+def reset_agent():
+    """Drop the cached _Agent so the next call rebuilds it against whichever
+    model llm_manager.switch_to() just loaded — see the identical note in
+    agent/qwen_harness.py. Called from app.py's POST /api/model handler."""
+    global _AGENT
+    _AGENT = None
 
 
 def agent_alive() -> bool:

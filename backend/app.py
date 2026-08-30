@@ -150,6 +150,17 @@ async def switch_model(payload: dict):
         # to reconstruct it.
         pipeline.llm.model_name = result["alias"]
         pipeline.llm.mock = False
+    # The tool-calling agent harnesses each cache a singleton Assistant/Agent with the
+    # model alias baked in at construction time (unlike LingStreaming above) — without
+    # this, any turn that triggers a tool call would keep talking to llama-server using
+    # the model alias from before the switch. Best-effort across all three fallback
+    # harnesses since only one is actually in use at a time.
+    for _mod_name in ("agent.qwen_harness", "agent.harness", "agent.pydantic_harness"):
+        try:
+            import importlib
+            importlib.import_module(_mod_name).reset_agent()
+        except Exception:
+            pass
     return result
 
 @app.get("/stats")
@@ -236,6 +247,14 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="default
     # only thing catching downstream.
     barge_in_lock = asyncio.Lock()
 
+    def _log_unexpected_cancel_results(results):
+        # asyncio.gather(..., return_exceptions=True) hands back the exception object
+        # instead of raising — without inspecting it, a genuine bug in a cancelled task
+        # (as opposed to the expected CancelledError) would vanish with no trace.
+        for r in results:
+            if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError):
+                logger.warning(f"barge_in: cancelled task raised {r!r} instead of being cleanly cancelled")
+
     async def do_barge_in(reason: str):
         """Cancel whatever is currently generating/speaking for this session — the
         text_input path (active_tts_tasks) and/or the live voice-turn task — and wait
@@ -254,7 +273,7 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="default
             for task in tasks:
                 task.cancel()
             active_tts_tasks.clear()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            _log_unexpected_cancel_results(await asyncio.gather(*tasks, return_exceptions=True))
             pipeline._voice_response_tasks.pop(session_id, None)
             barge_in_event.clear()
         try:
@@ -278,7 +297,7 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="default
             for task in tasks:
                 task.cancel()
             active_tts_tasks.clear()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            _log_unexpected_cancel_results(await asyncio.gather(*tasks, return_exceptions=True))
             barge_in_event.clear()
 
     async def sender_loop():
@@ -429,7 +448,7 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="default
                                             logger.info("direct_tts barge-in: aborting TTS streaming mid-sentence")
                                             break
                                         # Skip silence chunks
-                                        if len(pcm_chunk) == int(pipeline.tts.sample_rate*0.3) and int(np.max(np.abs(pcm_chunk))) == 0:
+                                        if len(pcm_chunk) == 0 or int(np.max(np.abs(pcm_chunk))) == 0:
                                             continue
                                         if not sent_tts_start:
                                             await websocket.send_text(json.dumps({"type":"tts_start","sampleRate":pipeline.tts.sample_rate,"turn_id":my_turn_id}))
@@ -451,7 +470,7 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="default
                                         pass
                                     else:
                                         async for pcm_chunk in pipeline.tts.synthesize_streaming(_rem):
-                                            if len(pcm_chunk) == int(pipeline.tts.sample_rate*0.3) and int(np.max(np.abs(pcm_chunk))) == 0:
+                                            if len(pcm_chunk) == 0 or int(np.max(np.abs(pcm_chunk))) == 0:
                                                 continue
                                             if not sent_tts_start:
                                                 await websocket.send_text(json.dumps({"type":"tts_start","sampleRate":pipeline.tts.sample_rate,"turn_id":my_turn_id}))

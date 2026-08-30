@@ -68,6 +68,15 @@ def _get_agent():
         )
     return _agent
 
+def reset_agent():
+    """Interface parity with agent/qwen_harness.py and agent/harness.py's
+    reset_agent() (called best-effort by app.py's POST /api/model handler on
+    every switch) — a no-op beyond dropping the cache, since this harness
+    targets a fixed, separate model (MODEL_ID above) unrelated to llm_manager's
+    Qwen3.5 registry."""
+    global _agent
+    _agent = None
+
 async def run_agent_task(task: str, event_q=None) -> str:
     loop = _asyncio.get_running_loop()
     set_emit_target(loop, event_q)

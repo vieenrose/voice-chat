@@ -308,7 +308,14 @@ class HFSpeechToSpeechPipeline:
                 nonlocal first_tts_t, tts_ttfb, first_chunk_of_turn
                 t0 = time.time()
                 async for pcm_chunk in self.tts.synthesize_streaming(text_to_synth):
-                    if barge_in_event.is_set() or len(pcm_chunk) == 0:
+                    # Silence-placeholder check generalized to "all-zero" rather than the
+                    # old fixed-length match (`len==int(sr*0.3)`) inherited from a previous
+                    # TTS backend (MOSS, at a different sample rate) — the current Qwen3-TTS
+                    # backend's own exception fallback is a different fixed length (0.4s),
+                    # so an exact-length check would silently miss it too; checking peak
+                    # amplitude instead of an incidental length coincidence catches any
+                    # backend's zero-fill fallback regardless of its exact duration.
+                    if barge_in_event.is_set() or len(pcm_chunk) == 0 or int(np.max(np.abs(pcm_chunk))) == 0:
                         continue
                     if first_chunk_of_turn:
                         await emit({"type": "tts_start", "sampleRate": self.tts.sample_rate})
@@ -405,8 +412,15 @@ class HFSpeechToSpeechPipeline:
                 task.cancel()
                 try:
                     await task
-                except (asyncio.CancelledError, Exception):
+                except asyncio.CancelledError:
                     pass
+                except Exception as e:
+                    # Not the expected cancellation outcome — e.g. the task's own
+                    # connection to llama-server/TTS failed independently at the same
+                    # moment (a model switch killing the old server mid-generation is
+                    # one real way this happens). Swallowing it silently here would
+                    # make a genuine bug indistinguishable from a normal barge-in.
+                    logger.warning(f"cancel_current_turn: task raised {e!r} instead of being cleanly cancelled")
                 self._voice_response_tasks.pop(session_id, None)
                 barge_in_event.clear()
 
@@ -429,10 +443,14 @@ class HFSpeechToSpeechPipeline:
                 (ev,) = rest  # kind == "stt"
                 yield ev
                 if response_task is not None and not response_task.done() and (
-                    (ev["type"] == "stt_partial" and ev.get("text", "").strip()) or ev["type"] == "stt_final"
+                    ev["type"] in ("stt_partial", "stt_final") and ev.get("text", "").strip()
                 ):
                     # User is talking again (partial) or finished a new utterance (final)
                     # while the previous reply is still playing — that supersedes it.
+                    # Must check non-empty text for stt_final too: not every STT backend
+                    # guards this before emitting (e.g. the whisper-fallback path's flush
+                    # handler yields stt_final unconditionally), and an empty "utterance"
+                    # is not real new speech — it shouldn't cut off an in-flight reply.
                     await cancel_current_turn(response_task)
                     response_task = None
                     yield {"type": "barge_in", "reason": "voice", "turn_id": current_turn_id}
@@ -460,8 +478,10 @@ class HFSpeechToSpeechPipeline:
                     continue
                 try:
                     await t
-                except (asyncio.CancelledError, Exception):
+                except asyncio.CancelledError:
                     pass
+                except Exception as e:
+                    logger.debug(f"stream_chat_interleaved teardown: task raised {e!r}")
             self._voice_response_tasks.pop(session_id, None)
 
     # HF pipeline alias

@@ -120,7 +120,17 @@ class QwenDateTime(BaseTool):
 def _make_agent():
     import os
     _base = os.getenv("LLM_API_BASE", "http://127.0.0.1:11435/v1")
+    # Prefer the live alias llm_manager actually has loaded (kept in sync across
+    # POST /api/model switches) over a static env var, so a freshly-reset agent
+    # (see reset_agent() below) picks up whichever model is currently running
+    # instead of whatever was true at process startup.
     _model = os.getenv("LLM_MODEL_ID", "qwen3.5-2b")
+    try:
+        from llm_manager import llm_manager as _llm_mgr
+        if _llm_mgr.current_alias:
+            _model = _llm_mgr.current_alias
+    except Exception:
+        pass
     llm_cfg = {
         'model': _model,
         'model_server': _base,
@@ -146,6 +156,15 @@ def _get_agent():
     if _agent is None:
         _agent = _make_agent()
     return _agent
+
+def reset_agent():
+    """Drop the cached Assistant so the next call rebuilds it — needed after
+    llm_manager.switch_to() changes which model llama-server serves, since
+    _make_agent() bakes the model alias in at construction time and _agent is
+    otherwise a permanent singleton for the process lifetime. Called from
+    app.py's POST /api/model handler."""
+    global _agent
+    _agent = None
 
 async def run_agent_task(task: str, event_q=None) -> str:
     loop = _asyncio.get_running_loop()

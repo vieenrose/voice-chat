@@ -50,7 +50,12 @@ MODEL_REGISTRY: dict[str, dict] = {
         "alias": "qwen3.5-4b",
     },
 }
-DEFAULT_MODEL_ID = os.getenv("LLM_MODEL_ID", "qwen3.5-2b-q4")
+# NOT "LLM_MODEL_ID" — the agent harnesses (backend/agent/{qwen_harness,harness,
+# pydantic_harness}.py) already read that name expecting a raw llama-server alias
+# (e.g. "qwen3.5-2b"), whereas this expects a MODEL_REGISTRY key (e.g. "qwen3.5-2b-q4");
+# reusing the same name would silently send the wrong "model" field to llama-server for
+# every tool-calling turn whenever this env var is set to pick a non-default boot model.
+DEFAULT_MODEL_ID = os.getenv("LLM_DEFAULT_MODEL_ID", "qwen3.5-2b-q4")
 
 
 def _alias_to_model_id(alias: str) -> Optional[str]:

@@ -32,6 +32,12 @@
   let connecting = $state(false);
   let listening = $state(false);
   let speaking = $state(false);
+  // True from the moment a turn starts (typed message sent, or a voice utterance
+  // finalized) until it truly ends (tts_end/barge_in) — covers the LLM-generation and
+  // tool-call phase too, unlike `speaking` (which only turns true once TTS audio
+  // actually starts). Gates the interrupt button so a reply stuck in a slow tool call,
+  // before any audio has played, can still be cancelled.
+  let turnActive = $state(false);
   let useWorklet = $state(true);
   let vadEnabled = $state(true);
   let sttPartial = $state('');
@@ -155,7 +161,7 @@
   function handleServerMessage(msg){
     switch(msg.type){
       case 'stt_partial': sttPartial = toTraditional(msg.text); break;
-      case 'stt_final': sttFinal = toTraditional(msg.text); sttPartial = ''; chatHistory = [...chatHistory, {role:'user', text: toTraditional(msg.text)}]; llmStreaming = ''; ttsText = ''; toolStatus = ''; break;
+      case 'stt_final': sttFinal = toTraditional(msg.text); sttPartial = ''; chatHistory = [...chatHistory, {role:'user', text: toTraditional(msg.text)}]; llmStreaming = ''; ttsText = ''; toolStatus = ''; if(msg.text && msg.text.trim()) turnActive = true; break;
       case 'llm_token': if(isStaleTurn(msg.turn_id)) break; llmStreaming = toTraditional(msg.text_so_far); break;
       case 'tool_call': {
           if(isStaleTurn(msg.turn_id)) break;
@@ -170,7 +176,7 @@
           let preview = (msg.formatted||'').slice(0,200).replace(/\n/g,' '); chatHistory = [...chatHistory, {role:'tool', text: `✓ ${src} · ${latency}ms — ${preview}`}]; } break;
       case 'tts_chunk': if(isStaleTurn(msg.turn_id)) break; ttsText = toTraditional(msg.text); if(msg.pcm){ try{ const pcm = base64ToInt16(msg.pcm); queueAudio(pcm, msg.sampleRate || 16000); }catch(e){ audioError = String(e).slice(0,120); } } updateAssistantStreaming(); break;
       case 'tts_start': if(isStaleTurn(msg.turn_id)) break; preRollStarted = false; preRollQueue.length = 0; speaking = true; break;
-      case 'tts_end': if(isStaleTurn(msg.turn_id)) break; flushPreRoll(); speaking = false; finalizeAssistant(); toolStatus = ''; break;
+      case 'tts_end': if(isStaleTurn(msg.turn_id)) break; flushPreRoll(); speaking = false; turnActive = false; finalizeAssistant(); toolStatus = ''; break;
       case 'latency': if(isStaleTurn(msg.turn_id)) break; latency = msg; break;
       case 'barge_in': killedTurnIds.add(msg.turn_id ?? activeTurnId); stopPlayback(); break;
     }
@@ -220,7 +226,7 @@
   }
   function stopMic(){ listening=false; if(animId) cancelAnimationFrame(animId); if(workletNode){ try{workletNode.disconnect();}catch(e){} workletNode=null; } if(mediaStream){ mediaStream.getTracks().forEach(t=>t.stop()); mediaStream=null; } if(audioCtx){ try{audioCtx.close();}catch(e){} audioCtx=null; } audioLevel=0; if(ws && ws.readyState===1) ws.send(JSON.stringify({type:'stop'})); }
   function sendPCM(pcm16){ if(!ws || ws.readyState!==1) return; const header = new Uint8Array(1); header[0]=0x01; const out = new Uint8Array(1 + pcm16.byteLength); out.set(header,0); out.set(new Uint8Array(pcm16.buffer),1); try{ ws.send(out); }catch(e){ const b64 = btoa(String.fromCharCode(...new Uint8Array(pcm16.buffer))); ws.send(JSON.stringify({type:'audio_chunk', pcm:b64, sampleRate:16000})); } }
-  function sendText(text){ if(!ws || ws.readyState!==1){ connect(); setTimeout(()=>sendText(text),500); return; } if(speaking) bargeIn(); ws.send(JSON.stringify({type:'text_input', text})); chatHistory=[...chatHistory, {role:'user', text}]; llmStreaming=''; }
+  function sendText(text){ if(!ws || ws.readyState!==1){ connect(); setTimeout(()=>sendText(text),500); return; } if(turnActive) bargeIn(); turnActive=true; ws.send(JSON.stringify({type:'text_input', text})); chatHistory=[...chatHistory, {role:'user', text}]; llmStreaming=''; }
   let activeSources = [];
   let bargeInLock = false;
   // Stop whatever audio is currently playing/queued locally. Called both when *we*
@@ -235,7 +241,7 @@
     // Clear pre-roll queue (0.6s buffered)
     for(const c of [...preRollQueue]){ try{ c.src.stop(); }catch(e){} try{ c.src.disconnect(); }catch(e){} }
     preRollQueue.length=0; preRollStarted=false;
-    jitterQueue=[]; nextPlayTime=0; speaking=false;
+    jitterQueue=[]; nextPlayTime=0; speaking=false; turnActive=false;
     if(playCtx){ try{ playCtx.suspend(); }catch(e){} try{ playCtx.close(); }catch(e){} playCtx=null; }
     // Freeze whatever text had already streamed instead of leaving its bubble stuck
     // showing a "▌" cursor forever — generation genuinely stopped here, it's not
@@ -246,6 +252,10 @@
     }
     // Clear any queued TTS chunks and LLM streaming
     ttsText=''; llmStreaming='';
+    // Interrupting mid-tool-call (now reachable since "Stop reply" shows during that
+    // phase too, not just once audio starts) would otherwise leave this pulsing
+    // indicator on screen forever, since only stt_final/tts_end used to clear it.
+    toolStatus='';
     // Force speaking false even if onended fires late
     setTimeout(()=>{ speaking=false; }, 50);
   }
@@ -400,7 +410,7 @@
           {:else}
             <button class="danger" onclick={stopMic}>Stop</button>
           {/if}
-          {#if speaking}
+          {#if turnActive}
             <button class="ghost" onclick={bargeIn} aria-label="Interrupt the assistant's reply">⏹ Stop reply</button>
           {/if}
           <button class="ghost" onclick={()=>{vadEnabled=!vadEnabled}} aria-pressed={vadEnabled}>{vadEnabled ? 'VAD' : 'VAD off'}</button>
@@ -411,6 +421,8 @@
         <canvas bind:this={canvasEl} class="wave" width="640" height="64"></canvas>
         {#if speaking}
           <div class="status-banner status-speaking"><span class="dot" aria-hidden="true">●</span> Assistant is speaking — say something or hit Stop reply to interrupt</div>
+        {:else if turnActive}
+          <div class="status-banner status-speaking"><span class="dot" aria-hidden="true">●</span> Thinking… (may include a web search) — say something or hit Stop reply to cancel</div>
         {/if}
         <div class="lat-grid">
           <div class="lat"><b>{latency.stt_ms||0}</b><span>STT</span></div>

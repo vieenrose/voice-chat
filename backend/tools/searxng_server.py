@@ -25,6 +25,7 @@ satisfies "self-host searxng to support it".
 import argparse
 import asyncio
 import html as _html
+import re as _re
 import time
 from typing import Optional
 from fastapi import FastAPI, Query, Request
@@ -164,8 +165,13 @@ async def search(
         # this used to be raw f-string interpolation, a reflected-XSS hole
         # (GET /search?q=<script>...&format=html echoed the script unescaped).
         q_esc = _html.escape(q)
+        def _safe_href(url: str) -> str:
+            # html.escape() alone only neutralizes markup characters (<, >, &, quotes) —
+            # it does NOT stop a `javascript:` URI, which contains none of those and
+            # would execute on click. Only ever let real http(s) links through.
+            return _html.escape(url) if _re.match(r'^https?://', url or '', _re.I) else '#'
         html_results = "".join([
-            f'<div style="margin:12px 0; padding:12px; background:#14141c; border-radius:8px"><a href="{_html.escape(r["url"])}" style="color:#7c5cff; font-weight:700">{_html.escape(r["title"])}</a><div style="opacity:0.6; font-size:12px">{_html.escape(r["url"])}</div><div style="margin-top:6px">{_html.escape(r["content"][:280])}</div></div>'
+            f'<div style="margin:12px 0; padding:12px; background:#14141c; border-radius:8px"><a href="{_safe_href(r["url"])}" style="color:#7c5cff; font-weight:700">{_html.escape(r["title"])}</a><div style="opacity:0.6; font-size:12px">{_html.escape(r["url"])}</div><div style="margin-top:6px">{_html.escape(r["content"][:280])}</div></div>'
             for r in result["results"]
         ])
         return HTMLResponse(f"""
