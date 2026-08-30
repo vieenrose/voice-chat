@@ -139,9 +139,32 @@ async def _wttr_weather(query: str) -> Dict | None:
         return None
 
 
+_GENERIC_TOPIC_WORDS = {"最新","科技","新聞","頭條","財經","娛樂","體育","國際","產業","要聞","今日","報導","消息","新知","資訊"}
+
+def _is_bare_topic_query(q: str) -> bool:
+    """True for a Chinese query that's just a topic/category phrase with no
+    location or named entity (e.g. 最新科技新聞), as opposed to one already
+    naming a place or entity (e.g. 法國新聞, 日本科技新聞) that a region
+    qualifier would only muddy."""
+    if not _is_chinese(q):
+        return False
+    import jieba
+    words = [w.strip() for w in jieba.cut(q) if w.strip()]
+    remaining = [w for w in words if w not in _GENERIC_TOPIC_WORDS and len(w) >= 2]
+    return len(remaining) == 0
+
 def _entity_first_query(q: str) -> str:
     """Generic query reformulation — no hard-coded outlet/location lists."""
-    return [_clean_query(q) or q.strip()[:40]]
+    base = _clean_query(q) or q.strip()[:40]
+    # A bare topic-only Chinese query (no location/entity already in it)
+    # searches noticeably better regionalized: this app defaults to zh-TW,
+    # and the self-hosted SearXNG instance returns far more on-topic Taiwan
+    # coverage for e.g. 台灣最新科技新聞 than the same unregionalized 最新科技新聞
+    # (verified directly against the live instance). Skip when a location is
+    # already present, or for weather (handled separately by _wttr_weather).
+    if _is_bare_topic_query(q) and "台灣" not in q and "台湾" not in q:
+        return [f"台灣{base}"]
+    return [base]
 
 async def _try_searxng(query: str, count: int, engine: str | None = None) -> List[Dict] | None:
     """Try local self-hosted SearXNG on 8888. engine=None -> aggregate; else single engine by name."""
@@ -315,14 +338,30 @@ async def _try_bing(query: str, count: int) -> List[Dict] | None:
         logger.debug(f"bing scrape failed {e}")
     return None
 
+_STOP_ZH = {"\u6700\u65b0","\u4eca\u5929","\u4eca\u5e74","\u73fe\u5728","\u76ee\u524d","\u4e00\u4e0b","\u7684","\u4e86","\u662f","\u5728","\u8207","\u548c","\u53ca","\u6709","\u55ce","\u5462","\u554a"}
+_STOP_EN = {"the","is","are","what","who","when","where","how","why","a","an","in","on","for","to","of","and","or","latest","today","current","search"}
+
+def _tokenize_query(q: str) -> List[str]:
+    """CJK-aware query tokenization for relevance scoring. A naive regex
+    (`[\\u4e00-\\u9fff]+`) treats an entire unsegmented Chinese phrase as ONE
+    token (e.g. '\u6700\u65b0\u79d1\u6280\u65b0\u805e' as a single 6-char blob), which then almost never
+    appears verbatim in a result's title/content/url \u2014 so every Chinese query
+    scored ~0 regardless of how relevant the results actually were, silently
+    defeating the fallback/reformulation logic this score is supposed to
+    drive. Use jieba to split CJK runs into real words (\u79d1\u6280/\u65b0\u805e/...) so
+    matching works the same way it does for space-delimited English."""
+    import jieba
+    tokens = []
+    for run in re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", q.lower()):
+        if re.match(r"[\u4e00-\u9fff]", run):
+            tokens.extend(w.strip() for w in jieba.cut(run) if len(w.strip()) >= 2 and w.strip() not in _STOP_ZH)
+        elif len(run) >= 3 and run not in _STOP_EN:
+            tokens.append(run)
+    return tokens
+
 def _relevance_score(query: str, results: List[Dict]) -> float:
     """Score 0..1 how relevant results are to query. Low = bad search, should fallback."""
-    ql = query.lower()
-    # Tokenize query, keep meaningful words >=3 chars, not stopwords
-    stop = {"the","is","are","what","who","when","where","how","why","a","an","in","on","for","to","of","and","or","latest","today","current","search"}
-    tokens = [w for w in re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", ql) if len(w)>=3 and w not in stop]
-    if not tokens:
-        tokens = [w for w in ql.split() if len(w)>=2]
+    tokens = _tokenize_query(query)
     if not results or not tokens:
         return 0
     # Require majority of tokens to appear for relevance (not just any one)
