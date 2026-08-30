@@ -19,6 +19,74 @@ SAMPLE_RATE = 24000  # Qwen3-TTS 12Hz * 2000
 FLUSH_TOKENS = 26   # flush only at real sentence ends (was 8 -> fragmented sentences => pauses INSIDE a sentence)
 SENTENCE_END = re.compile(r'[.!?。！？\n]')
 
+_CJK_RE = re.compile(r'[一-鿿㐀-䶿豈-﫿]')
+_LATIN_RE = re.compile(r'[A-Za-z]')
+
+
+def _segment_by_language(text: str) -> list[tuple[str, str]]:
+    """Split text into contiguous (language, segment_text) runs, each with a single
+    homogeneous script, instead of handing the whole string to the engine with
+    language="auto".
+
+    Verified directly against the runtime (qwentts_cpp): the "language" parameter
+    selects a single codec-language token baked into the generation prefill for the
+    *entire* call — "auto" only ever makes ONE detection decision (from the start of
+    the text) and never re-detects mid-generation. For a long or bilingual response
+    (e.g. an English proper noun or search-result snippet quoted inside an otherwise-
+    Chinese sentence — routine in this app given tool_call results), whatever
+    language "auto" locked onto gets applied to the rest of the text regardless of
+    what script it's actually in, mispronouncing that portion. Longer text only makes
+    this more likely, matching the reported symptom.
+
+    Splitting by script and passing the correct explicit language ("chinese"/
+    "english" — confirmed accepted values; ISO codes like "zh"/"en" are rejected by
+    the runtime) per segment fixes both the mixed-language case and makes the
+    single-language case deterministic instead of relying on auto-detection.
+
+    Digits/punctuation/whitespace inherit the current run's language rather than
+    starting a new one. A run is only ever merged into a neighbor when it contains
+    no actual CJK/Latin letters at all (pure punctuation/digits/whitespace, which can
+    only arise as a leading run before the first real letter) — merging is NEVER
+    applied to a short run of real letters (e.g. a single Chinese particle like "的"
+    stranded between two English runs), since silently reassigning it to whichever
+    neighbor happens to be adjacent is exactly the kind of wrong-language-per-
+    character mistake this function exists to prevent; a stray one-character segment
+    costs one extra small engine call, which is a fine trade for correct pronunciation.
+    """
+    if not text.strip():
+        return [("english", text)]
+    runs: list[list[str]] = []  # [lang, chars] pairs
+    current_lang = "english"
+    for ch in text:
+        if _CJK_RE.match(ch):
+            lang = "chinese"
+        elif _LATIN_RE.match(ch):
+            lang = "english"
+        else:
+            lang = current_lang  # neutral char (space/digit/punct) — extend current run
+        if runs and runs[-1][0] == lang:
+            runs[-1][1] += ch
+        else:
+            runs.append([lang, ch])
+        current_lang = lang
+    changed = True
+    while changed and len(runs) > 1:
+        changed = False
+        for i, (lang, seg) in enumerate(runs):
+            has_letters = bool(_CJK_RE.search(seg) or _LATIN_RE.search(seg))
+            if not has_letters and seg.strip():
+                if i + 1 < len(runs):
+                    runs[i + 1][1] = seg + runs[i + 1][1]
+                    del runs[i]
+                elif i > 0:
+                    runs[i - 1][1] += seg
+                    del runs[i]
+                else:
+                    continue
+                changed = True
+                break
+    return [(lang, seg) for lang, seg in runs]
+
 class StreamingPrimeTTS:
     def __init__(self, model_id: str = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice", device: str = "cuda", mock: bool = False):
         self.model_id = model_id
@@ -101,48 +169,52 @@ class StreamingPrimeTTS:
     async def synthesize(self, text: str, reference_audio: str = None) -> np.ndarray:
         preset = self.VOICE_PRESETS[self._vv]
         try:
+            segments = [(lang, seg) for lang, seg in _segment_by_language(text) if seg.strip()] or [("english", text)]
+            pcm_parts = []
             if preset.get("type") == "clone":
                 # 台湾腔 via reference-audio cloning (same as MOSS voice_clone with zh_4.wav)
                 await self._ensure_voice_ref(preset)
-                def _infer_clone():
-                    import qwentts_cpp as qc
-                    ref_spk = qc.load_speaker_embedding(preset["ref_spk"])
-                    ref_codes = qc.load_rvq_codes(preset["ref_rvq"], self.runtime.num_codebooks())
+                for seg_lang, seg_text in segments:
+                    def _infer_clone(seg_text=seg_text, seg_lang=seg_lang):
+                        import qwentts_cpp as qc
+                        ref_spk = qc.load_speaker_embedding(preset["ref_spk"])
+                        ref_codes = qc.load_rvq_codes(preset["ref_rvq"], self.runtime.num_codebooks())
+                        audio, sr = self.runtime.synthesize(
+                            text=seg_text,
+                            lang=seg_lang,
+                            ref_spk_emb=ref_spk,
+                            ref_codes=ref_codes,
+                            ref_text=preset["ref_text"],
+                            max_new_tokens=512,
+                            temperature=0.9,
+                            top_k=50,
+                            top_p=1.0,
+                        )
+                        return audio, sr
+                    audio, sr = await asyncio.to_thread(_infer_clone)
+                    arr = np.array(audio, dtype=np.float32).squeeze()
+                    arr = np.nan_to_num(arr); arr = np.clip(arr, -1.0, 1.0)
+                    pcm_parts.append((arr * 32767).astype(np.int16))
+                return np.concatenate(pcm_parts) if pcm_parts else np.zeros(0, dtype=np.int16)
+            for seg_lang, seg_text in segments:
+                def _infer(seg_text=seg_text, seg_lang=seg_lang):
                     audio, sr = self.runtime.synthesize(
-                        text=text,
-                        lang="auto",
-                        ref_spk_emb=ref_spk,
-                        ref_codes=ref_codes,
-                        ref_text=preset["ref_text"],
+                        text=seg_text,
+                        lang=seg_lang,
+                        speaker=self.speaker,
                         max_new_tokens=512,
                         temperature=0.9,
                         top_k=50,
                         top_p=1.0,
                     )
-                    return audio, sr
-                audio, sr = await asyncio.to_thread(_infer_clone)
-                arr = np.array(audio, dtype=np.float32).squeeze()
-                arr = np.nan_to_num(arr); arr = np.clip(arr, -1.0, 1.0)
-                pcm = (arr * 32767).astype(np.int16)
-                return pcm
-            def _infer():
-                audio, sr = self.runtime.synthesize(
-                    text=text,
-                    lang="auto",
-                    speaker=self.speaker,
-                    max_new_tokens=512,
-                    temperature=0.9,
-                    top_k=50,
-                    top_p=1.0,
-                )
-                arr = np.array(audio, dtype=np.float32).squeeze()
-                # Audio likely float -1..1; clamp and convert to int16
-                arr = np.nan_to_num(arr)
-                arr = np.clip(arr, -1.0, 1.0)
-                pcm = (arr * 32767).astype(np.int16)
-                return pcm
-            pcm = await asyncio.to_thread(_infer)
-            return pcm
+                    arr = np.array(audio, dtype=np.float32).squeeze()
+                    # Audio likely float -1..1; clamp and convert to int16
+                    arr = np.nan_to_num(arr)
+                    arr = np.clip(arr, -1.0, 1.0)
+                    pcm = (arr * 32767).astype(np.int16)
+                    return pcm
+                pcm_parts.append(await asyncio.to_thread(_infer))
+            return np.concatenate(pcm_parts) if pcm_parts else np.zeros(0, dtype=np.int16)
         except Exception as e:
             logger.error(f"Qwen3-TTS synthesize failed {e}")
             import traceback; traceback.print_exc()
@@ -208,42 +280,56 @@ class StreamingPrimeTTS:
         def _run():
             try:
                 preset = self.VOICE_PRESETS[self._vv]
-                if preset.get("type") == "clone":
+                is_clone = preset.get("type") == "clone"
+                if is_clone:
                     # 台湾腔 streaming via voice-clone generator
                     fut = asyncio.run_coroutine_threadsafe(self._ensure_voice_ref(preset), loop)
                     fut.result(timeout=120)
-                    gen = self.model.generate_voice_clone_streaming(
-                        text=text,
-                        language="auto",
-                        ref_audio=preset["ref_audio"],
-                        ref_text=preset["ref_text"],
-                        chunk_size=max(4, int(chunk_frames)),
-                    )
-                else:
-                    gen = self.model.generate_custom_voice_streaming(
-                        text=text,
-                        speaker=self.speaker,
-                        language="auto",
-                        chunk_size=max(4, int(chunk_frames)),
-                    )
-                for chunk, sr, meta in gen:
+                # Segment by language instead of passing the whole text with
+                # language="auto" — see _segment_by_language's docstring for why:
+                # "auto" only ever detects once, from the start of the text, and
+                # applies that single decision for the whole call.
+                for seg_lang, seg_text in _segment_by_language(text):
                     if stop_flag.is_set():
                         break
-                    arr = np.array(chunk, dtype=np.float32).squeeze()
-                    arr = np.nan_to_num(arr)
-                    arr = np.clip(arr, -1.0, 1.0)
-                    pcm16 = (arr * 32767).astype(np.int16)
+                    if not seg_text.strip():
+                        continue
+                    if is_clone:
+                        gen = self.model.generate_voice_clone_streaming(
+                            text=seg_text,
+                            language=seg_lang,
+                            ref_audio=preset["ref_audio"],
+                            ref_text=preset["ref_text"],
+                            chunk_size=max(4, int(chunk_frames)),
+                        )
+                    else:
+                        gen = self.model.generate_custom_voice_streaming(
+                            text=seg_text,
+                            speaker=self.speaker,
+                            language=seg_lang,
+                            chunk_size=max(4, int(chunk_frames)),
+                        )
+                    for chunk, sr, meta in gen:
+                        if stop_flag.is_set():
+                            break
+                        arr = np.array(chunk, dtype=np.float32).squeeze()
+                        arr = np.nan_to_num(arr)
+                        arr = np.clip(arr, -1.0, 1.0)
+                        pcm16 = (arr * 32767).astype(np.int16)
+                        try:
+                            asyncio.run_coroutine_threadsafe(q.put(("pcm", pcm16, meta)), loop).result(timeout=5)
+                        except Exception:
+                            stop_flag.set()
+                            break  # consumer gone / queue never drained (cancelled) — stop generating
+                        if stop_flag.is_set():
+                            break
                     try:
-                        asyncio.run_coroutine_threadsafe(q.put(("pcm", pcm16, meta)), loop).result(timeout=5)
+                        if hasattr(gen, "close"):
+                            gen.close()
                     except Exception:
-                        break  # consumer gone / queue never drained (cancelled) — stop generating
+                        pass
                     if stop_flag.is_set():
                         break
-                try:
-                    if hasattr(gen, "close"):
-                        gen.close()
-                except Exception:
-                    pass
             except Exception as e:
                 logger.error(f"Qwen streaming error {e}")
                 try:
