@@ -45,8 +45,9 @@ class QwenWebSearch(BaseTool):
                         query = str(d['query']).strip()
                     else:
                         query = s
-                except:
-                    query = s
+                except Exception:
+                    from tools.web_search import repair_truncated_json_query
+                    query = repair_truncated_json_query(s)
             else:
                 query = s
         else:

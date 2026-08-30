@@ -52,6 +52,29 @@ def _is_adult(title: str, content: str, url: str) -> bool:
 def _is_chinese(q: str) -> bool:
     return any('\u4e00' <= ch <= '\u9fff' for ch in q)
 
+def repair_truncated_json_query(s: str) -> str:
+    """Best-effort repair for a tool-call query arg that arrives as JSON missing
+    its closing brace(s), e.g. '{"query": "foo"'. This is not a hypothetical edge
+    case: qwen_agent's own fncall_prompts/nous_fncall_prompt.py:extract_fn() treats
+    ANY <tool_call> block that never got its closing </tool_call> tag as still
+    mid-stream and defensively strips the last character \u2014 so when the small
+    quantized model finishes the JSON payload but skips re-emitting the closing
+    XML tag, an otherwise-valid {"query": "..."} loses its final '}' before it
+    ever reaches our tools. Try re-closing with a few plausible suffixes before
+    falling back to a regex pull, then to the raw string untouched."""
+    import json as _json
+    for suffix in ("", "}", '"}', '"}}', "}}"):
+        try:
+            d = _json.loads(s + suffix)
+            if isinstance(d, dict) and str(d.get("query", "")).strip():
+                return str(d["query"]).strip()
+        except Exception:
+            continue
+    m = re.search(r'"query"\s*:\s*"([^"]*)', s)
+    if m and m.group(1).strip():
+        return m.group(1).strip()
+    return s
+
 def _clean_query(q: str, max_words: int = 6) -> str:
     """Reformulate query: drop stopwords/questions, keep meaningful content words."""
     # zh: keep as-is (no space tokenization)
@@ -394,7 +417,8 @@ async def web_search(query: str, count: int = 5) -> Dict:
             d = _js.loads(_raw)
             if isinstance(d, dict) and 'query' in d:
                 _raw = str(d['query']).strip()
-        except: pass
+        except Exception:
+            _raw = repair_truncated_json_query(_raw)
     query = _raw.strip()
     if not query:
         return {"query": query, "results": [], "source": "none", "latency_ms": 0}

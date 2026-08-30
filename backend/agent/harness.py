@@ -82,7 +82,10 @@ class WebSearchTool(Tool):
                 if isinstance(d, dict) and 'query' in d:
                     query = str(d['query']).strip()
                     _q = query
-            except: pass
+            except Exception:
+                from tools.web_search import repair_truncated_json_query
+                query = repair_truncated_json_query(_q)
+                _q = query
         # Apodex-style multi-query: accept JSON list or single string
         queries = query
         if isinstance(_q, str) and _q.strip().startswith("["):
