@@ -3,7 +3,6 @@ PydanticAI harness for Apodex-2B voice chat.
 Native parallel tool calls, async streaming, validation.
 """
 import asyncio
-import contextvars
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import List
@@ -13,24 +12,12 @@ from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
+from agent._shared import set_emit_target, emit as _emit, agent_call_lock
+
 API_BASE = "http://127.0.0.1:11435/v1"
 MODEL_ID = "apodex-1.0-2b"
 
-# Per-call (loop, queue) target, NOT a mutable global — see the identical comment in
-# agent/qwen_harness.py: _agent below is a single shared instance reused across every
-# session/turn, so a global "last attach() wins" singleton would cross-deliver one
-# turn's tool_call/tool_result events into a different (concurrent, or barge-in'd and
-# still finishing) turn's WS queue. asyncio.to_thread() copies the current contextvars
-# context into its worker thread, so this correctly stays call-scoped instead.
 import asyncio as _asyncio
-_emit_ctx: "contextvars.ContextVar[tuple | None]" = contextvars.ContextVar("_emit_ctx", default=None)
-
-def _emit(ev: dict):
-    ctx = _emit_ctx.get()
-    if ctx:
-        loop, q = ctx
-        if loop and q:
-            loop.call_soon_threadsafe(q.put_nowait, ev)
 
 def _make_model():
     # OpenAI-compatible llama-server, no thinking for voice
@@ -83,7 +70,7 @@ def _get_agent():
 
 async def run_agent_task(task: str, event_q=None) -> str:
     loop = _asyncio.get_running_loop()
-    _emit_ctx.set((loop, event_q))
+    set_emit_target(loop, event_q)
     agent = _get_agent()
     # Fast greeting path
     import re
@@ -94,7 +81,8 @@ async def run_agent_task(task: str, event_q=None) -> str:
     def _run():
         try:
             # PydanticAI run with history handling
-            result = agent.run_sync(task)
+            with agent_call_lock:
+                result = agent.run_sync(task)
             return result.output if hasattr(result, 'output') else str(result)
         except Exception as e:
             logger.exception(f"pydantic agent failed: {e}")

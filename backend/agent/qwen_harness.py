@@ -5,11 +5,12 @@ Wraps Qwen-Agent's Assistant with our SearXNG + wttr + granite tools.
 import os
 os.environ["QWEN_AGENT_MAX_LLM_CALL_PER_RUN"] = "3"  # voice: cap at 3 LLM calls (1 tool + final) to prevent 8× loop
 import asyncio
-import contextvars
 from loguru import logger
 from qwen_agent.agents import Assistant
 from qwen_agent.tools.base import BaseTool, register_tool
 import json
+
+from agent._shared import set_emit_target, emit as _emit, agent_call_lock
 
 # Import our search logic
 try:
@@ -19,25 +20,7 @@ except ImportError:
     from web_search import web_search, format_results
     _wttr_weather = None
 
-# Shared event emitter for WS streaming
 import asyncio as _asyncio
-# Per-call (loop, queue) target, NOT a mutable global: _agent below is a single shared
-# Assistant reused across every session/turn, so two calls to run_agent_task() can be
-# in flight at once (two sessions chatting concurrently, or an old barge-in'd turn's
-# background thread still finishing when a new turn starts). A plain "last attach() wins"
-# singleton would silently deliver one turn's tool_call/tool_result events into another
-# turn's WS queue. asyncio.to_thread() copies the current contextvars context into the
-# worker thread, so setting this per-call in run_agent_task (before to_thread) and
-# reading it from the tool .call() methods (which execute on that thread) keeps each
-# call's events routed to its own queue.
-_emit_ctx: "contextvars.ContextVar[tuple | None]" = contextvars.ContextVar("_emit_ctx", default=None)
-
-def _emit(ev: dict):
-    ctx = _emit_ctx.get()
-    if ctx:
-        loop, q = ctx
-        if loop and q:
-            loop.call_soon_threadsafe(q.put_nowait, ev)
 
 @register_tool('web_search', allow_overwrite=True)
 class QwenWebSearch(BaseTool):
@@ -166,7 +149,7 @@ def _get_agent():
 
 async def run_agent_task(task: str, event_q=None) -> str:
     loop = _asyncio.get_running_loop()
-    _emit_ctx.set((loop, event_q))
+    set_emit_target(loop, event_q)
     agent = _get_agent()
     def _run():
         try:
@@ -181,9 +164,10 @@ async def run_agent_task(task: str, event_q=None) -> str:
             messages = [{'role': 'user', 'content': task}]
             all_resps = []
             last_resp = None
-            for resp in agent.run(messages=messages):
-                all_resps.append(resp)
-                last_resp = resp
+            with agent_call_lock:
+                for resp in agent.run(messages=messages):
+                    all_resps.append(resp)
+                    last_resp = resp
             # Collect all assistant messages with non-empty content from entire run (filter thinking leak)
             candidates_all = []
             for resp in all_resps:

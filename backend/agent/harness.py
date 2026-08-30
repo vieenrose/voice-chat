@@ -19,6 +19,8 @@ from typing import List
 from loguru import logger
 from smolagents import Tool, ToolCallingAgent, OpenAIServerModel
 
+from agent._shared import set_emit_target, emit as _emit, agent_call_lock
+
 import os
 API_BASE = os.getenv("LLM_API_BASE", "http://127.0.0.1:11435/v1")
 MODEL_ID = os.getenv("LLM_MODEL_ID", "qwen3.5-2b")
@@ -55,23 +57,6 @@ class GraniteModel(OpenAIServerModel):
             extra["chat_template_kwargs"] = kwargs.pop("chat_template_kwargs")
         kwargs["extra_body"] = extra
         return super()._prepare_completion_kwargs(messages, stop_sequences, response_format, tools_to_call_from, custom_role_conversions, convert_images_to_image_urls, tool_choice, **kwargs)
-
-
-# Per-call (loop, queue) target, NOT a mutable global — see the identical comment in
-# agent/qwen_harness.py: _AGENT below is a single shared instance reused across every
-# session/turn, so a global "last attach() wins" singleton would cross-deliver one
-# turn's tool_call/tool_result events into a different (concurrent, or barge-in'd and
-# still finishing) turn's WS queue. asyncio.to_thread() copies the current contextvars
-# context into its worker thread, so this correctly stays call-scoped instead.
-import contextvars
-_emit_ctx: "contextvars.ContextVar[tuple | None]" = contextvars.ContextVar("_emit_ctx", default=None)
-
-def _emit(ev: dict):
-    ctx = _emit_ctx.get()
-    if ctx:
-        loop, q = ctx
-        if loop and q:
-            loop.call_soon_threadsafe(q.put_nowait, ev)
 
 
 class WebSearchTool(Tool):
@@ -210,7 +195,8 @@ class _Agent:
             # If query is short (<15) and contains greeting, treat as greeting
             if len(_tl) < 15 or re.match(r'^\s*[\w\s]*(你好|您好|哈囉|嗨|餵|喂|hi|hello|hey)\b', _tl, re.I):
                 return "Hello! How can I help you today?" if not re.search(r'[\u4e00-\u9fff]', _cur) else "你好！有什麼可以幫你的？"
-        out = self.agent.run(task, reset=True)
+        with agent_call_lock:
+            out = self.agent.run(task, reset=True)
         return out if isinstance(out, str) else (out.final_answer if hasattr(out, "final_answer") else str(out))
 
 
@@ -236,7 +222,7 @@ def agent_alive() -> bool:
 async def run_agent_task(task: str, event_q: asyncio.Queue | None = None) -> str:
     """Run the smolagents loop for one user prompt; may emit tool events into event_q."""
     loop = asyncio.get_running_loop()
-    _emit_ctx.set((loop, event_q))
+    set_emit_target(loop, event_q)
 
     def _worker():
         agent = _get_agent()
