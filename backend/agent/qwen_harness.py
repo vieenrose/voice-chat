@@ -141,6 +141,14 @@ def _make_agent():
             'temperature': 0.7,
             'top_p': 0.9,
             'chat_template_kwargs': {'enable_thinking': True},
+            # Cap thinking tokens (llama-server's native reasoning_budget_tokens,
+            # forwarded via extra_body) without touching max_tokens for the real
+            # answer/tool-call. Voice turns don't need long deliberation, and an
+            # uncapped thinking pass can burn most of max_tokens on reasoning
+            # alone, which is what caused the truncated tool-call JSON bug this
+            # session (reasoning ate the budget, leaving too few tokens to close
+            # the <tool_call> block) as well as unnecessary first-audio latency.
+            'extra_body': {'reasoning_budget_tokens': 200},
         },
         # Thinking enabled: reasoning_content will be in delta but we filter it in run_agent_task (only final assistant content)
         'enable_thinking': True

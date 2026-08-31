@@ -532,19 +532,23 @@ async def web_search(query: str, count: int = 5) -> Dict:
                     break
             if done:
                 break
-    # 3) DDG / lite scrape as network fallback
+    # 3) network fallbacks — race concurrently instead of walking them one at a
+    # time. Each stage carries its own several-second httpx timeout, and
+    # empirically most of them fail outright for a given query before
+    # whichever stage actually succeeds is reached, so walking them serially
+    # wastes seconds waiting on dead ends (measured ~3s for a typical zh-TW
+    # query). DDGS is a US/English-oriented backend that never wins for
+    # Chinese queries in practice, so skip its timeout there entirely.
     if best_score < 0.34:
-        ddgs = await _try_ddgs(query, count)
-        if ddgs and _score(ddgs) > best_score:
-            results, source, best_score = ddgs, "duckduckgo", _score(ddgs)
-    if best_score < 0.34:
-        lite = await _try_lite_scrape(query, count)
-        if lite and _score(lite) > best_score:
-            results, source, best_score = lite, "lite_scrape", _score(lite)
-    if best_score < 0.34:
-        bing = await _try_bing(query, count)
-        if bing and _score(bing) > best_score:
-            results, source, best_score = bing, "bing_scrape", _score(bing)
+        candidates = [] if _is_chinese(query) else [("duckduckgo", _try_ddgs(query, count))]
+        candidates += [("lite_scrape", _try_lite_scrape(query, count)), ("bing_scrape", _try_bing(query, count))]
+        gathered = await asyncio.gather(*(c[1] for c in candidates), return_exceptions=True)
+        for (name, _), r in zip(candidates, gathered):
+            if isinstance(r, Exception) or not r:
+                continue
+            s = _score(r)
+            if s > best_score:
+                results, source, best_score = r, name, s
     if not results:
         latency = int((time.time()-t0)*1000)
         payload = {"query": query, "results": [], "source": "no_results", "latency_ms": latency, "cached": False}
