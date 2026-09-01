@@ -30,6 +30,11 @@ def emit(ev: dict) -> None:
     if ctx:
         loop, q = ctx
         if loop and q:
+            if ev.get("type") in ("tool_call", "tool_result"):
+                g = _guard_ctx.get()
+                if g:
+                    ev = dict(ev)
+                    ev["guard"] = g          # whose decision was this? (see guard() below)
             loop.call_soon_threadsafe(q.put_nowait, ev)
 
 
@@ -44,3 +49,39 @@ def emit(ev: dict) -> None:
 # — rare: only when an orphaned barged-in call is still running) for guaranteed
 # correctness regardless of what the underlying library actually does.
 agent_call_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# "Who decided this?" — guard attribution on agent events.
+#
+# The harness has several guards that make a turn correct: forcing a lookup the
+# question plainly required, executing a tool the answer merely named, replacing a
+# stated clock that no tool verified, speaking the results a refusal ignored. Each one
+# is real work on real data — but a benchmark that then asks "did a tool run?" and
+# answers "yes" is partly measuring the guard, not the model. So every guarded action
+# announces itself on the same event channel the UI and the benchmark already read:
+# the tool_call/tool_result get `guard: <reason>`, plus an explicit tool_guard event.
+# Nothing is hidden from the user either — the search card appears because the search
+# really ran.
+_guard_ctx: "contextvars.ContextVar[str | None]" = contextvars.ContextVar("_guard_ctx", default=None)
+
+
+def set_guard_reason(reason):
+    """Attach `reason` to tool events emitted from here on (context-scoped, like the
+    emit target, so two concurrent turns cannot attribute to each other)."""
+    return _guard_ctx.set(reason)
+
+
+def reset_guard_reason(token):
+    _guard_ctx.reset(token)
+
+
+def current_guard_reason():
+    return _guard_ctx.get()
+
+
+def guard(reason: str, tool: str = "", detail: str = ""):
+    """Emit the marker for a guarded action and attribute subsequent tool events to it."""
+    token = _guard_ctx.set(reason)
+    emit({"type": "tool_guard", "reason": reason, "tool": tool, "detail": detail})
+    return token

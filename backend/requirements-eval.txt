@@ -1,0 +1,14 @@
+# Eval-only dependencies (NOT needed to run the service).
+#
+# PEP 668 blocks `pip install` into the system env on the dev box, and the runtime env
+# must stay minimal, so these are installed out-of-tree:
+#
+#   pip install --target "${EVAL_LIB_DIR:-/home/user/.eval-libs}" -r backend/requirements-eval.txt
+#
+# test_tts_asr_roundtrip.py adds that directory to sys.path itself (env EVAL_LIB_DIR) and
+# degrades loudly instead of reporting fiction when the package is missing.
+#
+# zhconv: X-ASR emits simplified Chinese, the corpus is traditional. Comparing them
+# char-by-char scores a correctly spoken sentence at ~42% CER (measured). Folding both
+# sides to zh-cn first is what makes the numbers mean pronunciation, not orthography.
+zhconv==1.4.3

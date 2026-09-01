@@ -39,7 +39,7 @@ import numpy as np
 
 from pipeline.speech_to_speech import HFSpeechToSpeechPipeline
 # the two 'this is not speech' rules are shared with the voice pipeline on purpose
-from pipeline.speech_to_speech import _is_tool_artifact, is_echo_of_prompt
+from pipeline.speech_to_speech import _is_tool_artifact, is_echo_of_prompt, prepare_tts_text
 from llm_manager import llm_manager, MODEL_REGISTRY as LLM_MODEL_REGISTRY
 
 app = FastAPI(title="Voice Chat HF S2S + SearXNG Tools", version="1.1.0")
@@ -83,6 +83,19 @@ def _token_ok(request: Request) -> bool:
         return True
     presented = _presented_token(request)
     return bool(presented) and secrets.compare_digest(presented, AUTH_TOKEN)
+
+
+def _agent_config() -> dict:
+    """Live agent-layer switches, read from the harness itself so this cannot drift."""
+    try:
+        from agent import qwen_harness as _qh
+        return {
+            "preflight_lookup": _qh._preflight_enabled(),
+            "smalltalk_rule": _qh._smalltalk_rule() != "",
+            "thinking": _qh._thinking_on(),
+        }
+    except Exception as e:                                    # harness absent (light image)
+        return {"error": f"{type(e).__name__}"}
 
 
 def _is_loopback(request: Request) -> bool:
@@ -154,10 +167,25 @@ async def auth_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+# Model switching: reachable-or-not is decided below; these are the knobs.
+#
+# The original hardening ("loopback-only when no token is configured") was wrong in
+# practice: it broke the operator's OWN model picker the moment the UI was opened over
+# Tailscale or the LAN, because from the server's side that request arrives with a
+# 100.x/192.x peer address and is indistinguishable from a stranger's. It also protected
+# a capability the demo's own open-by-design policy already hands to anyone who can reach
+# the port (chat, search, speak). So: in open mode switching is allowed, *attributed and
+# rate-limited* instead of blocked; set REQUIRE_TOKEN_FOR_MODEL_SWITCH=1 to get the old
+# closed behaviour back.
+MODEL_SWITCH_REQUIRE_TOKEN = os.getenv("REQUIRE_TOKEN_FOR_MODEL_SWITCH", "").strip().lower() in ("1", "true", "yes")
+MODEL_SWITCH_COOLDOWN_S = float(os.getenv("MODEL_SWITCH_COOLDOWN_S", "10"))
+_switch_state = {"at": 0.0, "peer": "", "model": ""}
+
 pipeline: HFSpeechToSpeechPipeline | None = None
 # `latencies` is a bounded ring buffer: as a plain list it grew for the whole
 # lifetime of the process (one entry per utterance, never freed) on a long-running demo.
-stats = {"connections": 0, "utterances": 0, "latencies": deque(maxlen=1000), "tool_calls": 0}
+stats = {"connections": 0, "utterances": 0, "latencies": deque(maxlen=1000), "tool_calls": 0,
+         "model_switches": deque(maxlen=20)}   # who switched what, when (verbose /health)
 MOCK_MODE = False
 
 # --- SearXNG self-host integration ---
@@ -246,10 +274,16 @@ async def health(verbose: bool = Query(False)):
         "rss_mb": round(mem.rss / 1024/1024, 1),
         "searxng": {"url": SEARXNG_URL, "ok": searxng_ok, "self_hosted": True},
         "auth": "token" if AUTH_TOKEN else "open",
+        # What the agent layer is configured to do, so any measurement can state it.
+        # The harness can *make* a turn correct (forcing a lookup the question demanded,
+        # repairing an answer that named a tool it never called); a benchmark that does
+        # not know those switches were on is measuring the guards, not the model.
+        "agent": _agent_config(),
         # Count only. The raw latency array (every utterance's E2E history) and VMS
         # are served only to an authenticated ?verbose=1 caller — they used to be
         # broadcast unauthenticated on a funnel-exposed port, and the UI reads neither.
         "stats": {k: (len(v) if isinstance(v, deque) else v) for k, v in stats.items()},
+        "last_model_switches": list(stats["model_switches"])[-5:] if verbose else [],
     }
     if verbose:
         body["vms_mb"] = round(mem.vms / 1024/1024, 1)
@@ -266,11 +300,23 @@ async def switch_model(payload: dict, request: Request):
     starts the requested one — the caller should expect this to take several
     seconds and the pipeline's LLM to be briefly unavailable while it swaps.
 
-    Affects every session on this process, and in the worst case terminates whatever
-    process holds the LLM port — so with no token configured it is loopback-only
-    rather than callable by anyone who can reach the port."""
-    if not AUTH_TOKEN and not _is_loopback(request):
-        return JSONResponse({"error": "model switching requires VOICE_CHAT_TOKEN when not on loopback"}, status_code=403)
+    Access: when a token is configured the auth middleware has already checked it. In open
+    mode the switch is allowed from any peer but *attributed* (logged + kept in a bounded
+    history visible at /health?verbose=1) and rate-limited, because a switch restarts
+    llama-server for every session and thrashing it is a self-inflicted outage.
+    REQUIRE_TOKEN_FOR_MODEL_SWITCH=1 restores loopback-only. The truly destructive part —
+    terminating whatever holds the LLM port — stays restricted inside llm_manager to
+    processes that actually are llama-server.
+    """
+    peer = request.client.host if request.client else "?"
+    if not AUTH_TOKEN:
+        if MODEL_SWITCH_REQUIRE_TOKEN and not _is_loopback(request):
+            return JSONResponse({
+                "error": "model switching is restricted to loopback (REQUIRE_TOKEN_FOR_MODEL_SWITCH=1)",
+                "remedy": "open the UI from the server itself, or set VOICE_CHAT_TOKEN and pass ?token=…",
+            }, status_code=403)
+        if not _is_loopback(request):
+            logger.warning(f"model switch requested by non-loopback peer {peer} (no token configured)")
     model_id = payload.get("model_id") or payload.get("model")
     if not model_id:
         return JSONResponse({"error": "model_id required"}, status_code=400)
@@ -278,11 +324,25 @@ async def switch_model(payload: dict, request: Request):
         return JSONResponse({"error": f"unknown model_id {model_id!r}", "available": list(LLM_MODEL_REGISTRY)}, status_code=400)
     if llm_manager.switching:
         return JSONResponse({"error": "a model switch is already in progress"}, status_code=409)
+    _since = time.time() - _switch_state["at"]
+    if _switch_state["at"] and _since < MODEL_SWITCH_COOLDOWN_S:
+        # Cooldown, not permission: two switches in quick succession means the first one's
+        # model never got a chance to serve anything, and repeated 4B reloads on a shared
+        # GPU take the whole assistant down for minutes.
+        return JSONResponse({"error": f"switched to {_switch_state['model']} {_since:.0f}s ago by "
+                                      f"{_switch_state['peer']}; wait {MODEL_SWITCH_COOLDOWN_S - _since:.0f}s",
+                             "retry_after_s": round(MODEL_SWITCH_COOLDOWN_S - _since, 1)}, status_code=429)
+    _t_switch = time.time()
     try:
         result = await llm_manager.switch_to(model_id)
     except Exception as e:
         logger.exception(f"model switch to {model_id} failed: {e}")
+        stats["model_switches"].append({"at": round(_t_switch, 1), "peer": peer, "model": model_id,
+                                        "ok": False, "error": str(e)[:120]})
         return JSONResponse({"error": str(e)}, status_code=500)
+    _switch_state.update(at=time.time(), peer=peer, model=model_id)
+    stats["model_switches"].append({"at": round(_t_switch, 1), "peer": peer, "model": model_id,
+                                    "ok": True, "took_s": round(time.time() - _t_switch, 1)})
     if pipeline is not None and result.get("alias"):
         # LingStreaming reads self.model_name fresh on every request (it's not baked
         # into a closure at construction), so updating these two attributes in place
@@ -389,7 +449,16 @@ async def tts_chunks(text: str, voice: str | None = None):
     Backends whose synthesize_streaming predates the voice kwarg (kokoro/moss/…)
     fall back to set_voice with a warning; a genuinely unknown voice name
     (KeyError) propagates to the caller instead of being ignored.
+
+    The text is run through the same front-end as the voice pipeline (markdown, units,
+    percent signs) so every TTS entry point speaks the same thing; the caller keeps the
+    original text for the chat bubble.
     """
+    text, applied = prepare_tts_text(text)
+    if applied:
+        logger.debug(f"tts_chunks text front-end {applied}: -> {text[:60]!r}")
+    if not text:
+        return
     if voice and hasattr(pipeline.tts, "synthesize_streaming"):
         try:
             async for pcm in pipeline.tts.synthesize_streaming(text, voice=voice):
@@ -508,7 +577,8 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="")):
                     await websocket.send_text(json.dumps(payload))
                 elif etype == "tts_start":
                     await websocket.send_text(json.dumps(event))
-                elif etype in ("stt_partial", "stt_final", "llm_token", "latency", "tts_end", "tool_call", "tool_result"):
+                elif etype in ("stt_partial", "stt_final", "llm_token", "latency", "tts_end", "tool_call", "tool_result",
+                              "tool_guard"):
                     await websocket.send_text(json.dumps(event, ensure_ascii=False))
                     if etype == "tool_call":
                         stats["tool_calls"] += 1
@@ -610,6 +680,15 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="")):
                                     cnt = 0
                                     llm_text_so_far = ""
                                     await websocket.send_text(json.dumps({"type": "llm_reset", "turn_id": my_turn_id}))
+                                elif ev["type"] == "tool_guard":
+                                    # "this lookup was run/forced by the harness, not chosen by the
+                                    # model" — see agent/_shared.py guard(). The UI can ignore it;
+                                    # test_e2e_report.py uses it to separate model routing quality
+                                    # from guard assistance, which is the difference between a
+                                    # measurement and a self-fulfilling one.
+                                    await websocket.send_text(json.dumps(
+                                        {"type": "tool_guard", "reason": ev.get("reason", ""),
+                                         "tool": ev.get("tool", ""), "turn_id": my_turn_id}, ensure_ascii=False))
                                 elif ev["type"] == "tool_result":
                                     # forward lightweight result to frontend (omit large content for WS size, but include formatted)
                                     await websocket.send_text(json.dumps({"type":"tool_result","name":ev["name"],"latency_ms":ev.get("latency_ms",0),"source":ev.get("result",{}).get("source","") if isinstance(ev.get("result"),dict) else "", "formatted":ev.get("formatted","")[:600], "turn_id": my_turn_id}, ensure_ascii=False))
@@ -808,6 +887,7 @@ async def api_chat(payload: dict):
     llm_text = ""
     first_token_ms = None
     tool_calls = []
+    guards = []          # turns where the harness, not the model, made it correct
     gen = pipeline.llm.generate_with_tools(stt_text) if use_tools else pipeline.llm.generate_stream(stt_text)
     # The WS path converts a mid-turn generation failure into a tts_end so its client cannot
     # hang; this endpoint had no equivalent, so an unreachable model server (LLM_API_BASE
@@ -822,6 +902,8 @@ async def api_chat(payload: dict):
                 llm_text = ev["text_so_far"]
             elif ev["type"] == "tool_call":
                 tool_calls.append(ev)
+            elif ev["type"] == "tool_guard":
+                guards.append({"tool": ev.get("tool", ""), "reason": ev.get("reason", "")})
             elif ev["type"] == "tool_result":
                 # we could include but not needed for text
                 pass
@@ -846,6 +928,7 @@ async def api_chat(payload: dict):
         "stt_text": stt_text,
         "llm_text": llm_text,
         "tool_calls": tool_calls,
+        "guards": guards,          # see agent/_shared.py guard(): pre-flight/repair attribution
         "audio_b64": audio_b64,
         "latencies": {"stt_ms": stt_ms, "llm_ttft_ms": first_token_ms or 0, "llm_total_ms": llm_ms, "tts_ms": tts_ms, "e2e_ms": e2e_ms},
         "rss_mb": round(psutil.Process().memory_info().rss/1024/1024,1)

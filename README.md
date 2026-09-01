@@ -59,6 +59,90 @@ Turning thinking off was the tempting fix — 7× faster first token — and it 
 - **A question the model answered from memory.** "Who is the president of France?" scored no tool call at all. `requires_fresh_facts()` recognises incumbency/winner questions from the *question alone* and invokes `web_search` before the model speaks (a real call, whose events reach the client), instead of hoping the router notices.
 - **A fabricated clock.** On the voice path the model said `現在是下午 3 點 25 分` when it was 13:25, with no tool call at all. `fabricates_time_without_tool()` fires only when the *question* is about now **and** the *answer* states a time/date, forces the real `get_current_datetime` call, and rewrites the sentence deterministically (`format_clock_zh`) — asking the model to redo it came back with the same wrong time, because its own wrong claim was already in context. Measured effect of the three guards together: **62 % → 100 %** on the benchmark set.
 
+## Pronunciation (why speech came out partly wrong, and what actually fixed it)
+
+"Sometimes it mis-pronounces part of the sentence" has five candidate causes — the TTS model, the
+streaming chunker, the text handed to it, the sample-rate path, and the *evaluator* (the ASR
+mis-hearing). They need different fixes, so this is now measured instead of argued:
+
+```bash
+python3 backend/test_tts_asr_roundtrip.py --tts qwen3 --repeats 3 --modes full,stream   # CER per category
+python3 backend/test_tts_asr_roundtrip.py --tts audio8 --raw-text                       # another engine / before-state
+python3 backend/compare_tts_reports.py /tmp/a.json /tmp/b.json                          # item-by-item + noise band
+```
+
+The harness varies one factor at a time (one-shot vs three chunk sizes, repeats, two resamplers
+24 k→16 k, the production paced-streaming ASR path vs a one-shot pass) and localizes every
+mismatch against the audio's own chunk-boundary times. Eval-only dep: `zhconv` (see
+`backend/requirements-eval.txt`) — X-ASR answers in simplified Chinese, so comparing it against a
+ground-truth traditional reference scored a *correctly spoken* sentence at 42 % CER until both
+sides were folded first.
+
+**Calibration first: the ASR's own floor is 10.5 % CER** (paced path) / 5.3 % (one-shot) on
+`asr_example.wav`, a human recording with a verified transcript. Every number below is TTS→audio→ASR,
+so categories near the floor mean the TTS is fine. Read them as `cer − floor`.
+
+38 texts × 3 repeats, streaming (`chunk_frames=12`), same engine, only the text front-end changed:
+
+| Category | written text as-is | through `tts/spoken_text.py` | reading |
+|---|---|---|---|
+| **markdown** (`**…**`, `` `…` ``, links, tables) | **65.0 %** | **15.5 %** | real fix, far outside noise |
+| mixed-script (`IBM 的 quantum …paper`) | 58.1 % | 55.1 % | the model's limit, not text shaping |
+| numbers (`34°C`, `68%`, dates) | 20.0 % | 20.1 % | CER ignores numerals *by design* — see below |
+| proper_zh_en | 8.9 % | 15.8 % | **identical input text** → this spread *is* the noise band |
+| plain_zh / names / short / long / pure_en | 4.3 / 9.3 / 2.3 / 4.2 / 21.2 % | unchanged | clean text passes through untouched (asserted in tests) |
+| corpus mean | 23.3 % | **17.1 %** | |
+
+**Cause 1 — written language reaching an acoustic model.** Chat models emit markdown; nothing
+stripped it, so `**颱風路徑北移**` went to the TTS verbatim and came back as `誰因此將就嗎？要回來…`
+(65 % → 15.5 % on that category). `backend/tts/spoken_text.py` is now the one front-end, called
+through `pipeline.prepare_tts_text()` from both TTS entry points (`synth_and_emit`, `app.tts_chunks`).
+It only rewrites *notation* (markup, `°C`→`度`, `68%`→`百分之68`, `3/4`→`4分之3`, emoji/URLs) — never
+content, and it returns the rule names it applied so a log line can explain why the spoken text
+differs from the chat bubble (which still shows the original). `tests/test_spoken_text.py` includes a
+guard rail that fails if a corpus sentence ever becomes a rule.
+
+**Cause 2 — a unit read as a letter.** `最高溫度 34°C` was spoken `三十四度 C`, i.e. the letter "C"
+apart, in **3/3 repeats**; normalized it is `三十四度` in 3/3. CER cannot see this (numerals are
+stripped on both sides on purpose, so that "34 °C" said as "三十四度" is not counted as an error) —
+which is exactly why the fix is verified from the transcripts, not from the metric.
+
+**Cause 3 (investigated, then rejected): the streaming chunker.** Raw text showed a real chunk
+penalty — stream@12 frames 36.7 % vs one-shot 22.9 % — and 47–57 % of mismatch positions landed
+within 0.45 s of a chunk boundary. But after the text fix the penalty is gone (stream@12 24.5 % ≈
+one-shot 24.6 %) while the boundary correlation barely moved (0.49 → 0.47). Conclusion: what looked
+like the chunker cutting audio was mostly small chunks *plus markup* derailing the model; no
+audio-cutting bug was confirmed, so no chunker change was made.
+
+**Noise, stated as a number.** Categories whose text the front-end does not touch can only move by
+noise, and one of them moved 8.9 → 15.8 % (n=4). Per-repeat corpus means spread 2.1 pp (raw) and
+17.2 pp (normalized, driven by a single repeat-derailment item with CER > 200 %). So: trust
+item-level deltas and per-repeat medians (`compare_tts_reports.py` prints both); treat any
+category delta under ~7 pp at n=4 as a tie. `--repeats 3` is the minimum, not the ideal.
+
+**Two engines evaluated and NOT adopted** (the pronunciation complaint made a model swap the
+obvious hypothesis — it did not survive measurement):
+
+- **MOSS-TTS-Realtime GGUF** (`BricksDisplay/MOSS-TTS-Realtime-GGUF`): the GGUFs are loadable in
+  spirit — backbone is stock llama.cpp `qwen3`, audio side is `codec.cpp`'s `codec_lm` — but the
+  *Realtime generation loop* (17 codebooks: `cb-0` text, `cb-1..16` RVQ) lives in `llama.rn`'s
+  `rn-tts.cpp`, i.e. Node. `codec.cpp` has the MOSS codec and TTSD smoke tests, and a `tts-cli`,
+  but no Realtime loop; there is no PyPI package. Adopting the GGUFs means writing that loop
+  against a C API. The upstream PyTorch path does work from Python
+  (`MossTTSRealtimeInference`, prefill/step, streaming via `session.push_text()/drain()`) but needs
+  **11.8 GB of weights** (4.68 GB backbone + 7.10 GB MOSS-Audio-Tokenizer) and its own
+  `transformers==5.0.0`/`torch==2.9.1` pins — this repo pins 5.15/2.11 for the STT+LLM, so it can
+  only come in as a separate-venv sidecar, not an in-process adapter.
+- **Audio8 TTS Preview 0.1B ONNX INT8** (`Audio8/audio8-TTS-0.1B-ONNX-INT8`, 0.45 GB, CPU-only,
+  11 languages): adapter written and working end to end (`backend/tts/audio8_onnx_streaming.py`,
+  `--tts audio8`), and *worse* on the axis that mattered — plain Chinese **29.1 % CER vs Qwen3-TTS'
+  9.2 %**, long sentences 29.8 % vs 3.2 % — while also being far too slow: 30 ms/frame AR +
+  22–35 ms/frame codec decode + **2.9 s prompt prefill per call** (the exported graph is
+  one-token and replays the 110-frame reference voice every time), measured TTFA 5.2–6.8 s against
+  Qwen3-TTS's 0.2–0.5 s. Upstream's `stream()` re-decodes `stream_context_frames + chunk_frames`
+  per emitted chunk, which is what produced RTF 9–12 at `chunk_frames=10`; both facts are recorded
+  in the adapter's docstring. Left available (`TTS_PREFER`/`AUDIO8_MODEL_DIR`), not made the default.
+
 ## Security & access control
 
 | Control | Default | How to change |
@@ -184,7 +268,7 @@ host. `.dockerignore` keeps the build context at ~600 MB instead of shipping wei
 
 ```bash
 # 1) Pure-logic regression tests — no GPU, no models, no network (also run in CI)
-python3 -m unittest discover -s backend/tests -v      # 92 tests
+python3 -m unittest discover -s backend/tests -v      # 124 tests
 
 # 2) Does this interpreter have what the default stack needs? (non-zero exit = missing)
 python3 backend/check_env.py
@@ -192,6 +276,12 @@ python3 backend/check_env.py
 # 3) Against a LIVE deployment (real models): STT accuracy/CER, tool-call selection,
 #    latency percentiles, peak RSS, and all three barge-in directions
 python3 backend/test_e2e_report.py --server http://127.0.0.1:8000
+
+# 3b) Pronunciation: synthesize -> re-transcribe -> CER per category, with the ASR's own
+#     error floor, three ASR/resample cross-checks and chunk-boundary correlation.
+#     Needs GPU models + `pip install --target $EVAL_LIB_DIR -r backend/requirements-eval.txt`
+python3 backend/test_tts_asr_roundtrip.py --tts qwen3 --repeats 3 --modes full,stream
+python3 backend/compare_tts_reports.py before.json after.json    # item-by-item + noise band
 
 # 4) Will the pins actually install in the Docker image? (wheels for cp313/x86_64,
 #    including the --find-links CUDA TTS wheel; no build needed to find out)

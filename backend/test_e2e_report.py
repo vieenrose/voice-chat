@@ -226,17 +226,25 @@ async def _tool_accuracy_pass(ws_base: str, pass_index: int = 0) -> dict:
         url = f"{ws_base}/ws/chat?session_id=e2e_tool_{RUN_ID}_{pass_index}_{i}"
         async with websockets.connect(url, max_size=None) as ws:
             called_tool = None
+            guards = []          # tool_guard: the harness, not the model, made this turn correct
             latency = {}
             answer = ""
             t0 = time.time()
 
-            async def recv():
+            # `_guards=guards` binds this query's list at definition time (B023): the
+            # closure is created once per query and the loop rebinds `guards` each turn.
+            async def recv(_guards=guards):
                 nonlocal called_tool, latency, answer
                 try:
                     async for raw in ws:
                         msg = json.loads(raw)
-                        if msg.get("type") == "tool_call" and called_tool is None:
-                            called_tool = msg.get("name")
+                        if msg.get("type") == "tool_guard":
+                            _guards.append(f"{msg.get('tool','?')}:{msg.get('reason','?')}")
+                        if msg.get("type") == "tool_call":
+                            if msg.get("guard"):
+                                _guards.append(f"{msg.get('name','?')}:{msg['guard']}")
+                            if called_tool is None:
+                                called_tool = msg.get("name")
                         if msg.get("type") == "llm_token":
                             answer = msg.get("text_so_far") or answer
                         if msg.get("type") == "latency":
@@ -270,16 +278,31 @@ async def _tool_accuracy_pass(ws_base: str, pass_index: int = 0) -> dict:
             results.append({
                 "query": query, "expected_tool": expected_tool, "called_tool": called_tool,
                 "correct": correct, "grounded_without_tool": grounded_without_tool,
+                "guards": sorted(set(guards)), "guard_assisted": bool(guards),
                 "answer_preview": answer[:80], "wall_ms": elapsed,
                 "llm_ttft_ms": latency.get("llm_ttft_ms"), "tts_ttfb_ms": latency.get("tts_ttfb_ms"),
                 "e2e_ms": latency.get("e2e_ms"),
             })
             _note = " (answer grounded without the tool)" if grounded_without_tool else ""
+            if guards:
+                _note += "  [guard:" + ",".join(sorted(set(guards))) + "]"
             print(f"  '{query[:45]:45}' expected={str(expected_tool):20} got={str(called_tool):20} {'OK' if correct else 'MISS'} e2e={latency.get('e2e_ms')}{_note}")
 
     accuracy = sum(1 for r in results if r["correct"]) / len(results)
+    # Split the number, because a pre-flight that runs the lookup the question already
+    # demanded makes "did the tool run?" true by construction. Reporting only the headline
+    # accuracy would credit the model with the guard's work.
+    _assisted = [r for r in results if r.get("guards")]
+    _own = [r for r in results if not r.get("guards")]
+    _own_acc = (sum(1 for r in _own if r["correct"]) / len(_own)) if _own else None
     print(f"  -> tool_selection_accuracy={accuracy:.0%} ({sum(1 for r in results if r['correct'])}/{len(results)})")
-    return {"queries": results, "accuracy": accuracy}
+    print(f"   guard-assisted turns: {len(_assisted)}/{len(results)}"
+          + (f"  [{', '.join(sorted({g for r in _assisted for g in r['guards']}))}]" if _assisted else ""))
+    if _own_acc is not None:
+        print(f"   accuracy on unguarded turns: {_own_acc:.0%} "
+              f"({sum(1 for r in _own if r['correct'])}/{len(_own)})  <- the model's own routing")
+    return {"queries": results, "accuracy": accuracy, "guard_assisted": len(_assisted),
+            "model_only_accuracy": _own_acc, "model_only_n": len(_own)}
 
 
 async def test_barge_in_text(ws_base: str) -> dict:
@@ -505,6 +528,12 @@ async def main():
     _accs = tool_report.get("pass_accuracies") or [tool_report["accuracy"]]
     _spread = "" if len(_accs) == 1 else f"  (passes: {' '.join(f'{a:.0%}' for a in _accs)}, min {min(_accs):.0%} max {max(_accs):.0%})"
     print(f"    Tool-call accuracy   : {tool_report['accuracy']:.0%}  (last pass {sum(1 for r in tool_report['queries'] if r['correct'])}/{len(tool_report['queries'])}, n={len(_accs)} pass(es)){_spread}")
+    _ag = health.get("agent") or {}
+    _ga = tool_report.get("guard_assisted")
+    if _ga is not None:
+        print(f"    Guard assistance     : {_ga}/{len(tool_report['queries'])} turns"
+              f" | unguarded accuracy {tool_report.get('model_only_accuracy', 0):.0%}"
+              f" | switches={_ag}")
     print(f"    Barge-in pass rate   : {barge_pass_rate:.0%}  (text={barge_text['passed']}, voice={barge_voice['passed']}, cross={barge_cross['passed']})")
     print(f"  PERFORMANCE (tool-accuracy queries, n={len(tool_report['queries'])})")
     print(f"    E2E       avg={perf['e2e_ms']['avg']:.0f}ms  p50={perf['e2e_ms']['p50']:.0f}ms  p95={perf['e2e_ms']['p95']:.0f}ms  min={perf['e2e_ms']['min']:.0f}  max={perf['e2e_ms']['max']:.0f}")
@@ -523,6 +552,8 @@ async def main():
             "stt_avg_cer": stt_report["avg_cer"],
             "stt_leading_word_trimmed_rate": stt_report["leading_word_trimmed_rate"],
             "tool_call_accuracy": tool_report["accuracy"],
+            "tool_call_accuracy_unguarded": tool_report.get("model_only_accuracy"),
+            "guard_assisted_turns": tool_report.get("guard_assisted"),
             "tool_call_accuracy_passes": tool_report.get("pass_accuracies") or [tool_report["accuracy"]],
             "barge_in_pass_rate": barge_pass_rate,
         },

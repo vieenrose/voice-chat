@@ -19,7 +19,8 @@ from qwen_agent.tools.base import BaseTool, register_tool
 import json
 import re
 
-from agent._shared import set_emit_target, emit as _emit, agent_call_lock
+from agent._shared import (set_emit_target, emit as _emit, agent_call_lock,
+                          guard as _guard, reset_guard_reason as _reset_guard)
 
 # --- agent sampling knobs -------------------------------------------------------
 # Tool-call routing on this 2B model is sampling-sensitive: the same 7-query set scored
@@ -265,6 +266,151 @@ def requires_fresh_facts(task: str) -> bool:
     return bool(task) and bool(_INCUMBENT_RE.search(task))
 
 
+_LOOKUP_REQUEST_RE = re.compile(
+    r"(幫我|幫忙|請|麻煩|能不能|可以)?\s*(找|查|搜|搜尋|搜索|查詢|查閱|看看|查)\s*(一下|下|過)?"
+    r"|(搜尋|搜索|查詢|查閱|找)\s*(一下|過)?\s*(今天|今日|最新|最近|這|那)?"
+    r"|(今天|今日|最新|最近)[^。？?！!]{0,10}(新聞|消息|頭條|头条|進展|进展|news)"
+    r"|\b(search|look\s?up|find\s+(?:out|me)|google|check\s+(?:the|for))\b"
+    r"|\b(what'?s|what is)\s+(the\s+)?(news|happening|new)\b"
+    r"|(any|some)\s+news\b", re.I)
+
+# A request, not a statement: "今天天氣不錯" (small talk) must not trigger a forecast call,
+# "東京今天天氣如何？" must.
+_WEATHER_REQUEST_RE = re.compile(
+    r"(天氣|天气|氣溫|气温|下雨|降雨|溫度|温度|forecast)"
+    r".{0,14}(如何|怎麼|怎么|怎样|怎樣|嗎|么|嗎？|\?|？|幾度|多少)|"
+    r"(如何|怎麼|怎么|怎樣|怎样).{0,10}(天氣|天气|氣溫|气温)|"
+    r"\b(weather|forecast|temperature|rain(ing)?|snow(ing)?)\b", re.I)
+
+
+def _preflight_enabled() -> bool:
+    """Turn the *steering* guards off to measure the model underneath them.
+
+    A pre-flight that invokes the tool the question already demands will, by
+    construction, make a benchmark that asks "did the tool run?" answer "yes". That makes
+    the routing number partly a measurement of this guard instead of the model, so it has
+    to be switchable and reported both ways: LLM_PREFLIGHT_TOOLS=0 answers with the real
+    router (and, measured, a third of news turns then answer from memory).
+    """
+    return os.getenv("LLM_PREFLIGHT_TOOLS", "1").strip().lower() not in ("0", "false", "no")
+
+
+def required_tool_for_request(task: str):
+    """The tool a request needs *by its own form*, independent of what the model feels like
+    doing. Returns a tool name or None.
+
+    This exists because the alternative is a coin flip: measured over 5 identical two-turn
+    voice sessions, "幫我找一下今天的新聞" produced a real web_search 4 times and, once,
+    the sentence "今天有新聞嗎？我來幫您搜尋一下。" — an announcement of a search that was
+    never performed, spoken to the user as the answer. A request that names the lookup in
+    its own wording does not need the model's permission.
+
+    Deliberately NOT included: weather. get_weather reliably gets called by the model
+    (measured), and forcing it from here would either duplicate the call or report the
+    wrong tool name — the pre-flight path reaches weather through web_search, and claiming
+    `get_weather` ran when `web_search` ran would make the benchmark lie.
+    """
+    if not task or not task.strip():
+        return None
+    t = task.strip()
+    if _LOOKUP_REQUEST_RE.search(t) or requires_fresh_facts(t):
+        return "web_search"
+    return None
+
+
+_EMPTY_REFUSAL_RE = re.compile(
+    r"(無法|无法|没能|沒有|没有|未|未能)"
+    r"[^。！？!?\n]{0,12}(取得|獲取|获取|拿到|查到|搜到|讀到|读到|提供|回報|回报|找到| searched)?"
+    r"[^。！？!?\n]{0,10}(資料|资讯|資訊|結果|结果|新聞|新闻|內容|内容|報導|报道|答案|解答|answer|result)"
+    r"|(找不到|查不到|搜不到|搜不出|查不出|沒有找到|没有查到)"
+    r"|(i|we)\s+(could\s?n.?t|cannot|can\s?n.?t)\s+(find|get|retrieve|access)", re.I)
+
+
+def _last_tool_result(all_resps) -> str:
+    """The longest `role=function` payload this turn produced — what the tools really
+    returned, independent of what the model decided to say about it."""
+    best = ""
+    for resp in all_resps or []:
+        for m in (resp if isinstance(resp, list) else [resp]):
+            if isinstance(m, dict) and m.get("role") == "function" and isinstance(m.get("content"), str):
+                if len(m["content"]) > len(best):
+                    best = m["content"]
+    return best
+
+
+def refuses_results_it_has(text: str, result_text: str, max_len: int = 90) -> bool:
+    """True when the answer claims it could not get the information that is sitting in
+    `result_text`. Length-capped on purpose: a genuine "I could not find X, but Y and Z
+    happened" answer is long and informative, while the refusal is short and empty."""
+    if not (result_text or "").strip():
+        return False
+    t = (text or "").strip()
+    if not t or len(t) > max_len:
+        return False
+    if "http" in t or result_headlines(result_text, limit=1):
+        pass                      # results exist; that is the precondition, not a filter
+    return bool(_EMPTY_REFUSAL_RE.search(t))
+
+
+_OFFER_RE = re.compile(
+    r"(我來|我將|我會|讓我|我可以|我應該|我這邊|需要我|要不要我|馬上為您|馬上幫你|立即)"
+    r"[^。！？!?\n]{0,10}(搜尋|搜索|查詢|查閱|查一下|检索|檢索|找資料|找一下|搜一下)"
+    r"|(有|有没有|有沒有)[^。！？!?\n]{0,8}(嗎|呢)[^。！？!?\n]{0,14}(搜尋|查|找)", re.I)
+_OFFER_EN_RE = re.compile(
+    r"\b(let me|i'?ll|i will|i can|i should|shall i)\s+(search|look\s?(it|that|this|you)?\s*up|check|find out)\b", re.I)
+
+
+def offers_action_without_doing_it(task: str, text: str, tool_ran: bool = False) -> bool:
+    """True when the answer *promises* a lookup that never happened.
+
+    Narrow on purpose: it only fires when the request's own form requires a lookup
+    (required_tool_for_request) and no tool actually ran, so a legitimate
+    "我可以幫你查天氣，要嗎？" answer to a vague remark is left alone."""
+    if tool_ran or not text:
+        return False
+    if required_tool_for_request(task) is None:
+        return False
+    return bool(_OFFER_RE.search(text) or _OFFER_EN_RE.search(text))
+
+
+_RESULT_LINE_RE = re.compile(r"^\s*(?:\[\d+\]|\d+[\.\)、])\s*(.+?)\s*$")
+
+
+def result_headlines(result: str, limit: int = 3) -> list:
+    """Titles out of a format_results() block ("[1] Title — src\nURL: …"). Shape-based."""
+    out = []
+    for line in (result or "").splitlines():
+        m = _RESULT_LINE_RE.match(line)
+        if not m:
+            continue
+        title = re.split(r"\s+[—–]\s+", m.group(1))[0].strip()
+        title = re.sub(r"^URL:\s*", "", title)
+        if title and not title.lower().startswith("http") and title not in out:
+            out.append(title)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def answer_from_results(text: str, result: str) -> str:
+    """Replace a promise to search with what the search actually found.
+
+    Used only when the model-with-results continuation also failed: saying nothing is the
+    failure being fixed, so a deterministic digest beats both an apology and silence. No
+    second LLM call — the same lesson the clock repair learned (qwen-agent reuses its
+    memory and reproduced the wrong answer)."""
+    keep = [seg for seg in re.split(r"(?<=[。！？!?\n])", text or "")
+            if seg.strip() and not (_OFFER_RE.search(seg) or _OFFER_EN_RE.search(seg))]
+    lead = "".join(keep).strip()
+    heads = result_headlines(result)
+    if not heads:
+        return lead or "我搜尋了，但沒有拿到可用的結果。"
+    cjk = any("\u4e00" <= c <= "\u9fff" for c in (text or ""))
+    body = "、".join(h[:44] for h in heads) if cjk else ", ".join(h[:44] for h in heads)
+    tail = f"查到的是：{body}。" if cjk else f"Here is what came up: {body}."
+    return (lead + " " if lead else "") + tail
+
+
 def _run_named_tool(name: str, task: str) -> str:
     """Execute a registered tool by name, deriving params from the user's request.
     The tools' own .call() emits the tool_call / tool_result events, so the UI sees
@@ -325,7 +471,7 @@ def _smalltalk_rule() -> str:
             "you cannot know: the current date/time, the weather, or a changing fact. ")
 
 
-def _make_agent():
+def _make_agent(function_list=None):
     import os
     _base = os.getenv("LLM_API_BASE", "http://127.0.0.1:11435/v1")
     # Prefer the live alias llm_manager actually has loaded (kept in sync across
@@ -367,17 +513,34 @@ def _make_agent():
     }
     return Assistant(
         llm=llm_cfg,
-        function_list=['web_search', 'get_weather', 'get_current_datetime'],
+        # `function_list or _TOOLS_FULL` would silently turn an INTENDED empty list
+        # back into the full tool set (an empty list is falsy) — which is exactly how
+        # the duplicate-search bug came back after being "fixed".
+        function_list=list(_TOOLS_FULL if function_list is None else function_list),
         system_message=("You are a helpful voice assistant." + _smalltalk_rule() + "For weather use get_weather(location, date) — 1 call max. For general search use web_search — 1 call max with 3-8 words, then answer. For date/time use get_current_datetime — 1 call max. Never do more than 2 tool calls per turn. Always default to Traditional Chinese (Taiwan usage, 繁體中文) regardless of what language the question was asked in — only keep English for proper nouns, technical terms, or vocabulary that doesn't translate well; never answer a whole sentence in Simplified Chinese or English."
         ),
     )
 
-_agent = None
-def _get_agent():
-    global _agent
-    if _agent is None:
-        _agent = _make_agent()
-    return _agent
+_TOOLS_FULL = ['web_search', 'get_weather', 'get_current_datetime']
+_agents: dict = {}
+
+
+def _get_agent(exclude=()):
+    """Cached Assistant per tool-set.
+
+    `exclude` exists because a pre-flight search must be *paired* with taking that tool
+    away for the turn. qwen-agent binds the tool list at construction and this version
+    exposes neither `max_function_calls` nor a per-call `function_list` override, so with
+    web_search still visible the model called it a second time on top of the result that
+    had just been injected for it — measured 2-3 searches per question and 8-11 s to
+    first audio. Dropping the tool that has already been satisfied is the one enforcement
+    mechanism available here, and it is honest: the results really are in context.
+    """
+    keep = [t for t in _TOOLS_FULL if t not in set(exclude)]
+    key = tuple(keep)
+    if key not in _agents:
+        _agents[key] = _make_agent(keep)
+    return _agents[key]
 
 def reset_agent():
     """Drop the cached Assistant so the next call rebuilds it — needed after
@@ -387,6 +550,7 @@ def reset_agent():
     app.py's POST /api/model handler."""
     global _agent
     _agent = None
+    _agents.clear()          # every cached tool-set variant, not just the default one
 
 async def run_agent_task(task: str, event_q=None, history=None) -> str:
     """Run one agent turn in a worker thread.
@@ -406,23 +570,46 @@ async def run_agent_task(task: str, event_q=None, history=None) -> str:
             # without ever consulting the model, which contradicted this repo's own
             # "no hard-coded cheating" rule and hid real first-token latency from any
             # benchmark that greeted first. The prompt already handles greetings.
+            # The Assistant for THIS turn. Swapped below when a pre-flight already
+            # satisfied one of the tools, so the model cannot call that tool twice.
+            _turn_agent = agent
             messages = hist + [{'role': 'user', 'content': task}]
-            if requires_fresh_facts(task):
+            # Measured both ways over 5 identical two-turn voice sessions:
+            #   incumbency-only  -> 2/5 news turns answered from memory (fabricated
+            #                       "news") and 1 said only "今天有幾則新聞報導。"
+            #   form-based       -> 5/5 searched, but the model searched again on top of
+            #                       the injected result (2-3 calls, 8-11 s first audio)
+            # so the form-based check stays, and the duplicate is removed structurally by
+            # running the turn on an agent whose web_search is already satisfied.
+            _preflight_tool = required_tool_for_request(task) if _preflight_enabled() else None
+            if _preflight_tool:
                 # A real invocation of a real tool (its own tool_call/tool_result events
                 # fire inside .call, so the UI and the benchmark see it) placed in context
                 # ahead of the answer. Nothing is invented here: if the search fails the
                 # messages are untouched and the model answers as it likes.
+                _gt = _guard("preflight_lookup", _preflight_tool,
+                            "the question asks for a lookup; it was run before the answer")
                 try:
-                    forced = _run_named_tool('web_search', task[:80])
+                    forced = _run_named_tool(_preflight_tool, task[:80])
                     if forced:
                         messages = messages + [
                             {'role': 'assistant', 'content': '',
                              'function_call': {'name': 'web_search', 'arguments': json.dumps({'query': task[:80]})}},
                             {'role': 'function', 'name': 'web_search', 'content': forced[:3000]},
                         ]
-                        logger.info("pre-flight web_search forced for an incumbency/latest question")
+                        # The tool it just satisfied is no longer offered for this turn.
+                        # Not just this tool — ALL of them. Leaving get_weather visible
+                        # made the model answer a news request with a weather report (it
+                        # wanted a tool to call, so it called the one it had). With the
+                        # lookup already in context this turn's job is to answer.
+                        _turn_agent = _get_agent(exclude=_TOOLS_FULL)
+                        logger.info(f"pre-flight {_preflight_tool} forced: the request asks for a lookup "
+                                    "(incumbency/latest fact, or an explicit search/news request); "
+                                    f"this turn runs with no tools (the lookup it needs is already in context)")
                 except Exception as e:
                     logger.warning(f"pre-flight search failed (answering without it): {e!r}")
+                finally:
+                    _reset_guard(_gt)
             all_resps = []
             # --- answer streaming (qwen-agent yields `response + partial_output` on
             # every LLM chunk, so the final step's content is available incrementally).
@@ -438,7 +625,7 @@ async def run_agent_task(task: str, event_q=None, history=None) -> str:
             abandoned = False
             with agent_call_lock:
                 run_kwargs = {"seed": int(LLM_AGENT_SEED)} if LLM_AGENT_SEED else {}
-                for resp in agent.run(messages=messages, **run_kwargs):
+                for resp in _turn_agent.run(messages=messages, **run_kwargs):
                     all_resps.append(resp)
                     if abandoned:
                         continue
@@ -487,6 +674,23 @@ async def run_agent_task(task: str, event_q=None, history=None) -> str:
                                for resp in all_resps for m in (resp if isinstance(resp, list) else [resp]))
                 missing = detect_unexecuted_tool(final_text, tool_ran)
                 must_regenerate = False
+                offered_lookup = False
+                if missing is None and not tool_ran and refuses_results_it_has(final_text, _last_tool_result(all_resps)):
+                    # A search ran and returned, and the answer was "抱歉，我無法獲取即時新聞。"
+                    # — the worst possible combination: the work is done and the user is
+                    # told it could not be. Speak what the tool actually found instead.
+                    logger.warning("tool ran but the answer refused its results — speaking the results")
+                    _gt = _guard("refusal_repair", "web_search",
+                                 "a tool returned data and the answer claimed there was none")
+                    final_text = answer_from_results(final_text, _last_tool_result(all_resps))
+                    _reset_guard(_gt)
+                    _emit({"type": "llm_delta", "text": "", "reset": True})
+                if missing is None and offers_action_without_doing_it(task, final_text, tool_ran):
+                    # "今天有新聞嗎？我來幫您搜尋一下。" — the promise IS the answer, and no
+                    # search ran. Run the lookup the request already asked for; the search
+                    # branch below hands the results back for a real answer.
+                    logger.warning("answer promised a lookup that never ran — executing it")
+                    missing, offered_lookup = "web_search", True
                 if missing is None and fabricates_time_without_tool(task, final_text, tool_ran):
                     # Splicing the true clock into "現在是下午 3 點 25 分" would leave the
                     # wrong claim standing next to the right one, so let the model rewrite
@@ -495,6 +699,9 @@ async def run_agent_task(task: str, event_q=None, history=None) -> str:
                     missing, must_regenerate = "get_current_datetime", True
                 if missing:
                     logger.warning(f"answer named {missing} without calling it — executing the tool it referenced")
+                    _why = ("clock_repair" if must_regenerate
+                            else "empty_promise_repair" if offered_lookup else "named_tool_repair")
+                    _gt = _guard(_why, missing, "the answer referred to a lookup it never performed")
                     result = _run_named_tool(missing, task)
                     repaired = ""
                     if result:
@@ -511,14 +718,19 @@ async def run_agent_task(task: str, event_q=None, history=None) -> str:
                                 {"role": "function", "name": missing, "content": result[:3000]},
                             ]
                             with agent_call_lock:
-                                for resp in agent.run(messages=cont, **run_kwargs):
+                                for resp in _turn_agent.run(messages=cont, **run_kwargs):
                                     lst = resp if isinstance(resp, list) else [resp]
                                     for m in lst:
                                         if (isinstance(m, dict) and m.get('role') == 'assistant'
                                                 and isinstance(m.get('content'), str) and m['content'].strip()):
                                             repaired = m['content']
                     if not repaired:
-                        if missing in ("web_search", "get_weather"):
+                        if offered_lookup:
+                            # For the empty-promise case a digest of the real results is
+                            # strictly better than an apology: the user asked for news and
+                            # news is in hand.
+                            repaired = answer_from_results(final_text, result)
+                        elif missing in ("web_search", "get_weather"):
                             # Continuing with the raw results did not produce a usable
                             # answer; splicing a results blob into a spoken sentence would
                             # be worse than admitting it.
@@ -529,6 +741,7 @@ async def run_agent_task(task: str, event_q=None, history=None) -> str:
                     # speak tool-name artifacts); the consumer replays this repaired text.
                     final_text = repaired
                     _emit({"type": "llm_delta", "text": "", "reset": True})
+                    _reset_guard(_gt)
                 return final_text
             # Fallback to memory (also filter empty)
             if hasattr(agent, 'memory') and agent.memory:

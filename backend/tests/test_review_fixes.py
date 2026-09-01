@@ -12,6 +12,7 @@ Run:  python3 -m unittest discover -s backend/tests -v     (stdlib only)
 import asyncio
 import inspect
 import os
+from unittest import mock
 import re
 import sys
 import time
@@ -132,13 +133,83 @@ class TestAuth(unittest.TestCase):
                             for p in ["/", "/index.html"]), "SPA paths must stay open")
         self.assertEqual(_client().get("/nope-not-an-api").status_code, 404)
 
-    def test_model_switch_loopback_only_without_token(self):
+    def _switch_ok(self):
+        """Stub the actual restart; the endpoint logic is what is under test."""
+        async def _fake(model_id):
+            return {"status": "ok", "model_id": model_id, "alias": model_id.replace("-q4", ""),
+                    "label": model_id}
+        return mock.patch.object(appmod.llm_manager, "switch_to", _fake)
+
+    def _reset_switch_state(self):
+        appmod._switch_state.update(at=0.0, peer="", model="")
+        appmod.stats["model_switches"].clear()
+
+    def test_open_mode_lets_the_operator_switch_from_their_own_device(self):
+        """The bug this replaces: "載入失敗：model switching requires VOICE_CHAT_TOKEN when
+        not on loopback". TestClient's peer is non-loopback exactly like a browser opened
+        over Tailscale/LAN, so the old loopback-only rule broke the model picker for the
+        person who owns the server — while a stranger with curl was never actually
+        stopped by anything that also stops the owner."""
         appmod.AUTH_TOKEN = None
-        r = _client().post("/api/model", json={"model_id": "qwen3.5-2b-q4"})
-        # TestClient's client host is "testclient", i.e. non-loopback
-        self.assertEqual(r.status_code, 403,
-                         "model switching must be refused to non-loopback callers with no token")
-        self.assertIn("loopback", r.json().get("error", ""))
+        appmod.MODEL_SWITCH_REQUIRE_TOKEN = False
+        self._reset_switch_state()
+        with self._switch_ok():
+            r = _client().post("/api/model", json={"model_id": "qwen3.5-2b-q4"})
+        self.assertEqual(r.status_code, 200, r.text)
+        hist = appmod.stats["model_switches"]
+        self.assertEqual(len(hist), 1, "the switch must be recorded")
+        self.assertTrue(hist[-1]["ok"] and hist[-1]["model"] == "qwen3.5-2b-q4")
+        self.assertTrue(hist[-1]["peer"], "it must be attributable")
+
+    def test_closed_mode_is_still_available_as_a_choice(self):
+        appmod.AUTH_TOKEN = None
+        appmod.MODEL_SWITCH_REQUIRE_TOKEN = True
+        self._reset_switch_state()
+        try:
+            r = _client().post("/api/model", json={"model_id": "qwen3.5-2b-q4"})
+            self.assertEqual(r.status_code, 403)
+            self.assertIn("remedy", r.json(), "a refusal must say what to do about it")
+            self.assertEqual(len(appmod.stats["model_switches"]), 0, "refused switches are not performed")
+        finally:
+            appmod.MODEL_SWITCH_REQUIRE_TOKEN = False
+
+    def test_switches_are_rate_limited_rather_than_blocked(self):
+        """Attribution is only honest if the log/history survives abuse; the abuse that
+        actually hurts is thrashing — every switch restarts llama-server for all sessions."""
+        appmod.AUTH_TOKEN = None
+        appmod.MODEL_SWITCH_REQUIRE_TOKEN = False
+        self._reset_switch_state()
+        with self._switch_ok():
+            c = _client()
+            first = c.post("/api/model", json={"model_id": "qwen3.5-2b-q4"})
+            second = c.post("/api/model", json={"model_id": "qwen3.5-0.8b-q8"})
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 429, "immediate re-switch must not restart the server twice")
+        j = second.json()
+        self.assertIn("retry_after_s", j)
+        self.assertGreater(j["retry_after_s"], 0)
+        self.assertEqual(len(appmod.stats["model_switches"]), 1, "the refused attempt must not be logged as a switch")
+
+    def test_a_configured_token_is_still_demanded(self):
+        appmod.AUTH_TOKEN = "sekret"
+        self._reset_switch_state()
+        try:
+            self.assertEqual(_client().post("/api/model", json={"model_id": "qwen3.5-2b-q4"}).status_code, 401)
+            with self._switch_ok():
+                ok = _client().post("/api/model", json={"model_id": "qwen3.5-2b-q4"},
+                                    headers={"X-Auth-Token": "sekret"})
+            self.assertEqual(ok.status_code, 200, ok.text)
+        finally:
+            appmod.AUTH_TOKEN = None
+
+    def test_unknown_model_id_is_rejected_before_any_restart(self):
+        appmod.AUTH_TOKEN = None
+        self._reset_switch_state()
+        with self._switch_ok():
+            r = _client().post("/api/model", json={"model_id": "gpt-99"})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("available", r.json())
+        self.assertEqual(len(appmod.stats["model_switches"]), 0)
 
     def test_websocket_rejected_without_token(self):
         appmod.AUTH_TOKEN = "sekret"
@@ -1575,6 +1646,117 @@ class TestShipFilesAreValid(unittest.TestCase):
         self.assertTrue(base, "voice-chat no longer sets LLM_API_BASE; the image default would be used")
         host = re.search(r"https?://([^:/\s]+):", base[0]).group(1)
         self.assertIn(host, doc["services"])
+
+
+class TestLookupRequestIsNotOptional(unittest.TestCase):
+    """Measured over 5 identical two-turn voice sessions: "幫我找一下今天的新聞" produced a
+    real web_search 4/5 times, and once produced "今天有新聞嗎？我來幫您搜尋一下。" — the
+    announcement of a search that was never performed, delivered as the answer. A request
+    that contains the lookup in its own wording should not depend on the model's mood."""
+
+    def _req(self, task):
+        from agent.qwen_harness import required_tool_for_request
+        return required_tool_for_request(task)
+
+    def test_explicit_lookup_requests_require_the_call(self):
+        for t in ("幫我找一下今天的新聞", "請幫我查一下台積電股價", "搜尋一下最新的AI進展",
+                  "Search for the latest news about artificial intelligence",
+                  "What's the news today?", "any news on the election?",
+                  "Who is the president of France?"):
+            self.assertEqual(self._req(t), "web_search", t)
+
+    def test_small_talk_and_statements_require_nothing(self):
+        for t in ("餵你好", "Hi there!", "Hello, how are you today?", "謝謝", "你今天看起來不錯",
+                  "今天天氣不錯", "我們聊一下吧", ""):
+            self.assertIsNone(self._req(t), t)
+
+    def test_a_date_question_does_not_become_a_web_search(self):
+        # The clock has its own verified path; forcing a search here would replace the
+        # wrong answer with a different wrong answer.
+        for t in ("今天是星期幾？", "What time is it right now?", "現在幾點了"):
+            self.assertIsNone(self._req(t), t)
+
+    def test_weather_is_deliberately_out_of_scope(self):
+        # Forcing weather from here would report the wrong tool name (the pre-flight
+        # reaches weather through web_search), which makes the benchmark lie.
+        self.assertIsNone(self._req("What is the weather in Tokyo today?"))
+
+    def _offer(self, task, text, tool_ran=False):
+        from agent.qwen_harness import offers_action_without_doing_it
+        return offers_action_without_doing_it(task, text, tool_ran)
+
+    def test_the_promise_instead_of_the_search_is_detected(self):
+        task = "幫我找一下今天的新聞"
+        self.assertTrue(self._offer(task, "今天有新聞嗎？我來幫您搜尋一下。"))
+        self.assertTrue(self._offer(task, "好的，我可以幫你查詢最新的新聞內容。"))
+        self.assertTrue(self._offer("What's the news today?", "Let me search for that."))
+        self.assertTrue(self._offer("What's the news today?", "I will look it up for you."))
+
+    def test_a_real_search_or_a_vague_remark_is_left_alone(self):
+        self.assertFalse(self._offer("幫我找一下今天的新聞", "我來幫您搜尋一下。", tool_ran=True),
+                         "the bug is the promise without the call, not the wording")
+        self.assertFalse(self._offer("我們聊一下吧", "我可以幫你查天氣，要嗎？"),
+                         "no lookup was requested, so the offer is a legitimate reply")
+        self.assertFalse(self._offer("幫我找一下今天的新聞", "今日主要新聞如下：颱風沙德爾復活。"))
+
+    def test_digest_uses_real_headlines_and_drops_the_promise(self):
+        from agent.qwen_harness import answer_from_results, result_headlines
+        blob = ("[1] 沙德爾颱風復活 氣象署：2天恐影響台灣 — 自由時報\n"
+                "URL: https://www.freedom.example/a\nDate/Snippet: …\n"
+                "[2] 新學年幼兒入學面談進行 — 中央社\nURL: https://www.cna.example/b\n")
+        self.assertEqual(result_headlines(blob),
+                         ["沙德爾颱風復活 氣象署：2天恐影響台灣", "新學年幼兒入學面談進行"])
+        out = answer_from_results("今天有新聞嗎？我來幫您搜尋一下。", blob)
+        self.assertNotIn("我來幫您搜尋", out)
+        self.assertIn("沙德爾颱風復活", out)
+        self.assertNotIn("http", out, "a spoken answer must not contain URLs")
+
+    def test_digest_handles_an_empty_search_honestly(self):
+        from agent.qwen_harness import answer_from_results
+        out = answer_from_results("我來幫您搜尋一下。", "")
+        self.assertTrue(out.strip())
+        self.assertNotIn("我來幫您搜尋", out)
+        self.assertIn("沒有", out)
+
+    def test_the_three_repairs_are_wired_and_the_turn_agent_is_the_one_that_runs(self):
+        """Shape check on the control flow, because both halves of this have already been
+        broken once each: the repair defined but never called (the detector sat unused
+        while the promise went to the speaker), and the pre-flight re-binding `agent` in
+        an inner function so the turn still ran on the unrestricted tool set — the
+        duplicate search came right back."""
+        import ast
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "agent", "qwen_harness.py")
+        with open(path, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        run_fn = next(n for n in ast.walk(tree)
+                      if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "_run")
+        called, run_receivers = set(), set()
+        for sub in ast.walk(run_fn):
+            if isinstance(sub, ast.Call):
+                called.add(getattr(sub.func, "attr", "") or getattr(sub.func, "id", ""))
+                if getattr(sub.func, "attr", "") == "run" and isinstance(sub.func.value, ast.Name):
+                    run_receivers.add(sub.func.value.id)
+        for needed in ("offers_action_without_doing_it", "refuses_results_it_has",
+                       "required_tool_for_request", "answer_from_results", "_get_agent"):
+            self.assertIn(needed, called, f"{needed} is not called from the turn loop")
+        self.assertIn("_turn_agent", run_receivers, "the turn must run on the possibly-restricted agent")
+        self.assertNotIn("agent", run_receivers,
+                         "agent.run() still uses the unrestricted instance — duplicate search returns")
+
+    def test_searched_then_refused_becomes_the_real_headlines(self):
+        from agent.qwen_harness import refuses_results_it_has
+        blob = ("[1] 沙德爾颱風復活 — 自由時報\nURL: https://a.example\n"
+                "[2] 護照排名出爐 — 中央社\nURL: https://b.example\n")
+        self.assertTrue(refuses_results_it_has("抱歉，我無法獲取即時新聞。抱歉！", blob))
+        self.assertTrue(refuses_results_it_has("我沒有查到相關的資料。", blob))
+        self.assertFalse(refuses_results_it_has("今日主要新聞：沙德爾颱風復活，氣象署示警。", blob),
+                         "a real answer must never be replaced by a digest")
+        self.assertFalse(refuses_results_it_has("抱歉，我無法獲取即時新聞。", ""),
+                         "nothing came back: there is nothing to speak, so leave the apology")
+        long_answer = ("無法提供完整報導，不過今天有三則新聞值得注意：" + "內容較長，" * 20)
+        self.assertFalse(refuses_results_it_has(long_answer, blob),
+                         "a long answer that hedges and still informs is not a refusal")
 
 
 class TestThinkingTextNeverGetsSpoken(unittest.TestCase):

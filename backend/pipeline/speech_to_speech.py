@@ -15,6 +15,8 @@ from typing import AsyncGenerator, Awaitable, Callable, Optional
 from loguru import logger
 import numpy as np
 
+from tts.spoken_text import normalize as _normalize_spoken_text   # stdlib-only, no engine deps
+
 
 # Text that is tool plumbing rather than speech must never reach the speaker. One case is
 # not XML: a small model "calling" a tool by printing its name and then answering
@@ -154,6 +156,21 @@ if not HF_OFFICIAL:
                     from tts.mock_streaming import SAMPLE_RATE as TTS_SR
                     TTS_NAME = "MOCK"
                     print(f"[TTS] Using MOCK TTS adapter (tone audio; VoxCPM unavailable: {e_vx})")
+
+def prepare_tts_text(text: str) -> tuple[str, list[str]]:
+    """The one text front-end every TTS call must go through.
+
+    Chat models write markdown; acoustic models are trained on read speech. Sending
+    `**\u53f0\u98a8**` or `68%` straight to the TTS is what produced the measured 112%/65% CER on the
+    mixed-script and markdown categories (see tts/spoken_text.py). Returning the applied
+    rule names keeps it auditable: a log line or a report can say *why* the spoken text
+    differs from the text bubble, instead of looking like the assistant said something else.
+
+    Display text is never replaced: callers synthesize the returned string but still show
+    the original to the user.
+    """
+    return _normalize_spoken_text(text)
+
 
 class HFSpeechToSpeechPipeline:
     """
@@ -328,8 +345,13 @@ class HFSpeechToSpeechPipeline:
 
             async def synth_and_emit(text_to_synth: str):
                 nonlocal first_tts_t, tts_ttfb, first_chunk_of_turn
+                spoken, applied = prepare_tts_text(text_to_synth)
+                if applied:
+                    logger.debug(f"tts text front-end {applied}: {text_to_synth[:50]!r} -> {spoken[:50]!r}")
+                if not spoken:
+                    return
                 t0 = time.time()
-                async for pcm_chunk in self.tts.synthesize_streaming(text_to_synth):
+                async for pcm_chunk in self.tts.synthesize_streaming(spoken):
                     # A barge-in means STOP consuming, not skip-and-keep-draining:
                     # `continue` here kept pulling chunks and made the TTS worker
                     # synthesize the entire rest of the sentence purely to discard it
