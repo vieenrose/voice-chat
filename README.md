@@ -1,6 +1,6 @@
 # Voice Chat — Streaming Speech-to-Speech with Tools
 
-**X-ASR-int8 → Qwen3.5-2B UD-Q4_K_XL+MTP (Qwen-Agent) → Qwen3-TTS.** Real models, no mocks, low latency.
+**X-ASR-int8 → Qwen3.5-2B UD-Q8_K_XL (Qwen-Agent) → Qwen3-TTS.** Real models, no mocks, low latency.
 
 A full-duplex voice chat demo: speak, interrupt it mid-sentence by voice *or* text, search the
 web, and hear the answer. **Traditional Chinese (Taiwan) by default** — input and output are
@@ -19,7 +19,7 @@ Mic 16k ─► endpoint detect ─► STT (X-ASR int8, 160ms) ─► LLM (Qwen3.
 |---|---|---|
 | **Turn-taking** | sherpa-onnx rule-based endpointing | trailing-silence rules drive `stt_final`; no separate VAD |
 | **STT** | `GilgameshWind/X-ASR-zh-en` int8 | Zipformer, 160 ms streaming, 146 M encoder, zh+en 16 k, CUDA |
-| **LLM** | `Qwen/Qwen3.5-2B` UD-Q4_K_XL + MTP (default) | llama-server `:11435`, `-c 16384`, thinking on, 3 tools. Switchable at runtime — see below |
+| **LLM** | `Qwen/Qwen3.5-2B` UD-Q8_K_XL (default) | llama-server `:11435`, `-c 16384`, thinking on, 3 tools. Switchable at runtime — see below |
 | **Embedding** | `granite-embedding-97m-multilingual` Q8_0 | 384 d, zh-TW+en, `:11434`, semantic rerank for paraphrases |
 | **TTS** | `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` Q8_0 | GGML CUDA via `qwentts-cpp-python`, true streaming, 24 k, ~20 ms TTFA |
 | **Search** | SearXNG `:8888` + wttr.in + Bing scrape | 180 engines, real results only — no curated mocks |
@@ -65,9 +65,9 @@ llama-server -m granite-embedding-97M-multilingual-r2-Q8_0.gguf \
 
 # 2) LLM — optional: the backend spawns and owns this itself if :11435 is free,
 #    or adopts it if you start it first (backend/llm_manager.py)
-llama-server -m /home/user/llms/mtp/Qwen3.5-2B-UD-Q4_K_XL.gguf \
+llama-server -m /home/user/llms/mtp/Qwen3.5-2B-UD-Q8_K_XL.gguf \
   --host 127.0.0.1 --port 11435 -c 16384 --alias qwen3.5-2b --n-gpu-layers 99 --jinja \
-  --reasoning-format deepseek --spec-type draft-mtp --spec-draft-n-max 3
+  --reasoning-format deepseek
 
 # 3) Search
 SEARXNG_SETTINGS_PATH=/tmp/searxng/settings.yml python3 -m searx.webapp   # :8888
@@ -82,7 +82,7 @@ cd frontend && npm install && npm run dev       # http://localhost:5173
 
 Model files (mount as volumes under Docker):
 
-- LLM `/home/user/llms/mtp/Qwen3.5-2B-UD-Q4_K_XL.gguf` · Embedding `/tmp/granite-emb-gguf/…Q8_0.gguf`
+- LLM `/home/user/llms/mtp/Qwen3.5-2B-UD-Q8_K_XL.gguf` · Embedding `/tmp/granite-emb-gguf/…Q8_0.gguf`
 - TTS `/tmp/qwen3_tts/talker_cv_q8.gguf` + `codec.gguf` · STT `/tmp/XASR/deployment/models/chunk-160ms-model/`
 - SearXNG `/tmp/searxng/settings.yml`
 
@@ -117,7 +117,7 @@ docker compose up -d --build     # UI at http://localhost:8000
 |---|---|
 | STT accuracy | 100 %, CER 0.000 (`asr_example.wav`, 5 runs) |
 | First audio — plain turn | 0.4–2.0 s |
-| First audio — tool turn | 1.0–3.6 s (bounded by the search round-trip) |
+| First audio — tool turn | 1.9–8.3 s (search round-trip plus Q8 decode; ~5 s on a Q4 build) |
 | LLM TTFT (p50) | 0.05–0.58 s |
 | TTS TTFB (p50) | 0.34–0.88 s |
 | E2E (p50 / max) | 1.3–2.7 s / 7–19 s (whole answer synthesized, so it scales with length) |
@@ -137,32 +137,36 @@ above is a spread. Fix `LLM_AGENT_SEED` to compare builds.
 | thinking off | 71 % | 56 ms | fast, clean, and invented: weather never looked up |
 | thinking + `--reasoning-format deepseek` | **83 %** | **53–576 ms** | answers only |
 
-**Choosing the quantization.** Three builds of the same two models, measured rather than
-argued (matrix = the four UI demo prompts across both sizes, 8 runs, checked for tool routing,
+**Choosing the quantization.** Four builds of the same two models, measured rather than argued
+(matrix = the four UI demo prompts across both sizes, 8 runs, checked for tool routing,
 reasoning kept out of speech and transcript, no repeats, zh-TW):
 
 | Build | 2B tok/s | 4B tok/s | matrix | |
 |---|---|---|---|---|
-| Q4_K_M | 172 | 87 | 4/8 | the previous default |
+| Q4_K_M | 172 | 87 | 4/8 | the original default |
 | IQ4_XS | 175 | 94 | **2/8** | rejected |
-| **UD-Q4_K_XL + MTP** | **174** | **102** | **6/8** | current |
+| UD-Q4_K_XL + MTP | 174 | 102 | 6/8 | fastest |
+| **UD-Q8_K_XL** | **100** | — | 5/8 | **current** |
 
-(The quant scores were all taken before the replay bug below was fixed, which was
-suppressing every build equally; the 6/8 is the same weights measured after it.)
+Read this table for what it does *not* show. **Q8 costs ~40 % of the throughput and did not buy
+a measurable quality gain** — 5/8 against 6/8 is well inside the run-to-run noise of a
+temperature-0.7 benchmark, and first audio on a 4B tool turn goes from ~5 s to 6.5–8.3 s. It is
+the current default because precision at the weights is worth having on principle; if turn
+latency matters more to you, UD-Q4_K_XL+MTP is the faster pick at the same measured quality.
 
-IQ4_XS is the cautionary one: faster on paper and lighter on VRAM, but it halved the matrix
-score and *every* failure was a repeated sentence — the signature of over-quantization rather
-than sampling noise. UD (Unsloth Dynamic) instead spends ~5 % more file on keeping the
-quantization-sensitive layers precise, and holds the baseline score.
+IQ4_XS is the one clear result: faster on paper and lighter on VRAM, it *halved* the score, and
+every failure was a repeated sentence — the signature of real quantization damage rather than
+sampling noise. UD (Unsloth Dynamic) spends its extra bits on the quantization-sensitive layers
+instead of spreading them evenly, and holds the baseline.
 
-MTP is free speed on top: the weights carry NextN layers, the model drafts its own next tokens
-and the target model verifies them, so accepted drafts are the tokens that would have been
-produced anyway. Verified, not assumed — at temperature 0 the same weights emit **byte-identical
-text** with and without it, while 4B goes 84.6 → 101.9 tok/s (+20 %). Bigger models gain more.
-`LLM_MTP=0` opts out; the `--spec-type` flag is probed, so a build without it still starts.
+(Scores predating the replay bug below were suppressed equally across every build; 6/8 and 5/8
+are post-fix.)
 
-2B and 4B score the same and fail the same way — a sentence repeated in the news answer. 2B is
-the default: same quality, ~1.7x the throughput.
+**MTP is available but off.** The registered weights are the MTP builds — they carry the NextN
+layers — while `_mtp_args()` adds nothing unless an entry sets `"mtp": True`. The ~120 MB the
+layers cost buys the option: enabling self-speculative decoding later is a one-key change, not
+a 9 GB re-download. Measured on Q4 weights it was byte-identical at temperature 0 and +20 % on
+4B, but that was two prompts, which is thinner evidence than it first appeared.
 
 If you want a turn to feel faster, the thinking budget and the search round-trip are where the
 seconds are — not the model size. First audio is 1.0–3.6 s on a tool turn, of which decode is a
