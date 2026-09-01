@@ -803,8 +803,17 @@ class LingStreaming:
         # an XML tool-call appears, or a tool step interleaved), so compare on the
         # common prefix rather than assuming they match.
         if any_streamed:
+            # Compare like with like. `final_text` has just been whitespace-collapsed
+            # (and leakage-stripped) above, while `streamed` is the raw delta text — so
+            # comparing them directly diverged at the first newline. Answers routinely
+            # begin with one, which made `common` 0 and `_tail` the WHOLE answer: every
+            # streamed reply was then re-emitted in full, once with its original line
+            # breaks and once collapsed onto a single line. That is the duplicate that
+            # showed up on every model and quantization tested and was read as a
+            # small-model repetition artifact; it was this.
+            streamed_cmp = " ".join(streamed.split())
             common = 0
-            for a, b in zip(streamed, final_text, strict=False):
+            for a, b in zip(streamed_cmp, final_text, strict=False):
                 if a != b:
                     break
                 common += 1

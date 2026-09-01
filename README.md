@@ -145,7 +145,10 @@ reasoning kept out of speech and transcript, no repeats, zh-TW):
 |---|---|---|---|---|
 | Q4_K_M | 172 | 87 | 4/8 | the previous default |
 | IQ4_XS | 175 | 94 | **2/8** | rejected |
-| **UD-Q4_K_XL + MTP** | **174** | **102** | **4/8** | current |
+| **UD-Q4_K_XL + MTP** | **174** | **102** | **6/8** | current |
+
+(The quant scores were all taken before the replay bug below was fixed, which was
+suppressing every build equally; the 6/8 is the same weights measured after it.)
 
 IQ4_XS is the cautionary one: faster on paper and lighter on VRAM, but it halved the matrix
 score and *every* failure was a repeated sentence — the signature of over-quantization rather
@@ -202,6 +205,17 @@ Three repair guards catch answers that assert things nothing verified: a tool th
 Each runs the real tool — its own events, so the repair is visible in the UI — and either
 splices the value in or takes one corrective turn. A pre-flighted tool counts as a tool that
 ran; treating it otherwise made the guards call everything a second time.
+
+**Nothing is said twice.** The harness streams its answer deltas live, then reconciles them
+against the authoritative final text and speaks only the remainder — a common-prefix
+comparison. It was comparing the raw streamed text against a `final_text` that had already
+been whitespace-collapsed, so an answer opening with a newline (most of them) broke the
+prefix at character 0 and the "remainder" became the entire answer. Every streamed reply was
+emitted twice: once with its line breaks, once flattened onto one line. This survived a long
+time because the audio was fine — `SpokenGuard` refuses to speak a repeat — so only the
+transcript showed it, and it was read as small-model repetition. It is on every model and
+every quantization because it is arithmetic. Both sides are normalized before comparing now
+(`tests/test_stream_replay.py`).
 
 **Markdown is not speech.** Chat models emit `**bold**`, and handing that to an acoustic model
 produced 65 % CER on those sentences. `tts/spoken_text.py` is the single front-end for both TTS
