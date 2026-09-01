@@ -61,19 +61,23 @@ MODEL_REGISTRY: dict[str, dict] = {
     # "ling": the agent harness matches on it to switch to Ling's tool-call dialect
     # (llm/ling_fncall.py), which is a different syntax from the JSON one Qwen emits.
     #
-    # MXFP4 rather than a K-quant: it is the 4-bit block format designed for MoE expert
-    # tensors (and the one llama.cpp ships tuned CUDA kernels for), so at equal size it
-    # spends its bits better than Q4_K_M/Q5_K_M do on the same weights. The _BF16 build
-    # keeps attention and embeddings at 16-bit and quantizes only the experts: 5.60 GB,
-    # essentially Q5_K_M's 5.72 GB. Plain MXFP4_MOE is 4.88 GB if you want the headroom.
+    # IQ4_XS, chosen by measurement. MXFP4 looked like the principled pick — it is the
+    # block format designed for MoE experts, with tuned CUDA kernels — but measured on
+    # this box the i-quant is simply better on every axis: 148 tok/s against MXFP4_MOE_BF16's
+    # 108 (+38%), 6.9 GB of VRAM against 7.9, 4.39 GB on disk against 5.60, and the same
+    # 3/4 on the four UI prompts with the same single failure. Format theory lost to the
+    # stopwatch.
     #
-    # Not Q8_0, which is what was originally wanted: 6.2 GB of this 12 GB card is already
-    # held by TTS+STT (2.4 GB), the embedding server and the LLM slot, so freeing the LLM
-    # leaves ~9.0 GB, and Q8_0 is 8.41 GB of weights before any KV cache — it either OOMs
-    # or leaves the TTS process nothing to grow into.
+    # Not Q8_0 (8.41 GB), which is what was originally wanted: 6.2 GB of this 12 GB card
+    # is already held by TTS+STT, the embedding server and the LLM slot, so freeing the
+    # LLM leaves ~9.0 GB — Q8_0 is that much before any KV cache.
+    #
+    # NOTE: not under /tmp like the other entries. /tmp here is tmpfs AND carries a
+    # filesystem quota that aborts multi-GB writes partway ("Disk quota exceeded"),
+    # which is what defeated three attempts to put this file there.
     "ling-3.0-tiny": {
-        "label": "Ling 3.0 tiny MXFP4 MoE",
-        "path": os.getenv("LLM_PATH_LING", "/tmp/llms/Ling-3.0-tiny-MXFP4_MOE_BF16.gguf"),
+        "label": "Ling 3.0 tiny IQ4_XS (MoE)",
+        "path": os.getenv("LLM_PATH_LING", "/home/user/llms/Ling-3.0-tiny-IQ4_XS.gguf"),
         "alias": "ling-3.0-tiny",
     },
 }
