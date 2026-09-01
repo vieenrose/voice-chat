@@ -35,3 +35,13 @@ workspace/
 *.log
 .idea/
 .vscode/
+
+# Debug exports produced while running the demo, not source.
+# The UI's "export conversation" button drops conversation-*.json into the repo root
+# every time it is used, and a pi/agent session export is several MB of HTML.
+conversation-*.json
+pi-session-*.html
+
+# Local endpoint notes: contains a tailnet address and records that the service runs
+# with no auth configured. Keep it out of a public remote.
+qwen3.8-flash-next-pi-agent-setup.md

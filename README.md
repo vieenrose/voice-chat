@@ -161,17 +161,25 @@ above is a spread. Fix `LLM_AGENT_SEED` to compare builds.
 | thinking off | 71 % | 56 ms | fast, clean, and invented: weather never looked up |
 | thinking + `--reasoning-format deepseek` | **83 %** | **53–576 ms** | answers only |
 
-**Decode throughput** (220-token answer, same prompt, median of 3):
+**Decode throughput and quality** (220-token answer, median of 3; matrix = the four UI demo
+prompts, checked for tool routing, reasoning kept out of speech and transcript, no repeats,
+zh-TW):
 
-| Model | tok/s | wall |
-|---|---|---|
-| 0.8B q8 *(removed)* | 236 | 0.97 s |
-| **2B Q4_K_M** | **172** | **1.31 s** |
-| 4B Q4_K_M | 87 | 2.60 s |
+| Model | tok/s | wall | matrix |
+|---|---|---|---|
+| 0.8B q8 *(removed)* | 236 | 0.97 s | 1/4 |
+| **Qwen3.5 2B Q4_K_M** | **172** | **1.31 s** | **3/4** |
+| Ling 3.0 tiny IQ4_XS | 148 | 1.55 s | 3/4 |
+| Qwen3.5 4B Q4_K_M | 87 | 2.60 s | 3/4 |
 
-Across the four UI demo prompts, 2B and 4B pass every check; 0.8B did not, which is why it is
-gone (see above). If you want a turn to feel faster, the thinking budget and the search
-round-trip are where the seconds are — not the model size.
+2B, 4B and Ling all score the same and fail the same way — a sentence repeated in the news
+answer. Ling additionally drifts into Simplified Chinese more than Qwen does (`湿度` for 濕度,
+`阵雨` for 陣雨); the display layer's OpenCC pass covers it and pronunciation is unaffected, but
+it is a real zh-TW adherence gap. 2B stays the default on speed.
+
+If you want a turn to feel faster, the thinking budget and the search round-trip are where the
+seconds are — not the model size. First audio is 1.0–3.6 s on a tool turn, of which decode is a
+fraction.
 
 ## Design notes
 
