@@ -47,32 +47,31 @@ LLM_SEED = int(os.getenv("LLM_SEED", "-1"))
 # tool template, quoted the prompt back, or repeated itself — each needing another
 # filter. Unquantized f16 scored the same as q8, so this is capacity, not quantization.
 MODEL_REGISTRY: dict[str, dict] = {
-    # UD-Q8_K_XL, no MTP. UD (Unsloth Dynamic) keeps the quantization-sensitive layers at
-    # higher precision instead of applying one bit-width everywhere; at Q8 the whole model
-    # is already well clear of the range where quantization damage shows up, which is the
-    # point of coming here from Q4.
+    # UD-Q4_K_XL. UD (Unsloth Dynamic) spends its extra bits on the quantization-sensitive
+    # layers rather than raising every layer's bit-width, which is what separates it from
+    # both Q4_K_M and IQ4_XS at a comparable size.
     #
-    # The route to this was instructive. IQ4_XS looked like the upgrade — faster and
-    # lighter than Q4_K_M — and scored 2/8 on the four UI prompts against Q4_K_M's 4/8,
-    # every failure a repeated sentence. Q4_K_XL held the baseline. Q8 buys precision with
-    # throughput: expect roughly half the tokens/s of a Q4 build, against a turn where
-    # first audio is dominated by the search round-trip and TTS rather than decode.
+    # Measured on the four UI prompts across both sizes (8 runs): Q4_K_M 4/8, IQ4_XS 2/8,
+    # UD-Q4_K_XL 6/8, UD-Q8_K_XL 5/8. IQ4_XS was the instructive failure — faster and
+    # lighter, but every one of its extra failures was a repeated sentence, which is real
+    # quantization damage rather than sampling noise. Q8 cost ~40% of the throughput
+    # (100 vs 174 tok/s on 2B) and bought nothing measurable over Q4_K_XL, so the speed
+    # is worth more here: first audio on a tool turn went 6.5-8.3s at Q8 against ~5s.
     #
-    # These are the MTP builds, carrying the NextN layers, but "mtp" is NOT set below so
-    # _mtp_args() adds nothing and they decode exactly like the plain weights. The ~120 MB
-    # the extra layers cost buys the option: turning self-speculative decoding on later is
-    # a one-key change here rather than a 9 GB re-download. It is off because the evidence
-    # for it being lossless — byte-identical greedy output, +20% on 4B — came from two
-    # prompts at temperature 0, which is thinner than it first looked, and the point of
-    # moving to Q8 was precision.
+    # These are the MTP builds, carrying the NextN layers, but "mtp" is NOT set so
+    # _mtp_args() adds nothing and they decode exactly like the plain weights. The ~60 MB
+    # the layers cost buys the option: turning self-speculative decoding on is a one-key
+    # change here rather than a re-download. It stays off because the case for it being
+    # lossless rests on byte-identical greedy output over two prompts at temperature 0,
+    # which is thinner evidence than it first appeared.
     "qwen3.5-2b-q4": {
-        "label": "Qwen3.5 2B UD-Q8_K_XL",
-        "path": os.getenv("LLM_PATH_2B", "/home/user/llms/mtp/Qwen3.5-2B-UD-Q8_K_XL.gguf"),
+        "label": "Qwen3.5 2B UD-Q4_K_XL",
+        "path": os.getenv("LLM_PATH_2B", "/home/user/llms/mtp/Qwen3.5-2B-UD-Q4_K_XL.gguf"),
         "alias": "qwen3.5-2b",
     },
     "qwen3.5-4b-q4": {
-        "label": "Qwen3.5 4B UD-Q8_K_XL",
-        "path": os.getenv("LLM_PATH_4B", "/home/user/llms/mtp/Qwen3.5-4B-UD-Q8_K_XL.gguf"),
+        "label": "Qwen3.5 4B UD-Q4_K_XL",
+        "path": os.getenv("LLM_PATH_4B", "/home/user/llms/mtp/Qwen3.5-4B-UD-Q4_K_XL.gguf"),
         "alias": "qwen3.5-4b",
     },
 }
