@@ -30,10 +30,21 @@ libraries installed; `/health` reports `mock` when a rung is reached.
 
 ### Switchable models
 
-`qwen3.5-2b-q4` (default) and `qwen3.5-4b-q4`, selectable from the UI's Model card or
-`POST /api/model`. Only one is loaded at a time — VRAM on a 12 GB card is tight with embedding
-+ TTS + STT resident. **Bare-metal only**: the compose setup runs the LLM in a fixed sibling
-container.
+`qwen3.5-2b-q4` (default), `qwen3.5-4b-q4` and `qwen3.6-35b-a3b-q4`, selectable from the UI's
+Model card or `POST /api/model`. Only one is loaded at a time — VRAM on a 12 GB card is tight
+with embedding + TTS + STT resident. **Bare-metal only**: the compose setup runs the LLM in a
+fixed sibling container.
+
+**Qwen3.6 35B-A3B runs by keeping its experts in system RAM.** 35B total parameters, ~3B active
+per token: far too large for a 12 GB card outright, but the experts are the bulk of the weights
+and are touched sparsely, so `"cpu_moe": True` sends them to DRAM via llama-server's `--cpu-moe`
+while attention, embeddings and the KV cache stay on the GPU. `LLM_CPU_MOE_LAYERS=N` switches to
+`--n-cpu-moe N` to offload only the first N layers, trading VRAM headroom back for speed. Expect
+it to be markedly slower than the 2B/4B entries — the point is running the model at all.
+
+It is registered but **not downloaded**: UD-Q4_K_M is 22.66 GB on disk and wants comparable RAM
+for the offloaded experts on top. `/health` reports `exists: false` and the UI greys it out
+until `LLM_PATH_35B` points at a real file.
 
 **Two models that were evaluated and dropped**, so the same ground isn't retrodden:
 

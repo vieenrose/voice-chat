@@ -76,6 +76,22 @@ MODEL_REGISTRY: dict[str, dict] = {
         "alias": "qwen3.5-4b",
         "mtp": True,
     },
+    # Qwen3.6 35B-A3B: 35B total, ~3B active per token. Far too large for a 12 GB card
+    # outright, so "cpu_moe" sends the expert tensors to system RAM (see
+    # _moe_offload_args) and leaves attention, embeddings and the KV cache on the GPU.
+    # The experts are the bulk of the weights and are touched sparsely, which is what
+    # makes them the right thing to pay host-memory bandwidth for. Expect it to be
+    # markedly slower than the 2B/4B entries — this is about running the model at all.
+    #
+    # Not downloaded by default: Q4_K_M is 22.66 GB, and it needs the RAM for the
+    # offloaded experts on top of that. /health reports exists=false and the UI greys it
+    # out until LLM_PATH_35B points at a real file.
+    "qwen3.6-35b-a3b-q4": {
+        "label": "Qwen3.6 35B-A3B UD-Q4_K_M (experts in RAM)",
+        "path": os.getenv("LLM_PATH_35B", "/home/user/llms/mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"),
+        "alias": "qwen3.6-35b-a3b",
+        "cpu_moe": True,
+    },
 }
 # Ling 3.0 tiny (bailingmoe3 MoE) was evaluated here and dropped. At IQ4_XS it scored the
 # same 3/4 on the four UI prompts as 2B, but ran slower (148 tok/s vs 172), used more VRAM
@@ -173,6 +189,32 @@ class LLMServerManager:
             return []
         return ["--spec-type", "draft-mtp", "--spec-draft-n-max", os.getenv("LLM_MTP_DRAFT_N", "3")]
 
+    def _moe_offload_args(self, info: dict) -> list[str]:
+        """Keep a sparse MoE's expert weights in system RAM instead of VRAM.
+
+        A 35B-A3B activates ~3B parameters per token but must have all 35B resident
+        somewhere. The experts are the bulk of that and are touched sparsely, so they
+        are the part worth paying host-memory bandwidth for: attention, embeddings and
+        the KV cache stay on the GPU, which is what a 12 GB card can actually hold
+        alongside TTS and STT. Expect it to be considerably slower than a model that
+        fits in VRAM outright — this trades throughput for being able to run the model
+        at all.
+
+        `--cpu-moe` offloads every layer's experts; `LLM_CPU_MOE_LAYERS=N` switches to
+        `--n-cpu-moe N`, which offloads only the first N and keeps the rest on the GPU,
+        for trading VRAM headroom back against speed. Probed like the flags above,
+        since an older llama-server would reject them and fail to start.
+        """
+        if not info.get("cpu_moe"):
+            return []
+        n = os.getenv("LLM_CPU_MOE_LAYERS", "").strip()
+        flag = "--n-cpu-moe" if n else "--cpu-moe"
+        if not _supports_llama_flag(LLAMA_SERVER_BIN, flag):
+            logger.warning(f"this llama-server build has no {flag}; a sparse-MoE entry will try to "
+                           "load entirely into VRAM and will most likely fail to allocate")
+            return []
+        return [flag, n] if n else [flag]
+
     def _spawn(self, model_id: str) -> None:
         info = MODEL_REGISTRY[model_id]
         path = Path(info["path"])
@@ -186,6 +228,7 @@ class LLMServerManager:
         ]
         cmd += self._reasoning_args()
         cmd += self._mtp_args(info)
+        cmd += self._moe_offload_args(info)
         if LLM_SEED != -1:
             cmd += ["--seed", str(LLM_SEED)]
         logger.info(f"LLMServerManager: spawning {model_id} ({info['label']}): {' '.join(cmd)}")
