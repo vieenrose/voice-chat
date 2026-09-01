@@ -30,51 +30,26 @@ libraries installed; `/health` reports `mock` when a rung is reached.
 
 ### Switchable models
 
-`qwen3.5-2b-q4` (default), `qwen3.5-4b-q4` and `ling-3.0-tiny`, selectable from the UI's Model
-card or `POST /api/model`. Only one is loaded at a time — VRAM on a 12 GB card is tight with
-embedding + TTS + STT resident. **Bare-metal only**: the compose setup runs the LLM in a fixed
-sibling container.
+`qwen3.5-2b-q4` (default) and `qwen3.5-4b-q4`, selectable from the UI's Model card or
+`POST /api/model`. Only one is loaded at a time — VRAM on a 12 GB card is tight with embedding
++ TTS + STT resident. **Bare-metal only**: the compose setup runs the LLM in a fixed sibling
+container.
 
-**Ling 3.0 tiny** is a `bailingmoe3` MoE (128 experts, 8 active) and needs two things this repo
-supplies. Set `LLM_PATH_LING` to the GGUF you downloaded.
+**Two models that were evaluated and dropped**, so the same ground isn't retrodden:
 
-*A different tool-call syntax.* Qwen-Agent drives tools over plain text and expects a JSON body;
-Ling's chat template asks for tag pairs:
+*Ling 3.0 tiny* (`bailingmoe3` MoE, 128 experts / 8 active) works — it needed its own tool-call
+dialect, since Qwen-Agent expects a JSON call body while Ling's chat template asks for
+`<tool_call>name<arg_key>…</arg_key><arg_value>…</arg_value>`, and with that adapter it routed
+all three tools correctly. At IQ4_XS it scored the same 3/4 on the four UI prompts as 2B. It was
+still dropped: slower (148 tok/s vs 172), much heavier on VRAM (6.9 GB vs ~3.5), and it drifted
+into Simplified Chinese more than Qwen does (`湿度` for 濕度), which is the one thing this demo
+is specifically not supposed to do. Its adapter and tests were removed with it — recoverable
+from git if it's ever worth revisiting. One finding outlived it: **IQ4_XS beat MXFP4** on the
+same weights (148 vs 108 tok/s, 6.9 vs 7.9 GB VRAM, identical score), despite MXFP4 being the
+format designed for MoE experts. Measure the quant; don't reason about it.
 
-```
-Qwen-Agent:  <tool_call>\n{"name": "web_search", "arguments": {"query": "台北天氣"}}\n</tool_call>
-Ling 3.0:    <tool_call>web_search\n<arg_key>query</arg_key>\n<arg_value>台北天氣</arg_value>\n</tool_call>
-```
-
-Everything around the call — the `<tools>` signature block, `<tool_response>` for results — is
-already identical, so only the body needs translating. `llm/ling_fncall.py` does that in both
-directions and is installed automatically when the loaded alias names a Ling model. The tag
-syntax also degrades better under truncation: a cut-off JSON body loses the whole call (that bug
-searched for the literal string `{"query": "…`), whereas a cut-off tag list still yields the
-pairs that arrived.
-
-*Quantization: IQ4_XS, chosen by stopwatch.* MXFP4 is the format **designed** for MoE experts,
-with tuned CUDA kernels, so it was the obvious pick — and it lost the measurement:
-
-| build | tok/s | VRAM | disk | 4-prompt matrix |
-|---|---|---|---|---|
-| **IQ4_XS** | **148** | **6.9 GB** | **4.39 GB** | 3/4 |
-| MXFP4_MOE_BF16 | 108 | 7.9 GB | 5.60 GB | 3/4 |
-
-Same score, same single failure, 38 % faster on less of everything. Worth remembering the next
-time a format looks principled on paper.
-
-VRAM rules out Q8_0 (8.41 GB): 6.2 GB of the 12 GB card is already held by TTS+STT, the
-embedding server and the LLM slot, so freeing the LLM leaves ~9.0 GB — Q8_0 is that much before
-any KV cache.
-
-Note the default path is **not** under `/tmp` like the other models: `/tmp` here is tmpfs *and*
-enforces a quota that aborts multi-GB writes partway (`Disk quota exceeded`), which defeated
-three attempts to download this file there. `df` reporting free space does not mean you can
-write to it.
-
-**Why there is no 0.8B option.** It was tested and removed. Decode runs 236 tok/s at 0.8B
-against 172 tok/s at 2B — 0.97 s vs 1.31 s for a 220-token answer. That 0.34 s falls inside a
+*0.8B.* Decode runs 236 tok/s at 0.8B against 172 tok/s at 2B — 0.97 s vs 1.31 s for a
+220-token answer. That 0.34 s falls inside a
 turn where the user already waits 1.0–3.6 s for first audio, which search and TTS dominate, so
 nobody can hear it. What it costs is reliability: every 0.8B build tested narrated its own
 planning aloud, echoed the agent framework's tool template, quoted the prompt back, or repeated
@@ -112,8 +87,8 @@ Model files (mount as volumes under Docker):
 
 > **`/tmp` is tmpfs on this machine — it is RAM, and it enforces a quota.** The paths above are
 > the dev defaults, but a multi-GB write there fails partway with `Disk quota exceeded` even
-> though `df` shows free space. Put weights on a real disk and point `LLM_PATH_*` at them, as
-> the Ling entry already does.
+> though `df` shows free space. For anything new, put weights on a real disk and point the
+> matching `LLM_PATH_*` at them.
 
 ```bash
 docker compose up -d --build     # UI at http://localhost:8000
@@ -169,13 +144,10 @@ zh-TW):
 |---|---|---|---|
 | 0.8B q8 *(removed)* | 236 | 0.97 s | 1/4 |
 | **Qwen3.5 2B Q4_K_M** | **172** | **1.31 s** | **3/4** |
-| Ling 3.0 tiny IQ4_XS | 148 | 1.55 s | 3/4 |
 | Qwen3.5 4B Q4_K_M | 87 | 2.60 s | 3/4 |
 
-2B, 4B and Ling all score the same and fail the same way — a sentence repeated in the news
-answer. Ling additionally drifts into Simplified Chinese more than Qwen does (`湿度` for 濕度,
-`阵雨` for 陣雨); the display layer's OpenCC pass covers it and pronunciation is unaffected, but
-it is a real zh-TW adherence gap. 2B stays the default on speed.
+2B and 4B score the same and fail the same way — a sentence repeated in the news answer. 2B is
+the default: same quality, twice the throughput.
 
 If you want a turn to feel faster, the thinking budget and the search round-trip are where the
 seconds are — not the model size. First audio is 1.0–3.6 s on a tool turn, of which decode is a
@@ -240,7 +212,6 @@ concurrently instead of each waiting out its own timeout.
 | `WS_ALLOW_ANY_ORIGIN` | off | opt out of the WebSocket Origin gate |
 | `SEARXNG_URL` | `http://localhost:8888` | search backend |
 | `LLM_API_BASE`, `LLM_PORT`, `LLM_CTX`, `LLM_DEFAULT_MODEL_ID`, `LLM_PATH_*` | see `llm_manager.py` | LLM subprocess |
-| `LLM_PATH_LING` | `/home/user/llms/Ling-3.0-tiny-IQ4_XS.gguf` | Ling GGUF (see Switchable models for the quant/VRAM note) |
 | `LLM_SEED` / `LLM_AGENT_SEED` | random / unset | reproducible runs |
 | `LLM_AGENT_TEMP`, `LLM_AGENT_TOP_P` | `0.7`, `0.9` | agent-turn sampling |
 | `LLM_AGENT_THINKING` | `1` | thinking pass on agent turns |

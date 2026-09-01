@@ -57,30 +57,12 @@ MODEL_REGISTRY: dict[str, dict] = {
         "path": os.getenv("LLM_PATH_4B", "/tmp/llms/Qwen3.5-4B-Q4_K_M.gguf"),
         "alias": "qwen3.5-4b",
     },
-    # Ling 3.0 tiny (bailingmoe3, 128 experts / 8 active). The alias must keep saying
-    # "ling": the agent harness matches on it to switch to Ling's tool-call dialect
-    # (llm/ling_fncall.py), which is a different syntax from the JSON one Qwen emits.
-    #
-    # IQ4_XS, chosen by measurement. MXFP4 looked like the principled pick — it is the
-    # block format designed for MoE experts, with tuned CUDA kernels — but measured on
-    # this box the i-quant is simply better on every axis: 148 tok/s against MXFP4_MOE_BF16's
-    # 108 (+38%), 6.9 GB of VRAM against 7.9, 4.39 GB on disk against 5.60, and the same
-    # 3/4 on the four UI prompts with the same single failure. Format theory lost to the
-    # stopwatch.
-    #
-    # Not Q8_0 (8.41 GB), which is what was originally wanted: 6.2 GB of this 12 GB card
-    # is already held by TTS+STT, the embedding server and the LLM slot, so freeing the
-    # LLM leaves ~9.0 GB — Q8_0 is that much before any KV cache.
-    #
-    # NOTE: not under /tmp like the other entries. /tmp here is tmpfs AND carries a
-    # filesystem quota that aborts multi-GB writes partway ("Disk quota exceeded"),
-    # which is what defeated three attempts to put this file there.
-    "ling-3.0-tiny": {
-        "label": "Ling 3.0 tiny IQ4_XS (MoE)",
-        "path": os.getenv("LLM_PATH_LING", "/home/user/llms/Ling-3.0-tiny-IQ4_XS.gguf"),
-        "alias": "ling-3.0-tiny",
-    },
 }
+# Ling 3.0 tiny (bailingmoe3 MoE) was evaluated here and dropped. At IQ4_XS it scored the
+# same 3/4 on the four UI prompts as 2B, but ran slower (148 tok/s vs 172), used more VRAM
+# (6.9 GB vs ~3.5), and drifted into Simplified Chinese more often — which this demo is
+# specifically not supposed to do. Its tool-call dialect adapter went with it; see the
+# commit that removed it if Ling is ever worth revisiting.
 # NOT "LLM_MODEL_ID" — the agent harnesses (backend/agent/{qwen_harness,harness,
 # pydantic_harness}.py) already read that name expecting a raw llama-server alias
 # (e.g. "qwen3.5-2b"), whereas this expects a MODEL_REGISTRY key (e.g. "qwen3.5-2b-q4");

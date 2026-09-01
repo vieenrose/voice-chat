@@ -647,17 +647,6 @@ def _make_agent(function_list=None):
         function_list=list(_TOOLS_FULL if function_list is None else function_list),
         system_message=("You are a helpful voice assistant." + _smalltalk_rule() + AGENT_SYSTEM_MESSAGE),
     )
-    # Ling 3.0 asks for tool calls in its own tag syntax (<tool_call>name<arg_key>…),
-    # not the JSON body Qwen-Agent's default dialect emits and parses. fncall_prompt is
-    # the single object used for both directions, so swapping it is the whole fix —
-    # everything around the call (<tools>, <tool_response>) is already identical.
-    try:
-        from llm.ling_fncall import LingFnCallPrompt, looks_like_ling
-        if looks_like_ling(_model) and getattr(agent, 'llm', None) is not None:
-            agent.llm.fncall_prompt = LingFnCallPrompt()
-            logger.info(f"agent: Ling tool-call dialect enabled for model {_model!r}")
-    except Exception as e:
-        logger.warning(f"agent: could not install Ling fncall dialect: {e!r}")
     return agent
 
 # Module-level so llm.ling_streaming._is_own_prompt_echo() can recognize this text
