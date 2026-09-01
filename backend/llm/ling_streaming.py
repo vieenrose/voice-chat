@@ -108,7 +108,7 @@ def _is_own_prompt_echo(s: str) -> bool:
     global _ECHO_CORPUS
     norm = _norm_for_echo(s)
     # Short fragments ("繁體中文", "web_search") legitimately appear in real answers.
-    if len(norm) < 30:
+    if len(norm) < 20:
         return False
     if _ECHO_CORPUS is None:
         parts = []
@@ -123,16 +123,34 @@ def _is_own_prompt_echo(s: str) -> bool:
         except Exception:
             pass
         _ECHO_CORPUS = _norm_for_echo(" ".join(parts))
-    return bool(_ECHO_CORPUS) and norm in _ECHO_CORPUS
+    if not _ECHO_CORPUS:
+        return False
+    if norm in _ECHO_CORPUS:
+        return True
+    # The model also replays instructions *paraphrased or truncated* ("For weather use
+    # get_weather...", "only keep English for proper nouns..."), which no exact-substring
+    # test can catch. Compare character shingles instead: text that is mostly built out
+    # of fragments of our own instructions is an echo, however it was chopped up.
+    if len(norm) < 24:
+        return False
+    k = 8
+    shingles = {norm[i:i + k] for i in range(0, len(norm) - k + 1)}
+    if not shingles:
+        return False
+    hits = sum(1 for sh in shingles if sh in _ECHO_CORPUS)
+    return hits / len(shingles) >= 0.6
 
 
 # A deliberation checklist header ("2. Evaluate Tool Call Need:", "Determine the
-# language:"). Shape-based: an English decision verb aimed at a meta noun, not at
-# anything the user asked about.
+# language:", "Tool Call Analysis:"). Shape-based: an English line that ends in a colon
+# and is about the machinery of answering rather than about anything the user asked.
+_META_NOUN = (r"tool|call|request|constraint|language|query|need|response|answer|output"
+              r"|prompt|instruction|analysis|reasoning|evaluation|step|plan|check")
 _CHECKLIST_HEADER_RE = re.compile(
     r"^\s*(?:[*\-#\d.]+\s*)*(?:\*\*)?\s*"
-    r"(evaluate|analyz[es]?|analyse|determine|identify|assess|consider|review|verify|check|decide|formulate|construct)\b"
-    r"[^.?!\n]{0,60}?\b(tool|call|request|constraint|language|query|need|response|answer|output|prompt|instruction)s?\b"
+    r"(?:(?:evaluate|analyz[es]?|analyse|determine|identify|assess|consider|review|verify"
+    r"|check|decide|formulate|construct)\b[^.?!\n]{0,60}?\b(?:" + _META_NOUN + r")s?\b"
+    r"|(?:" + _META_NOUN + r")s?\b[^.?!\n]{0,40}?\b(?:" + _META_NOUN + r")s?\b)"
     r"[^.?!\n]{0,40}:\s*(?:\*\*)?\s*$",
     re.I,
 )
@@ -153,15 +171,22 @@ def _is_reasoning_text(text: str) -> bool:
         return True
     if _CHECKLIST_HEADER_RE.match(s):
         return True
-    # No CJK at all -> likely spillover (answer must be zh-TW per system prompt)
+    # No CJK at all -> not an answer this app would give.
+    #
+    # This app answers in Traditional Chinese by product decision, keeping English only
+    # for proper nouns and terms — and those appear *inside* a Chinese sentence, which
+    # therefore still contains CJK. So a standalone, sentence-length, all-English span is
+    # never the answer: in practice it is deliberation ("The question is about the current
+    # president.") or replayed instructions. Judging by that property rather than by a list
+    # of observed phrases is what keeps this from needing a new entry every time the model
+    # rewords itself. Short English spans ("Emmanuel Macron.") stay speakable.
     if not _CJK_RE.search(text):
         low = s.lower()
         if re.search(r"^\s*\"?\s*wait\b", low):
             return True
         if re.search(r"\bi need to\b", low) and len(s) < 160:
             return True
-        # Any English sentence that is meta-talk about the task/prompt/system is reasoning
-        if any(kw in low for kw in ["constraint", "prompt already included", "tool call example", "system constraints", "the user prompt", "instruction says", "user asks:"]):
+        if len(_norm_for_echo(s)) >= 24:
             return True
         if len(s) > 20:
             has_first_person = any(p in low for p in ["i must", "i need to", "i should", "let me", "wait,", "however"])

@@ -471,6 +471,23 @@ async def tts_chunks(text: str, voice: str | None = None):
     async for pcm in pipeline.tts.synthesize_streaming(text):
         yield pcm
 
+def _retract(text_so_far: str, spoken_candidate: str) -> str:
+    """Remove a span that turned out to be reasoning from the streamed transcript.
+
+    Tokens reach the client as they arrive, so by the time a full sentence can be
+    judged, its text is already in text_so_far. Trim it from the tail (the normal
+    case) and fall back to removing the last occurrence anywhere."""
+    if not spoken_candidate:
+        return text_so_far
+    stripped = text_so_far.rstrip()
+    if stripped.endswith(spoken_candidate):
+        return stripped[: -len(spoken_candidate)]
+    idx = text_so_far.rfind(spoken_candidate)
+    if idx >= 0:
+        return text_so_far[:idx] + text_so_far[idx + len(spoken_candidate):]
+    return text_so_far
+
+
 def _resolve_session_id(session_id: str) -> str:
     """Empty or the literal 'default' gets a unique id.
 
@@ -739,6 +756,15 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="")):
                                             from llm.ling_streaming import _is_reasoning_text as _is_r2
                                             if _is_r2(txt_s):
                                                 await websocket.send_text(json.dumps({"type": "reasoning", "text": txt_s, "delta": txt_s, "turn_id": my_turn_id}, ensure_ascii=False))
+                                                # Take it back out of the answer bubble as well. A single
+                                                # token is too small a unit to classify, so reasoning slips
+                                                # past the per-token check above and is only recognisable
+                                                # once a whole sentence has arrived — by which point it is
+                                                # already in text_so_far. Speech was spared; the transcript
+                                                # has to be corrected explicitly or the UI shows thinking
+                                                # as the answer.
+                                                llm_text_so_far = _retract(llm_text_so_far, txt_s)
+                                                await websocket.send_text(json.dumps({"type": "llm_token", "token": "", "text_so_far": llm_text_so_far, "turn_id": my_turn_id}, ensure_ascii=False))
                                                 tts_buf=""
                                                 cnt=0
                                                 continue

@@ -168,6 +168,13 @@ class QwenDateTime(BaseTool):
 _TOOL_PLACEHOLDER_RE = re.compile(r"\[\s*(get_current_datetime|get_weather|web_search)\s*\]")
 
 
+def _msg_field(m, key, default=None):
+    """Read a field from a qwen_agent message, which may be a dict or a Message object."""
+    if isinstance(m, dict):
+        return m.get(key, default)
+    return getattr(m, key, default)
+
+
 def detect_unexecuted_tool(text, tool_ran: bool = False):
     """The bracketed tool name in `text`, or None if the answer is clean / a tool
     already ran this turn (a real call that returned 'No results' can legitimately be
@@ -267,8 +274,18 @@ def format_clock_zh(tool_result: str) -> str:
 # memory-replay failure that made a post-hoc "please redo it" unreliable.
 # Narrow on purpose: an office/holder noun (or 現任/誰是, or "who won"), not merely a
 # question. "What is the weather in Tokyo?" and greetings must not pay for a search.
+_INCUMBENT_OFFICE_ZH = (
+    r"總統|总统|首相|總理|总理|主席|市長|市长|州長|州长|省長|省长|部長|部长|"
+    r"執行長|执行长|董事長|董事长|國王|国王|女王|皇帝|教宗|教皇|冠軍|冠军|得主|領導人|领导人|總裁|总裁"
+)
+
 _INCUMBENT_RE = re.compile(
     r"(?:誰是|谁是|哪一位是|現任|现任|目前在任)"
+    # Chinese normally puts 誰 AFTER the office noun ("法國總統是誰？"), the mirror of the
+    # English "who is the …" branch below. Matching only the verb-first 誰是 form missed
+    # the ordinary phrasing — including this app's own demo chip, 法國現在的總統是誰？ —
+    # so the question was answered from the model's memory instead of from a search.
+    r"|(?:" + _INCUMBENT_OFFICE_ZH + r")[^。？?！!]{0,8}(?:是誰|是谁)"
     r"|who\s+(?:is|are|was|will\s+be)\s+(?:the|a|an)?[\w'’ é\-]{0,40}?"
     r"(?:president|prime minister|premier|\bpm\b|chancellor|mayor|governor|monarch|king|queen|emperor|"
     r"ceo|chief executive|chairman|chairwoman|chairperson|minister|secretary|speaker|senator|"
@@ -326,8 +343,18 @@ def required_tool_for_request(task: str):
     if not task or not task.strip():
         return None
     t = task.strip()
+    # The current date/time is not in the weights, exactly like an office holder is not
+    # (see requires_fresh_facts): asking the model to recall it is asking it to invent it.
+    # fabricates_time_without_tool() only catches the case where it states a time anyway;
+    # measured here, 2B answered "今天是星期幾？" with the non-answer "今天是一週的幾號？"
+    # and called nothing at all, which that post-hoc check cannot see. Weather owns "今天"
+    # in "今天天氣" and must not be dragged into a clock lookup.
+    # Checked before the clock: "法國現在的總統是誰？" is an office-holder lookup that merely
+    # contains 現在 ("now"), not a question about the time.
     if _LOOKUP_REQUEST_RE.search(t) or requires_fresh_facts(t):
         return "web_search"
+    if _TIME_QUESTION_RE.search(t) and not _WEATHER_REQUEST_RE.search(t):
+        return "get_current_datetime"
     return None
 
 
@@ -701,13 +728,13 @@ async def run_agent_task(task: str, event_q=None, history=None) -> str:
             for resp in all_resps:
                 lst = resp if isinstance(resp, list) else [resp]
                 for m in lst:
-                    if isinstance(m, dict) and m.get('role') == 'assistant':
-                        c = m.get('content')
+                    if _msg_field(m, 'role') == 'assistant':
+                        c = _msg_field(m, 'content')
                         # Filter: content must be non-empty and not just reasoning (reasoning_content is separate)
                         if isinstance(c, str) and c.strip() and len(c.strip()) > 2:
                             # Skip if it's just the reasoning dump (empty content with reasoning_content)
                             if not c.strip().startswith("["):
-                                candidates_all.append(m)
+                                candidates_all.append({"role": "assistant", "content": c})
                         elif isinstance(c, list):
                             txt = "".join(b.get('text','') if isinstance(b, dict) else str(b) for b in c)
                             if txt.strip():
@@ -716,7 +743,13 @@ async def run_agent_task(task: str, event_q=None, history=None) -> str:
                 final_text = candidates_all[-1].get('content', '')
                 # Did a tool actually run this turn? (a real call that came back empty
                 # may legitimately be referred to by name — that is not the bug below)
-                tool_ran = any(isinstance(m, dict) and (m.get('role') == 'function' or m.get('function_call'))
+                # qwen_agent yields either dicts or Message objects depending on the step
+                # (the streaming loop above has to normalize for the same reason). Testing
+                # only for dicts left tool_ran False on turns where tools really had run,
+                # which fired the repair guards below on a correct answer: "法國現在的總統
+                # 是誰？" got an unrelated clock appended, because the question contains 現在
+                # and the answer contains years, and the guard believed no tool had run.
+                tool_ran = any(_msg_field(m, 'role') == 'function' or _msg_field(m, 'function_call')
                                for resp in all_resps for m in (resp if isinstance(resp, list) else [resp]))
                 missing = detect_unexecuted_tool(final_text, tool_ran)
                 must_regenerate = False
@@ -767,9 +800,10 @@ async def run_agent_task(task: str, event_q=None, history=None) -> str:
                                 for resp in _turn_agent.run(messages=cont, **run_kwargs):
                                     lst = resp if isinstance(resp, list) else [resp]
                                     for m in lst:
-                                        if (isinstance(m, dict) and m.get('role') == 'assistant'
-                                                and isinstance(m.get('content'), str) and m['content'].strip()):
-                                            repaired = m['content']
+                                        _c = _msg_field(m, 'content')
+                                        if (_msg_field(m, 'role') == 'assistant'
+                                                and isinstance(_c, str) and _c.strip()):
+                                            repaired = _c
                     if not repaired:
                         if offered_lookup:
                             # For the empty-promise case a digest of the real results is
