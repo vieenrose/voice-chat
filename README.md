@@ -53,11 +53,16 @@ syntax also degrades better under truncation: a cut-off JSON body loses the whol
 searched for the literal string `{"query": "…`), whereas a cut-off tag list still yields the
 pairs that arrived.
 
-*Quantization, chosen by VRAM rather than preference.* 6.2 GB of the 12 GB card is already held
-by TTS+STT, the embedding server and the LLM slot, so freeing the LLM leaves ~9.0 GB. Q8_0 is
-8.41 GB of weights before any KV cache — it either OOMs or leaves the TTS process nothing to
-grow into. Q5_K_M (5.72 GB) is the default here and fits with headroom; Q6_K (6.84 GB) also
-fits if you want to spend it.
+*Quantization: MXFP4, not a K-quant.* MXFP4 is the 4-bit block format designed for MoE expert
+tensors, and llama.cpp ships tuned CUDA kernels for it — so at equal size it spends its bits
+better than a general-purpose K-quant does on the same weights. `MXFP4_MOE_BF16` keeps attention
+and embeddings at 16-bit and quantizes only the experts, at 5.60 GB against Q5_K_M's 5.72 GB;
+plain `MXFP4_MOE` is 4.88 GB against Q4_K_M's 4.92 GB. Same footprint either way, better-matched
+format.
+
+VRAM is what rules out Q8_0 (8.41 GB): 6.2 GB of the 12 GB card is already held by TTS+STT, the
+embedding server and the LLM slot, so freeing the LLM leaves ~9.0 GB — Q8_0 is that much before
+any KV cache, and either OOMs or leaves the TTS process nothing to grow into.
 
 **Why there is no 0.8B option.** It was tested and removed. Decode runs 236 tok/s at 0.8B
 against 172 tok/s at 2B — 0.97 s vs 1.31 s for a 220-token answer. That 0.34 s falls inside a
@@ -95,6 +100,10 @@ Model files (mount as volumes under Docker):
 - LLM `/tmp/llms/Qwen3.5-2B-Q4_K_M.gguf` · Embedding `/tmp/granite-emb-gguf/…Q8_0.gguf`
 - TTS `/tmp/qwen3_tts/talker_cv_q8.gguf` + `codec.gguf` · STT `/tmp/XASR/deployment/models/chunk-160ms-model/`
 - SearXNG `/tmp/searxng/settings.yml`
+
+> **`/tmp` is tmpfs on this machine — it is RAM.** The paths above are the dev defaults, but
+> downloading a multi-GB GGUF into `/tmp` spends that much memory and can wedge the box. Put
+> weights on a real disk and point `LLM_PATH_*` at them.
 
 ```bash
 docker compose up -d --build     # UI at http://localhost:8000
@@ -213,7 +222,7 @@ concurrently instead of each waiting out its own timeout.
 | `WS_ALLOW_ANY_ORIGIN` | off | opt out of the WebSocket Origin gate |
 | `SEARXNG_URL` | `http://localhost:8888` | search backend |
 | `LLM_API_BASE`, `LLM_PORT`, `LLM_CTX`, `LLM_DEFAULT_MODEL_ID`, `LLM_PATH_*` | see `llm_manager.py` | LLM subprocess |
-| `LLM_PATH_LING` | `/tmp/llms/Ling-3.0-tiny-Q5_K_M.gguf` | Ling GGUF (see Switchable models for the quant/VRAM note) |
+| `LLM_PATH_LING` | `/tmp/llms/Ling-3.0-tiny-MXFP4_MOE_BF16.gguf` | Ling GGUF (see Switchable models for the quant/VRAM note) |
 | `LLM_SEED` / `LLM_AGENT_SEED` | random / unset | reproducible runs |
 | `LLM_AGENT_TEMP`, `LLM_AGENT_TOP_P` | `0.7`, `0.9` | agent-turn sampling |
 | `LLM_AGENT_THINKING` | `1` | thinking pass on agent turns |

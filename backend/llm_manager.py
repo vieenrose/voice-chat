@@ -61,15 +61,19 @@ MODEL_REGISTRY: dict[str, dict] = {
     # "ling": the agent harness matches on it to switch to Ling's tool-call dialect
     # (llm/ling_fncall.py), which is a different syntax from the JSON one Qwen emits.
     #
-    # Q5_K_M rather than the Q8_0 that was asked for. Measured on this box: 6.2 GB of
-    # the 12 GB card is already held by TTS+STT (2.4 GB), the embedding server and the
-    # LLM slot, so freeing the LLM leaves ~9.0 GB. Q8_0 is 8.41 GB of weights before
-    # any KV cache — it either OOMs or leaves the TTS process nothing to grow into.
-    # Q5_K_M is 5.72 GB and fits with room to spare; Q6_K (6.84 GB) also fits if you
-    # want to trade the headroom. Point LLM_PATH_LING at whichever you downloaded.
+    # MXFP4 rather than a K-quant: it is the 4-bit block format designed for MoE expert
+    # tensors (and the one llama.cpp ships tuned CUDA kernels for), so at equal size it
+    # spends its bits better than Q4_K_M/Q5_K_M do on the same weights. The _BF16 build
+    # keeps attention and embeddings at 16-bit and quantizes only the experts: 5.60 GB,
+    # essentially Q5_K_M's 5.72 GB. Plain MXFP4_MOE is 4.88 GB if you want the headroom.
+    #
+    # Not Q8_0, which is what was originally wanted: 6.2 GB of this 12 GB card is already
+    # held by TTS+STT (2.4 GB), the embedding server and the LLM slot, so freeing the LLM
+    # leaves ~9.0 GB, and Q8_0 is 8.41 GB of weights before any KV cache — it either OOMs
+    # or leaves the TTS process nothing to grow into.
     "ling-3.0-tiny": {
-        "label": "Ling 3.0 tiny Q5_K_M (MoE)",
-        "path": os.getenv("LLM_PATH_LING", "/tmp/llms/Ling-3.0-tiny-Q5_K_M.gguf"),
+        "label": "Ling 3.0 tiny MXFP4 MoE",
+        "path": os.getenv("LLM_PATH_LING", "/tmp/llms/Ling-3.0-tiny-MXFP4_MOE_BF16.gguf"),
         "alias": "ling-3.0-tiny",
     },
 }
