@@ -30,14 +30,42 @@ libraries installed; `/health` reports `mock` when a rung is reached.
 
 ### Switchable models
 
-Selectable from the UI's Model card or `POST /api/model`. Only one is loaded at a time (VRAM on
-a 12 GB card is tight with embedding + TTS + STT resident). **Bare-metal only** — the compose
-setup runs the LLM in a fixed sibling container.
+`qwen3.5-2b-q4` (default), `qwen3.5-4b-q4` and `ling-3.0-tiny`, selectable from the UI's Model
+card or `POST /api/model`. Only one is loaded at a time — VRAM on a 12 GB card is tight with
+embedding + TTS + STT resident. **Bare-metal only**: the compose setup runs the LLM in a fixed
+sibling container.
 
-| id | Weights |
-|---|---|
-| `qwen3.5-0.8b-q8` / `qwen3.5-2b-q4` (default) / `qwen3.5-4b-q4` | Qwen3.5 GGUF |
-| `apodex-0.8b-q8` / `apodex-0.8b-f16` | Apodex 0.8B, quantized and unquantized |
+**Ling 3.0 tiny** is a `bailingmoe3` MoE (128 experts, 8 active) and needs two things this repo
+supplies. Set `LLM_PATH_LING` to the GGUF you downloaded.
+
+*A different tool-call syntax.* Qwen-Agent drives tools over plain text and expects a JSON body;
+Ling's chat template asks for tag pairs:
+
+```
+Qwen-Agent:  <tool_call>\n{"name": "web_search", "arguments": {"query": "台北天氣"}}\n</tool_call>
+Ling 3.0:    <tool_call>web_search\n<arg_key>query</arg_key>\n<arg_value>台北天氣</arg_value>\n</tool_call>
+```
+
+Everything around the call — the `<tools>` signature block, `<tool_response>` for results — is
+already identical, so only the body needs translating. `llm/ling_fncall.py` does that in both
+directions and is installed automatically when the loaded alias names a Ling model. The tag
+syntax also degrades better under truncation: a cut-off JSON body loses the whole call (that bug
+searched for the literal string `{"query": "…`), whereas a cut-off tag list still yields the
+pairs that arrived.
+
+*Quantization, chosen by VRAM rather than preference.* 6.2 GB of the 12 GB card is already held
+by TTS+STT, the embedding server and the LLM slot, so freeing the LLM leaves ~9.0 GB. Q8_0 is
+8.41 GB of weights before any KV cache — it either OOMs or leaves the TTS process nothing to
+grow into. Q5_K_M (5.72 GB) is the default here and fits with headroom; Q6_K (6.84 GB) also
+fits if you want to spend it.
+
+**Why there is no 0.8B option.** It was tested and removed. Decode runs 236 tok/s at 0.8B
+against 172 tok/s at 2B — 0.97 s vs 1.31 s for a 220-token answer. That 0.34 s falls inside a
+turn where the user already waits 1.0–3.6 s for first audio, which search and TTS dominate, so
+nobody can hear it. What it costs is reliability: every 0.8B build tested narrated its own
+planning aloud, echoed the agent framework's tool template, quoted the prompt back, or repeated
+itself — each failure needing another filter. Unquantized f16 scored the same as q8, so this is
+capacity rather than quantization, and no amount of filtering fixes it.
 
 ## Quick Start
 
@@ -114,11 +142,17 @@ above is a spread. Fix `LLM_AGENT_SEED` to compare builds.
 | thinking off | 71 % | 56 ms | fast, clean, and invented: weather never looked up |
 | thinking + `--reasoning-format deepseek` | **83 %** | **53–576 ms** | answers only |
 
-**Model size vs. quality.** Across the four UI demo prompts, 2B and 4B pass everything. The
-0.8B failures turned out to be filtering gaps on our side, not capacity: once framework
-scaffolding and transcript labels were kept out of the answer (below), both Apodex 0.8B builds
-passed all four and Qwen3.5 0.8B three of four. Unquantized f16 scored the same as q8, so
-quantization was not the cause either.
+**Decode throughput** (220-token answer, same prompt, median of 3):
+
+| Model | tok/s | wall |
+|---|---|---|
+| 0.8B q8 *(removed)* | 236 | 0.97 s |
+| **2B Q4_K_M** | **172** | **1.31 s** |
+| 4B Q4_K_M | 87 | 2.60 s |
+
+Across the four UI demo prompts, 2B and 4B pass every check; 0.8B did not, which is why it is
+gone (see above). If you want a turn to feel faster, the thinking budget and the search
+round-trip are where the seconds are — not the model size.
 
 ## Design notes
 
@@ -179,6 +213,7 @@ concurrently instead of each waiting out its own timeout.
 | `WS_ALLOW_ANY_ORIGIN` | off | opt out of the WebSocket Origin gate |
 | `SEARXNG_URL` | `http://localhost:8888` | search backend |
 | `LLM_API_BASE`, `LLM_PORT`, `LLM_CTX`, `LLM_DEFAULT_MODEL_ID`, `LLM_PATH_*` | see `llm_manager.py` | LLM subprocess |
+| `LLM_PATH_LING` | `/tmp/llms/Ling-3.0-tiny-Q5_K_M.gguf` | Ling GGUF (see Switchable models for the quant/VRAM note) |
 | `LLM_SEED` / `LLM_AGENT_SEED` | random / unset | reproducible runs |
 | `LLM_AGENT_TEMP`, `LLM_AGENT_TOP_P` | `0.7`, `0.9` | agent-turn sampling |
 | `LLM_AGENT_THINKING` | `1` | thinking pass on agent turns |

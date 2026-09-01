@@ -172,28 +172,44 @@ NO_ANSWER_ZH = "抱歉，我找不到相關的答案。"
 
 
 def _answer_or_fallback(text: str) -> str:
-    """Drop an 'answer' that is only deliberation or its leftover scaffolding.
+    """Return the answer with non-answer material removed, or say there isn't one.
 
     Smaller quantizations sometimes spend the whole turn narrating a plan and never
     write an answer. Filtering the reasoning out then leaves either nothing or the
     skeleton it hung on — "Plan:", "2.  Evaluate the Input:", bare list markers and
     blank lines — which is what reached the chat bubble while TTS, correctly, refused
     to speak any of it: the user saw scaffolding and heard silence. If nothing
-    survives the filter, say so instead."""
+    survives the filter, say so instead.
+
+    What survives is what is returned, so the chat bubble shows the same text that is
+    spoken; returning the original meant the transcript kept sentences the audio had
+    dropped."""
     if not text or not text.strip():
         return NO_ANSWER_ZH
     try:
         from llm.ling_streaming import _is_reasoning_text
     except Exception:
         return text
-    kept = [p for p in re.split(r"(?<=[.!?。！？\n])\s*", text) if p.strip() and not _is_reasoning_text(p)]
+    parts = [p for p in re.split(r"(?<=[.!?。！？\n])\s*", text) if p.strip()]
+    kept, seen = [], set()
+    for p in parts:
+        if _is_reasoning_text(p):
+            continue
+        # Small models sometimes emit the same sentence twice in a row. SpokenGuard keeps
+        # it from being said twice, but the transcript kept both copies, so the bubble
+        # disagreed with the audio.
+        key = re.sub(r"[^\w一-鿿]+", "", p.lower())
+        if len(key) >= 8 and key in seen:
+            continue
+        seen.add(key)
+        kept.append(p)
     remainder = " ".join(kept).strip()
     # Residue: what is left carries no CJK and no real word — only numbering, bullets
     # and punctuation. That is not an answer in any language.
     has_word = bool(re.search(r"[一-鿿]", remainder)) or bool(re.search(r"[A-Za-z]{3,}", remainder))
     if not remainder or not has_word:
         return NO_ANSWER_ZH
-    return text
+    return remainder if len(kept) != len(parts) else text
 
 
 def _msg_field(m, key, default=None):
@@ -273,6 +289,18 @@ def fabricates_weather_without_tool(task: str, text: str, tool_ran: bool = False
     if not _WEATHER_REQUEST_RE.search(task):
         return False
     return bool(_WEATHER_CLAIM_RE.search(text))
+
+
+# Stricter sibling of _TIME_QUESTION_RE, for deciding to CALL the clock rather than to
+# check an answer against it. The loose form is safe post-hoc because it is paired with
+# "and the answer states a time", but on its own it fires on any sentence containing 今天
+# — "你今天看起來不錯" is small talk, not a request for the date.
+_TIME_REQUEST_RE = re.compile(
+    r"(幾點|几点|幾號|几号|星期幾|星期几|禮拜幾|礼拜几|週幾|周几|哪一天|今天.*日期|日期.*今天|"
+    r"今天.*(?:是|幾|几)\s*(?:星期|禮拜|礼拜|週|周|號|号|日)|"
+    r"現在.*(?:時間|时间|幾點|几点)|(?:時間|时间).*(?:現在|现在)|"
+    r"what\s+(?:time|day|date)\b|what\s+is\s+the\s+(?:time|date|day)\b|what'?s\s+the\s+(?:time|date|day)\b|"
+    r"current\s+(?:time|date)\b|today'?s\s+date\b)", re.I)
 
 
 def fabricates_time_without_tool(task: str, text: str, tool_ran: bool = False) -> bool:
@@ -407,7 +435,7 @@ def required_tool_for_request(task: str):
     # contains 現在 ("now"), not a question about the time.
     if _LOOKUP_REQUEST_RE.search(t) or requires_fresh_facts(t):
         return "web_search"
-    if _TIME_QUESTION_RE.search(t) and not _WEATHER_REQUEST_RE.search(t):
+    if _TIME_REQUEST_RE.search(t) and not _WEATHER_REQUEST_RE.search(t):
         return "get_current_datetime"
     return None
 
@@ -611,7 +639,7 @@ def _make_agent(function_list=None):
         },
         'enable_thinking': _thinking_on()
     }
-    return Assistant(
+    agent = Assistant(
         llm=llm_cfg,
         # `function_list or _TOOLS_FULL` would silently turn an INTENDED empty list
         # back into the full tool set (an empty list is falsy) — which is exactly how
@@ -619,6 +647,18 @@ def _make_agent(function_list=None):
         function_list=list(_TOOLS_FULL if function_list is None else function_list),
         system_message=("You are a helpful voice assistant." + _smalltalk_rule() + AGENT_SYSTEM_MESSAGE),
     )
+    # Ling 3.0 asks for tool calls in its own tag syntax (<tool_call>name<arg_key>…),
+    # not the JSON body Qwen-Agent's default dialect emits and parses. fncall_prompt is
+    # the single object used for both directions, so swapping it is the whole fix —
+    # everything around the call (<tools>, <tool_response>) is already identical.
+    try:
+        from llm.ling_fncall import LingFnCallPrompt, looks_like_ling
+        if looks_like_ling(_model) and getattr(agent, 'llm', None) is not None:
+            agent.llm.fncall_prompt = LingFnCallPrompt()
+            logger.info(f"agent: Ling tool-call dialect enabled for model {_model!r}")
+    except Exception as e:
+        logger.warning(f"agent: could not install Ling fncall dialect: {e!r}")
+    return agent
 
 # Module-level so llm.ling_streaming._is_own_prompt_echo() can recognize this text
 # if the model replays it as an "answer" (it must never be spoken).

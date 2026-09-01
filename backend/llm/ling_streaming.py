@@ -186,6 +186,17 @@ _BARE_HEADER_RE = re.compile(
 # (llm/function_calling.py: 工具"…"被调用时使用了以下参数：… / 该工具返回了以下结果：…).
 # Small models echo that scaffolding back as if it were their answer, and it was
 # spoken aloud. Framework plumbing is never an answer, in any language.
+# Quoted or parenthesised spans: what the model is repeating rather than saying.
+_QUOTED_RE = re.compile(
+    r"[\"'“‘「『]{1}[^\"'”’」』]{0,120}[\"'”’」』]{1}"
+    r"|[（(][^）)]{0,120}[）)]"
+)
+
+# Search results echoed back verbatim instead of summarised: format_results() emits
+# "[1] title / URL: … / Date/Snippet: …". Reading that aloud (URL and all, sometimes a
+# hallucinated one) is never the answer the user asked for.
+_RESULT_DUMP_RE = re.compile(r"(^|\n)\s*\[\d+\]\s|\bURL\s*[:：]\s*http|\bDate/Snippet\s*[:：]", re.I)
+
 _FRAMEWORK_TEMPLATE_RE = re.compile(
     r"(被调用时使用了以下参数|該工具返回了以下結果|该工具返回了以下结果|"
     r"工具\s*[\"“][^\"”]{0,40}[\"”]\s*被调用)")
@@ -218,7 +229,7 @@ def _is_reasoning_text(text: str) -> bool:
     if not text or not text.strip():
         return False
     s = text.strip()
-    if _FRAMEWORK_TEMPLATE_RE.search(text):
+    if _FRAMEWORK_TEMPLATE_RE.search(text) or _RESULT_DUMP_RE.search(text):
         return True
     if _INLINE_HEADER_RE.search(text):
         return True
@@ -243,7 +254,12 @@ def _is_reasoning_text(text: str) -> bool:
     # president.") or replayed instructions. Judging by that property rather than by a list
     # of observed phrases is what keeps this from needing a new entry every time the model
     # rewords itself. Short English spans ("Emmanuel Macron.") stay speakable.
-    if not _CJK_RE.search(text):
+    # Judge the language of what the model WROTE, not of what it quoted. Deliberation
+    # about a Chinese request quotes that request back ('The user is asking me to search
+    # for "最新的科技新聞"'), and that borrowed CJK was enough to make the rule below treat
+    # an English planning sentence as a Chinese answer — so 0.8B read its own planning
+    # aloud. Parenthetical glosses ("(Latest tech news)") go the same way.
+    if not _CJK_RE.search(_QUOTED_RE.sub(" ", text)):
         low = s.lower()
         if re.search(r"^\s*\"?\s*wait\b", low):
             return True

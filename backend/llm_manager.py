@@ -39,12 +39,14 @@ LLM_SEED = int(os.getenv("LLM_SEED", "-1"))
 # id -> {label, path, alias}. `label` is what the UI shows; `alias` is what
 # llama-server reports in /v1/models and what must match LingStreaming's
 # `model_name` (sent as the "model" field of every chat completion request).
+# 0.8B is deliberately absent. Measured on this box, decode runs 236 tok/s at 0.8B
+# against 172 tok/s at 2B — 0.97 s vs 1.31 s for a 220-token answer. That 0.34 s is
+# spent inside a turn where the user already waits 1.0-3.6 s for first audio (search
+# round-trip and TTS dominate), so it buys nothing anyone can hear. What it costs is
+# reliability: every 0.8B build tested narrated its own planning, echoed the framework's
+# tool template, quoted the prompt back, or repeated itself — each needing another
+# filter. Unquantized f16 scored the same as q8, so this is capacity, not quantization.
 MODEL_REGISTRY: dict[str, dict] = {
-    "qwen3.5-0.8b-q8": {
-        "label": "Qwen3.5 0.8B Q8_0",
-        "path": os.getenv("LLM_PATH_0_8B", "/tmp/llms/Qwen3.5-0.8B-Q8_0.gguf"),
-        "alias": "qwen3.5-0.8b",
-    },
     "qwen3.5-2b-q4": {
         "label": "Qwen3.5 2B Q4_K_M",
         "path": os.getenv("LLM_PATH_2B", "/tmp/llms/Qwen3.5-2B-Q4_K_M.gguf"),
@@ -55,19 +57,20 @@ MODEL_REGISTRY: dict[str, dict] = {
         "path": os.getenv("LLM_PATH_4B", "/tmp/llms/Qwen3.5-4B-Q4_K_M.gguf"),
         "alias": "qwen3.5-4b",
     },
-    # Two more 0.8B-class weights, kept so the question "is 0.8B failing because it is
-    # quantized, or because it is 0.8B?" can be answered by switching rather than
-    # argued from first principles. apodex-0.8b at f16 is the same size class with no
-    # quantization loss at all; measured results are in the README.
-    "apodex-0.8b-q8": {
-        "label": "Apodex 1.0 0.8B Q8_0",
-        "path": os.getenv("LLM_PATH_APODEX_0_8B_Q8", "/tmp/llms/apodex-1.0-0.8b-q8_0.gguf"),
-        "alias": "apodex-0.8b-q8",
-    },
-    "apodex-0.8b-f16": {
-        "label": "Apodex 0.8B f16 (unquantized)",
-        "path": os.getenv("LLM_PATH_APODEX_0_8B_F16", "/tmp/llms/apodex-0.8b-f16.gguf"),
-        "alias": "apodex-0.8b-f16",
+    # Ling 3.0 tiny (bailingmoe3, 128 experts / 8 active). The alias must keep saying
+    # "ling": the agent harness matches on it to switch to Ling's tool-call dialect
+    # (llm/ling_fncall.py), which is a different syntax from the JSON one Qwen emits.
+    #
+    # Q5_K_M rather than the Q8_0 that was asked for. Measured on this box: 6.2 GB of
+    # the 12 GB card is already held by TTS+STT (2.4 GB), the embedding server and the
+    # LLM slot, so freeing the LLM leaves ~9.0 GB. Q8_0 is 8.41 GB of weights before
+    # any KV cache — it either OOMs or leaves the TTS process nothing to grow into.
+    # Q5_K_M is 5.72 GB and fits with room to spare; Q6_K (6.84 GB) also fits if you
+    # want to trade the headroom. Point LLM_PATH_LING at whichever you downloaded.
+    "ling-3.0-tiny": {
+        "label": "Ling 3.0 tiny Q5_K_M (MoE)",
+        "path": os.getenv("LLM_PATH_LING", "/tmp/llms/Ling-3.0-tiny-Q5_K_M.gguf"),
+        "alias": "ling-3.0-tiny",
     },
 }
 # NOT "LLM_MODEL_ID" — the agent harnesses (backend/agent/{qwen_harness,harness,

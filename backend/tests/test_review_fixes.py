@@ -182,7 +182,7 @@ class TestAuth(unittest.TestCase):
         with self._switch_ok():
             c = _client()
             first = c.post("/api/model", json={"model_id": "qwen3.5-2b-q4"})
-            second = c.post("/api/model", json={"model_id": "qwen3.5-0.8b-q8"})
+            second = c.post("/api/model", json={"model_id": "qwen3.5-4b-q4"})
         self.assertEqual(first.status_code, 200)
         self.assertEqual(second.status_code, 429, "immediate re-switch must not restart the server twice")
         j = second.json()
@@ -1670,11 +1670,13 @@ class TestLookupRequestIsNotOptional(unittest.TestCase):
                   "今天天氣不錯", "我們聊一下吧", ""):
             self.assertIsNone(self._req(t), t)
 
-    def test_a_date_question_does_not_become_a_web_search(self):
-        # The clock has its own verified path; forcing a search here would replace the
-        # wrong answer with a different wrong answer.
+    def test_a_date_question_routes_to_the_clock_not_a_web_search(self):
+        # A search here would replace the wrong answer with a different wrong answer.
+        # The date is not in the weights either, so it routes to the clock instead of
+        # being left to the model: 2B answered "今天是星期幾？" with the non-answer
+        # "今天是一週的幾號？" and called nothing at all.
         for t in ("今天是星期幾？", "What time is it right now?", "現在幾點了"):
-            self.assertIsNone(self._req(t), t)
+            self.assertEqual(self._req(t), "get_current_datetime", t)
 
     def test_weather_is_deliberately_out_of_scope(self):
         # Forcing weather from here would report the wrong tool name (the pre-flight
