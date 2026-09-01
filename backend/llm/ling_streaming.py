@@ -182,11 +182,48 @@ _BARE_HEADER_RE = re.compile(
 )
 
 
+# qwen_agent narrates tool calls to the model in Simplified Chinese
+# (llm/function_calling.py: 工具"…"被调用时使用了以下参数：… / 该工具返回了以下结果：…).
+# Small models echo that scaffolding back as if it were their answer, and it was
+# spoken aloud. Framework plumbing is never an answer, in any language.
+_FRAMEWORK_TEMPLATE_RE = re.compile(
+    r"(被调用时使用了以下参数|該工具返回了以下結果|该工具返回了以下结果|"
+    r"工具\s*[\"“][^\"”]{0,40}[\"”]\s*被调用)")
+
+# A deliberation header that continues on the same line ("Evaluate the Input: * User:
+# …"). The anchored forms above only catch a header alone on its line; quoting the
+# user's question after the colon puts CJK in the span, so the all-English rule below
+# does not fire either — which is how 0.8B kept speaking its own checklist.
+_INLINE_HEADER_RE = re.compile(
+    r"\b(?:evaluate|analyz[es]?|analyse|determine|identify|assess|consider|review|verify"
+    r"|decide|formulate|construct)\s+(?:the\s+)?(?:" + _META_NOUN + r")s?\s*:",
+    re.I,
+)
+
+
+# A transcript label the model writes when it is restating the exchange to itself
+# ("User Question: "今天是星期幾？"", "Input:", "Assistant:"). Quoting the user back is
+# never an answer to them, and the quote is what smuggles CJK into an otherwise
+# English deliberation span.
+_LABEL_PREFIX_RE = re.compile(
+    r"^\s*" + _LIST_MARKER + r"(?:\*\*)?\s*"
+    r"(?:user|assistant|system|human|ai|bot)\s*"
+    r"(?:question|input|prompt|query|request|message|says?|asks?|wants?)?\s*:",
+    re.I,
+)
+
+
 def _is_reasoning_text(text: str) -> bool:
     """Heuristic: does this sentence look like internal deliberation, not an answer?"""
     if not text or not text.strip():
         return False
     s = text.strip()
+    if _FRAMEWORK_TEMPLATE_RE.search(text):
+        return True
+    if _INLINE_HEADER_RE.search(text):
+        return True
+    if _LABEL_PREFIX_RE.match(s):
+        return True
     # Pure markup-thinking blocks
     if "Thinking Process" in text or "Analyze the Request" in text:
         return True

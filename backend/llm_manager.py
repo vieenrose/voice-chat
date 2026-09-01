@@ -55,6 +55,20 @@ MODEL_REGISTRY: dict[str, dict] = {
         "path": os.getenv("LLM_PATH_4B", "/tmp/llms/Qwen3.5-4B-Q4_K_M.gguf"),
         "alias": "qwen3.5-4b",
     },
+    # Two more 0.8B-class weights, kept so the question "is 0.8B failing because it is
+    # quantized, or because it is 0.8B?" can be answered by switching rather than
+    # argued from first principles. apodex-0.8b at f16 is the same size class with no
+    # quantization loss at all; measured results are in the README.
+    "apodex-0.8b-q8": {
+        "label": "Apodex 1.0 0.8B Q8_0",
+        "path": os.getenv("LLM_PATH_APODEX_0_8B_Q8", "/tmp/llms/apodex-1.0-0.8b-q8_0.gguf"),
+        "alias": "apodex-0.8b-q8",
+    },
+    "apodex-0.8b-f16": {
+        "label": "Apodex 0.8B f16 (unquantized)",
+        "path": os.getenv("LLM_PATH_APODEX_0_8B_F16", "/tmp/llms/apodex-0.8b-f16.gguf"),
+        "alias": "apodex-0.8b-f16",
+    },
 }
 # NOT "LLM_MODEL_ID" — the agent harnesses (backend/agent/{qwen_harness,harness,
 # pydantic_harness}.py) already read that name expecting a raw llama-server alias
