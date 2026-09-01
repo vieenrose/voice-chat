@@ -578,7 +578,7 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="")):
                 elif etype == "tts_start":
                     await websocket.send_text(json.dumps(event))
                 elif etype in ("stt_partial", "stt_final", "llm_token", "latency", "tts_end", "tool_call", "tool_result",
-                              "tool_guard"):
+                              "tool_guard", "reasoning", "llm_reasoning"):
                     await websocket.send_text(json.dumps(event, ensure_ascii=False))
                     if etype == "tool_call":
                         stats["tool_calls"] += 1
@@ -650,6 +650,8 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="")):
                         tts_buf = ""
                         llm_text_so_far = ""
                         cnt = 0
+                        from llm.ling_streaming import SpokenGuard as _SpokenGuard
+                        spoken_guard_app = _SpokenGuard()
                         import re
                         SENT_END = re.compile(r'[.!?。！？\n]')
                         first_llm = None
@@ -658,11 +660,13 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="")):
                         history = pipeline._get_history(session_id)
                         # Ensure history is trimmed and has system
                         history = pipeline._trim_history(history)
-                        # See llm/ling_streaming.py:LANG_HINT for why this is appended every turn
-                        # unconditionally (zh-TW default, English only for untranslatable terms).
-                        from llm.ling_streaming import LANG_HINT as _lang_hint
+                        # The zh-TW default lives in the system prompt (SYSTEM_PROMPT /
+                        # AGENT_SYSTEM_MESSAGE), never appended to the user's own words:
+                        # a hint glued onto the turn text became part of what the model
+                        # was asked, and it duly copied it into web_search queries and
+                        # read it back aloud as if it were the answer.
                         try:
-                            async for ev in pipeline.llm.generate_chat_with_tools(history, txt + _lang_hint) if hasattr(pipeline.llm, 'generate_chat_with_tools') else pipeline.llm.generate_with_tools(txt):
+                            async for ev in pipeline.llm.generate_chat_with_tools(history, txt) if hasattr(pipeline.llm, 'generate_chat_with_tools') else pipeline.llm.generate_with_tools(txt):
                                 # Check for barge-in cancellation
                                 if barge_in_event.is_set():
                                     logger.info("direct_tts cancelled by barge-in")
@@ -689,12 +693,24 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="")):
                                     await websocket.send_text(json.dumps(
                                         {"type": "tool_guard", "reason": ev.get("reason", ""),
                                          "tool": ev.get("tool", ""), "turn_id": my_turn_id}, ensure_ascii=False))
+                                elif ev["type"] in ("llm_reasoning", "reasoning"):
+                                    # Never spoken — forwarded to UI's reasoning panel only
+                                    await websocket.send_text(json.dumps({"type": "reasoning", "text": ev.get("text", ""), "delta": ev.get("text", ""), "turn_id": my_turn_id}, ensure_ascii=False))
                                 elif ev["type"] == "tool_result":
                                     # forward lightweight result to frontend (omit large content for WS size, but include formatted)
                                     await websocket.send_text(json.dumps({"type":"tool_result","name":ev["name"],"latency_ms":ev.get("latency_ms",0),"source":ev.get("result",{}).get("source","") if isinstance(ev.get("result"),dict) else "", "formatted":ev.get("formatted","")[:600], "turn_id": my_turn_id}, ensure_ascii=False))
                                 elif ev["type"] == "llm_token":
-                                    # Filter tool call XML from TTS/history
+                                    # Filter tool call XML and reasoning spillover from TTS/history
                                     _tok = ev.get("token","")
+                                    # Defense: if a reasoning chunk arrived as llm_token (budget truncated),
+                                    # re-route it to reasoning channel.
+                                    try:
+                                        from llm.ling_streaming import _is_reasoning_text as _is_r
+                                        if _is_r(_tok):
+                                            await websocket.send_text(json.dumps({"type": "reasoning", "text": _tok, "delta": _tok, "turn_id": my_turn_id}, ensure_ascii=False))
+                                            continue
+                                    except Exception:
+                                        pass
                                     if "<tool_call" in _tok or "<arg_" in _tok or "</" in _tok or "tool_call" in _tok.lower() or ("<" in _tok and ">" in _tok):
                                         continue
                                     if first_llm is None:
@@ -718,6 +734,23 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="")):
                                         if barge_in_event.is_set():
                                             break
                                         txt_s = tts_buf.strip()
+                                        # Never speak reasoning — route to UI panel instead
+                                        try:
+                                            from llm.ling_streaming import _is_reasoning_text as _is_r2
+                                            if _is_r2(txt_s):
+                                                await websocket.send_text(json.dumps({"type": "reasoning", "text": txt_s, "delta": txt_s, "turn_id": my_turn_id}, ensure_ascii=False))
+                                                tts_buf=""
+                                                cnt=0
+                                                continue
+                                        except Exception:
+                                            pass
+                                        # Never say the same thing twice in one turn (the harness
+                                        # re-streams an answer from the start on each new step).
+                                        if not spoken_guard_app.should_speak(txt_s):
+                                            logger.info(f"direct_tts skip duplicate: {txt_s[:60]}")
+                                            tts_buf=""
+                                            cnt=0
+                                            continue
                                         # Tool plumbing and question echoes are not speech.
                                         # Both rules live in pipeline.speech_to_speech so the
                                         # voice and text paths cannot drift apart — and the
@@ -762,7 +795,20 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="")):
                                 elif ev["type"] == "llm_done":
                                     if tts_buf.strip():
                                         _rem = tts_buf.strip()
-                                        if "<" in _rem and ">" in _rem:
+                                        _is_dup_rem = False
+                                        try:
+                                            from llm.ling_streaming import _is_reasoning_text as _is_r_rem2
+                                            if _is_r_rem2(_rem):
+                                                await websocket.send_text(json.dumps({"type": "reasoning", "text": _rem, "delta": _rem, "turn_id": my_turn_id}, ensure_ascii=False))
+                                                _is_dup_rem = True
+                                            elif not spoken_guard_app.should_speak(_rem):
+                                                logger.info(f"direct_tts skip duplicate remainder: {_rem[:60]}")
+                                                _is_dup_rem = True
+                                        except Exception:
+                                            pass
+                                        if _is_dup_rem:
+                                            pass
+                                        elif "<" in _rem and ">" in _rem:
                                             pass
                                         elif "tool_call" in _rem.lower() or _rem.strip().startswith("<"):
                                             pass

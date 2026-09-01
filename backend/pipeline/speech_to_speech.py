@@ -16,6 +16,7 @@ from loguru import logger
 import numpy as np
 
 from tts.spoken_text import normalize as _normalize_spoken_text   # stdlib-only, no engine deps
+from llm.ling_streaming import SpokenGuard
 
 
 # Text that is tool plumbing rather than speech must never reach the speaker. One case is
@@ -338,6 +339,7 @@ class HFSpeechToSpeechPipeline:
             tts_ttfb = None
             first_chunk_of_turn = True
             tool_queries: list[str] = []   # what the tools were asked, for echo suppression
+            spoken_guard = SpokenGuard()  # never speak the same thing twice in one turn
             turn_history = self._trim_history(self._get_history(session_id))
 
             async def emit(ev):
@@ -380,9 +382,9 @@ class HFSpeechToSpeechPipeline:
             # Use Ling multi-turn tool-aware generation (history + current prompt)
             # LingStreaming handles web_search via SearXNG and full chat template (<role>SYSTEM/HUMAN/ASSISTANT + <tool_call>)
             try:
-                from llm.ling_streaming import LANG_HINT
-                prompt_with_hint = stt_final_text + LANG_HINT  # history keeps the raw transcript, not the hint
-                llm_gen = self.llm.generate_chat_with_tools(turn_history, prompt_with_hint) if hasattr(self.llm, 'generate_chat_with_tools') else self.llm.generate_with_tools(prompt_with_hint)
+                # The zh-TW default belongs in the system prompt, not glued onto the
+                # user's transcript — see the same note in app.py's text path.
+                llm_gen = self.llm.generate_chat_with_tools(turn_history, stt_final_text) if hasattr(self.llm, 'generate_chat_with_tools') else self.llm.generate_with_tools(stt_final_text)
                 async for llm_event in llm_gen:
                     if llm_event["type"] == "llm_reset":
                         # The harness streamed answer text and then had to take it back
@@ -405,9 +407,20 @@ class HFSpeechToSpeechPipeline:
                     if llm_event["type"] == "tool_result":
                         await emit({"type": "tool_result", "name": llm_event["name"], "result": llm_event.get("result"), "formatted": llm_event.get("formatted",""), "latency_ms": llm_event.get("latency_ms",0), "source": llm_event.get("result",{}).get("source","") if isinstance(llm_event.get("result"), dict) else ""})
                         continue
+                    if llm_event["type"] in ("llm_reasoning", "reasoning"):
+                        # Never spoken — forwarded to UI's reasoning panel only
+                        await emit({"type": "reasoning", "text": llm_event.get("text", ""), "delta": llm_event.get("text", "")})
+                        continue
                     if llm_event["type"] == "llm_token":
-                        # Filter tool call artifacts from TTS/history - they are XML, not natural language
+                        # Filter tool call artifacts and leaked reasoning from speech
                         _tok = llm_event.get("token","")
+                        try:
+                            from llm.ling_streaming import _is_reasoning_text as _is_r_tok
+                            if _is_r_tok(_tok):
+                                await emit({"type": "reasoning", "text": _tok, "delta": _tok})
+                                continue
+                        except Exception:
+                            pass
                         if "<tool_call" in _tok or "<arg_" in _tok or "</" in _tok or "tool_call" in _tok.lower():
                             continue
                         if first_llm_t is None:
@@ -430,6 +443,17 @@ class HFSpeechToSpeechPipeline:
 
                         if should_flush and tts_buffer.strip():
                             text_to_synth = tts_buffer.strip()
+                            # Defense: if a reasoning spillover arrived as llm_token (budget truncated),
+                            # re-route it to reasoning channel instead of TTS.
+                            try:
+                                from llm.ling_streaming import _is_reasoning_text as _is_reasoning
+                                if _is_reasoning(text_to_synth):
+                                    await emit({"type": "reasoning", "text": text_to_synth, "delta": text_to_synth})
+                                    tts_buffer = ""
+                                    tts_token_count = 0
+                                    continue
+                            except Exception:
+                                pass
                             _low = text_to_synth.lower()
                             if _is_tool_artifact(text_to_synth):
                                 logger.info(f"Skip TTS for tool artifact: {text_to_synth[:60]}")
@@ -449,6 +473,11 @@ class HFSpeechToSpeechPipeline:
                                 continue
                             tts_buffer = ""
                             tts_token_count = 0
+                            # Never say the same thing twice in one turn (the harness
+                            # re-streams an answer from the start on each new step).
+                            if not spoken_guard.should_speak(text_to_synth):
+                                logger.info(f"Skip TTS duplicate sentence: {text_to_synth[:60]}")
+                                continue
                             logger.info(f"[TTS flush] trig='{tok!r}' text='{text_to_synth[:60]}'")
                             await synth_and_emit(text_to_synth)
 
@@ -456,10 +485,21 @@ class HFSpeechToSpeechPipeline:
                         # flush remainder
                         if tts_buffer.strip():
                             _remainder = tts_buffer.strip()
-                            if ("<" in _remainder and ">" in _remainder) or _remainder.strip().startswith("<") or "tool_call" in _remainder.lower():
-                                logger.info(f"Skip TTS remainder tool artifact: {_remainder[:60]}")
-                            else:
-                                await synth_and_emit(_remainder)
+                            try:
+                                from llm.ling_streaming import _is_reasoning_text as _is_reasoning2
+                                if _is_reasoning2(_remainder):
+                                    await emit({"type": "reasoning", "text": _remainder, "delta": _remainder})
+                                elif ("<" in _remainder and ">" in _remainder) or _remainder.strip().startswith("<") or "tool_call" in _remainder.lower():
+                                    logger.info(f"Skip TTS remainder tool artifact: {_remainder[:60]}")
+                                elif not spoken_guard.should_speak(_remainder):
+                                    logger.info(f"Skip TTS duplicate remainder: {_remainder[:60]}")
+                                else:
+                                    await synth_and_emit(_remainder)
+                            except Exception:
+                                if ("<" in _remainder and ">" in _remainder) or _remainder.strip().startswith("<") or "tool_call" in _remainder.lower():
+                                    logger.info(f"Skip TTS remainder tool artifact: {_remainder[:60]}")
+                                else:
+                                    await synth_and_emit(_remainder)
                         # Update multi-turn history for Ling 3.0 chat template (system + turns)
                         try:
                             from llm.ling_streaming import SYSTEM_PROMPT

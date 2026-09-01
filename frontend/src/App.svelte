@@ -47,6 +47,7 @@
   let sttPartial = $state('');
   let sttFinal = $state('');
   let llmStreaming = $state('');
+  let reasoningStreaming = $state('');
   let ttsText = $state('');
   let chatHistory = $state([]);
   let latency = $state({stt_ms:0, llm_ttft_ms:0, tts_ttfb_ms:0, e2e_ms:0});
@@ -178,12 +179,37 @@
   function handleServerMessage(msg){
     switch(msg.type){
       case 'stt_partial': sttPartial = toTraditional(msg.text); break;
-      case 'stt_final': sttFinal = toTraditional(msg.text); sttPartial = ''; chatHistory = [...chatHistory, {role:'user', text: toTraditional(msg.text)}]; llmStreaming = ''; ttsText = ''; toolStatus = ''; if(msg.text && msg.text.trim()) turnActive = true; break;
+      case 'reasoning':
+      case 'llm_reasoning': {
+        const delta = toTraditional(msg.text || msg.delta || '');
+        if(!delta) break;
+        reasoningStreaming += delta;
+        // Find the most recent reasoning bubble (may not be the last entry if tools interleaved)
+        let rIdx = -1;
+        for(let i=chatHistory.length-1; i>=0; i--) if(chatHistory[i].role==='reasoning'){ rIdx=i; break; }
+        if(rIdx >= 0){
+          // Append only the new delta to the existing bubble to avoid duplicating
+          // the cumulative prefix when a new bubble would otherwise be created
+          // after an interleaving tool message.
+          chatHistory[rIdx].text += delta;
+          chatHistory[rIdx].streaming = true;
+          chatHistory = [...chatHistory];
+        } else {
+          chatHistory = [...chatHistory, {role:'reasoning', text: delta, streaming:true}];
+        }
+        break;
+      }
+      case 'stt_final': sttFinal = toTraditional(msg.text); sttPartial = ''; chatHistory = [...chatHistory, {role:'user', text: toTraditional(msg.text)}]; llmStreaming = ''; reasoningStreaming = ''; ttsText = ''; toolStatus = ''; if(msg.text && msg.text.trim()) turnActive = true; break;
       case 'llm_reset': if(isStaleTurn(msg.turn_id)) break;
         // The assistant streamed text it then withdrew (a tool call appeared mid
         // stream). Nothing was ever spoken from it — clear the partial bubble rather
         // than leaving a half-sentence on screen next to the real answer.
         llmStreaming = '';
+        reasoningStreaming = '';
+        // Remove trailing streaming reasoning bubble as well if present
+        if(chatHistory.length && chatHistory[chatHistory.length-1].role==='reasoning' && chatHistory[chatHistory.length-1].streaming){
+          chatHistory = chatHistory.slice(0, -1);
+        }
         if(chatHistory.length && chatHistory[chatHistory.length-1].streaming){
           chatHistory = chatHistory.slice(0, -1);
         }
@@ -202,7 +228,7 @@
           let preview = (msg.formatted||'').slice(0,200).replace(/\n/g,' '); chatHistory = [...chatHistory, {role:'tool', text: `✓ ${src} · ${latency}ms — ${preview}`}]; } break;
       case 'tts_chunk': if(isStaleTurn(msg.turn_id)) break; ttsText = toTraditional(msg.text); if(msg.pcm){ try{ const pcm = base64ToInt16(msg.pcm); queueAudio(pcm, msg.sampleRate || 16000); }catch(e){ audioError = String(e).slice(0,120); } } updateAssistantStreaming(); break;
       case 'tts_start': if(isStaleTurn(msg.turn_id)) break; preRollStarted = false; preRollQueue.length = 0; speaking = true; break;
-      case 'tts_end': if(isStaleTurn(msg.turn_id)) break; flushPreRoll(); speaking = false; turnActive = false; finalizeAssistant(); toolStatus = ''; break;
+      case 'tts_end': if(isStaleTurn(msg.turn_id)) break; flushPreRoll(); speaking = false; turnActive = false; finalizeAssistant(); finalizeReasoning(); toolStatus = ''; break;
       case 'latency': if(isStaleTurn(msg.turn_id)) break; latency = msg; break;
       case 'barge_in': killedTurnIds.add(msg.turn_id ?? activeTurnId); stopPlayback(); break;
     }
@@ -221,6 +247,16 @@
     if(chatHistory.length && chatHistory[chatHistory.length-1].streaming){ chatHistory[chatHistory.length-1].streaming = false; chatHistory[chatHistory.length-1].text = displayText; chatHistory = [...chatHistory]; }
     else if(displayText){ chatHistory = [...chatHistory, {role:'assistant', text: displayText}]; }
     llmStreaming='';
+  }
+  function finalizeReasoning(){
+    for(let i=chatHistory.length-1; i>=0; i--){
+      if(chatHistory[i].role==='reasoning' && chatHistory[i].streaming){
+        chatHistory[i].streaming = false;
+        chatHistory = [...chatHistory];
+        break;
+      }
+    }
+    reasoningStreaming = '';
   }
   function base64ToInt16(b64){ const bin = atob(b64); const bytes = new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i); return new Int16Array(bytes.buffer); }
   function floatTo16BitPCM(float32){ const out = new Int16Array(float32.length); for(let i=0;i<float32.length;i++){ let s = Math.max(-1, Math.min(1, float32[i])); out[i] = s < 0 ? s*0x8000 : s*0x7FFF; } return out; }
@@ -319,6 +355,18 @@
   $effect(()=>{ try{ theme=localStorage.getItem('vc-theme')||'dark'; }catch(e){} document.body.classList.toggle('light', theme==='light'); });
   function toggleTheme(){ theme=theme==='dark'?'light':'dark'; try{localStorage.setItem('vc-theme',theme);}catch(e){} document.body.classList.toggle('light', theme==='light'); }
   function clearChat(){ chatHistory=[]; }
+  function exportConversation(){
+    const payload = {
+      exportedAt: new Date().toISOString(),
+      chatHistory: chatHistory.map(m => ({role: m.role, text: m.text, streaming: !!m.streaming})),
+      latency, mode, sttBackend, ttsBackend, currentModelId, reasoningStreaming, llmStreaming
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {type: 'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url;
+    a.download = `conversation-${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.json`;
+    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+  }
 </script>
 
 <style>
@@ -377,13 +425,38 @@
   .bubble.assistant{align-self:flex-start; background:#1e1e28; border:1px solid #232332}
   .bubble.system{align-self:center; background:transparent; border:1px dashed #2a2a3a; font-size:11px; opacity:0.7}
   .bubble.tool{align-self:center; background:#0e1a14; border:1px solid #1e3326; color:#8fd9b0; font-size:11px; max-width:90%; border-radius:8px; padding:7px 10px}
+  .bubble.reasoning{align-self:flex-start; background:#1a1628; border:1px solid #2e2648; color:#9d8ec7; font-size:11px; max-width:90%; border-radius:10px; padding:10px 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; line-height:1.6; opacity:0.9}
+  .bubble.reasoning.streaming{opacity:0.7}
+  .reasoning-label{font-size:10px; font-weight:700; letter-spacing:0.08em; text-transform:uppercase; opacity:0.6; margin-bottom:6px; display:flex; align-items:center; gap:6px}
+  .reasoning-body{white-space:pre-wrap; word-break:break-word; max-height:180px; overflow:auto; scrollbar-width:thin}
+  .reasoning-body.collapsed{max-height:72px}
+  :global(body.light) .bubble.reasoning{background:#f3f0ff; border-color:#d8ccff; color:#5a3fc0}
   .bubble.markdown :global(p){margin:6px 0}
   .bubble.markdown :global(strong){color:#fff; font-weight:700}
   :global(body.light) .bubble.markdown :global(strong){color:#1a1a24}
   .bubble.markdown :global(ul), .bubble.markdown :global(ol){margin:6px 0 6px 18px; padding:0}
   .bubble.markdown :global(li){margin:4px 0}
-  .bubble.markdown :global(a){color:#8ea6ff; text-decoration:underline}
-  .bubble.markdown :global(h1), .bubble.markdown :global(h2), .bubble.markdown :global(h3){margin:8px 0 4px; font-size:13px}
+  .bubble.markdown :global(a){color:#8ea6ff; text-decoration:underline; word-break:break-all}
+  .bubble.markdown :global(a:hover){color:#a8beff}
+  .bubble.markdown :global(h1), .bubble.markdown :global(h2), .bubble.markdown :global(h3){margin:10px 0 6px; font-size:13px; font-weight:700; border-bottom:1px solid #232332; padding-bottom:4px}
+  :global(body.light) .bubble.markdown :global(h1), :global(body.light) .bubble.markdown :global(h2), :global(body.light) .bubble.markdown :global(h3){border-color:#e8eaf0}
+  .bubble.markdown :global(h1){font-size:15px}
+  .bubble.markdown :global(h2){font-size:14px}
+  .bubble.markdown :global(code){background:#0f0f14; border:1px solid #1e1e28; padding:1px 5px; border-radius:4px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11.5px; word-break:break-word}
+  :global(body.light) .bubble.markdown :global(code){background:#f0f1f8; border-color:#e3e4ee}
+  .bubble.markdown :global(pre){background:#0a0a0f; border:1px solid #1e1e28; border-radius:8px; padding:10px 12px; overflow:auto; margin:8px 0; max-height:320px}
+  :global(body.light) .bubble.markdown :global(pre){background:#f8f9fc; border-color:#e8eaf0}
+  .bubble.markdown :global(pre code){background:none; border:none; padding:0; font-size:12px; white-space:pre}
+  .bubble.markdown :global(blockquote){border-left:3px solid #7c5cff; margin:8px 0; padding:6px 10px; background:rgba(124,92,255,0.08); border-radius:0 6px 6px 0; opacity:0.9}
+  :global(body.light) .bubble.markdown :global(blockquote){background:rgba(124,92,255,0.06); border-left-color:#7c5cff}
+  .bubble.markdown :global(table){width:100%; border-collapse:collapse; margin:8px 0; font-size:12px; display:block; overflow:auto}
+  .bubble.markdown :global(th), .bubble.markdown :global(td){border:1px solid #232332; padding:6px 8px; text-align:left}
+  .bubble.markdown :global(th){background:#1a1a28; font-weight:600}
+  :global(body.light) .bubble.markdown :global(th){background:#f1f2f8}
+  :global(body.light) .bubble.markdown :global(td), :global(body.light) .bubble.markdown :global(th){border-color:#e3e4ee}
+  .bubble.markdown :global(hr){border:none; border-top:1px solid #232332; margin:10px 0}
+  :global(body.light) .bubble.markdown :global(hr){border-color:#e8eaf0}
+  .bubble.markdown :global(img){max-width:100%; border-radius:8px; margin:6px 0}
   :global(body.light) .bubble.assistant{background:#f1f2f8; border-color:#e3e4ee}
   :global(body.light) .bubble.system{background:#f8f9fc; border-color:#e3e4ee}
   :global(body.light) .bubble.tool{background:#eef8f0; border-color:#c8e8d0; color:#2a6b4a}
@@ -488,10 +561,15 @@
 
     <div class="stack chat-col">
       <div class="card" style="display:flex; flex-direction:column; min-height:500px">
-        <h3>Conversation <span style="margin-left:auto; font-size:11px; opacity:0.5; text-transform:none; letter-spacing:0">{chatHistory.length} 則訊息</span> <button class="ghost" style="padding:4px 8px; font-size:11px; margin-left:8px" onclick={clearChat}>清除</button></h3>
+        <h3>Conversation <span style="margin-left:auto; font-size:11px; opacity:0.5; text-transform:none; letter-spacing:0">{chatHistory.length} 則訊息</span> <button class="ghost" style="padding:4px 8px; font-size:11px; margin-left:8px" onclick={exportConversation} title="匯出原始對話 JSON（除錯用）">匯出 JSON</button> <button class="ghost" style="padding:4px 8px; font-size:11px; margin-left:4px" onclick={clearChat}>清除</button></h3>
         <div class="chat" id="chat">
           {#each chatHistory as m}
-            {#if m.role==='assistant'}
+            {#if m.role==='reasoning'}
+              <details class="bubble reasoning" open={m.streaming ? true : undefined}>
+                <summary class="reasoning-label">🧠 思考過程 {#if m.streaming}<span style="opacity:0.6">· 思考中…</span>{:else}<span style="opacity:0.45">（僅顯示，不會朗讀）</span>{/if}</summary>
+                <div class="reasoning-body">{m.text}{#if m.streaming}<span style="opacity:0.6"> ▌</span>{/if}</div>
+              </details>
+            {:else if m.role==='assistant'}
               <div class="bubble {m.role} {m.streaming ? 'streaming' : ''} markdown">{@html renderMarkdown(m.text)}{#if m.streaming}<span style="opacity:0.6"> ▌</span>{/if}</div>
             {:else}
               <div class="bubble {m.role} {m.streaming ? 'streaming' : ''}">{m.text}{#if m.streaming}<span style="opacity:0.6"> ▌</span>{/if}</div>

@@ -22,6 +22,13 @@ import re
 from agent._shared import (set_emit_target, emit as _emit, agent_call_lock,
                           guard as _guard, reset_guard_reason as _reset_guard)
 
+# Reasoning vs answer separation for TTS: thinking must never be spoken.
+# Single source of truth lives in llm.ling_streaming; this is a thin re-export so the
+# two paths cannot drift. Fallback keeps the harness importable even if ling is absent.
+from llm.ling_streaming import _is_reasoning_text as _is_reasoning_chunk
+
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
 # --- agent sampling knobs -------------------------------------------------------
 # Tool-call routing on this 2B model is sampling-sensitive: the same 7-query set scored
 # 57%, 57%, 71% (mean 62%) across three passes at temperature 0.7. Two things follow:
@@ -74,6 +81,13 @@ class QwenWebSearch(BaseTool):
                 query = s
         else:
             query = params.get('query', '') if isinstance(params, dict) else ''
+        # Defense: strip language-hint leakage that was appended to the user turn
+        try:
+            from tools.web_search import _sanitize_query as _sq
+            query = _sq(query)
+        except Exception:
+            if "（請一律使用繁體中文" in query:
+                query = query.split("（請一律使用繁體中文")[0].strip()
         _emit({"type": "tool_call", "name": "web_search", "arguments": {"query": query}, "query": query})
         # Use sync version for Qwen-Agent (which is sync)
         from tools.web_search import web_search_sync, format_results
@@ -207,6 +221,10 @@ def fabricates_time_without_tool(task: str, text: str, tool_ran: bool = False) -
     mentioned in passing by a non-time question."""
     if tool_ran or not task or not text:
         return False
+    # Weather queries often contain "今天" (e.g. "台北今天天氣如何？") but are not time questions —
+    # treating them as such forced a spurious get_current_datetime and a spoken clock.
+    if re.search(r"(天氣|天气|氣溫|气温|weather|forecast)", task, re.I):
+        return False
     if not _TIME_QUESTION_RE.search(task):
         return False
     return bool(_TIME_CLAIM_RE.search(text))
@@ -304,11 +322,6 @@ def required_tool_for_request(task: str):
     the sentence "今天有新聞嗎？我來幫您搜尋一下。" — an announcement of a search that was
     never performed, spoken to the user as the answer. A request that names the lookup in
     its own wording does not need the model's permission.
-
-    Deliberately NOT included: weather. get_weather reliably gets called by the model
-    (measured), and forcing it from here would either duplicate the call or report the
-    wrong tool name — the pre-flight path reaches weather through web_search, and claiming
-    `get_weather` ran when `web_search` ran would make the benchmark lie.
     """
     if not task or not task.strip():
         return None
@@ -368,6 +381,12 @@ def offers_action_without_doing_it(task: str, text: str, tool_ran: bool = False)
     "我可以幫你查天氣，要嗎？" answer to a vague remark is left alone."""
     if tool_ran or not text:
         return False
+    # Weather promises are also empty promises, even though weather is not forced via
+    # required_tool_for_request (deliberately, to avoid duplicate pre-flight). A bare
+    # "讓我查一下天氣預報" without a call must still be repaired — otherwise it is spoken.
+    if _WEATHER_REQUEST_RE.search(task or ""):
+        if re.search(r"(讓我|我來|我會|幫您|查一下天氣|天氣預報|幫你查天氣)", text, re.I):
+            return True
     if required_tool_for_request(task) is None:
         return False
     return bool(_OFFER_RE.search(text) or _OFFER_EN_RE.search(text))
@@ -517,9 +536,12 @@ def _make_agent(function_list=None):
         # back into the full tool set (an empty list is falsy) — which is exactly how
         # the duplicate-search bug came back after being "fixed".
         function_list=list(_TOOLS_FULL if function_list is None else function_list),
-        system_message=("You are a helpful voice assistant." + _smalltalk_rule() + "For weather use get_weather(location, date) — 1 call max. For general search use web_search — 1 call max with 3-8 words, then answer. For date/time use get_current_datetime — 1 call max. Never do more than 2 tool calls per turn. Always default to Traditional Chinese (Taiwan usage, 繁體中文) regardless of what language the question was asked in — only keep English for proper nouns, technical terms, or vocabulary that doesn't translate well; never answer a whole sentence in Simplified Chinese or English."
-        ),
+        system_message=("You are a helpful voice assistant." + _smalltalk_rule() + AGENT_SYSTEM_MESSAGE),
     )
+
+# Module-level so llm.ling_streaming._is_own_prompt_echo() can recognize this text
+# if the model replays it as an "answer" (it must never be spoken).
+AGENT_SYSTEM_MESSAGE = "For weather use get_weather(location, date) — 1 call max. For general search use web_search — 1 call max with 3-8 words, then answer. For date/time use get_current_datetime — 1 call max. Never do more than 2 tool calls per turn. Always default to Traditional Chinese (Taiwan usage, 繁體中文) regardless of what language the question was asked in — only keep English for proper nouns, technical terms, or vocabulary that doesn't translate well; never answer a whole sentence in Simplified Chinese or English."
 
 _TOOLS_FULL = ['web_search', 'get_weather', 'get_current_datetime']
 _agents: dict = {}
@@ -622,6 +644,7 @@ async def run_agent_task(task: str, event_q=None, history=None) -> str:
             # this exists to get. Permanent abandonment only for template junk.
             stream_step = -1
             streamed_len = 0
+            reasoning_len = 0
             abandoned = False
             with agent_call_lock:
                 run_kwargs = {"seed": int(LLM_AGENT_SEED)} if LLM_AGENT_SEED else {}
@@ -630,9 +653,27 @@ async def run_agent_task(task: str, event_q=None, history=None) -> str:
                     if abandoned:
                         continue
                     lst = resp if isinstance(resp, list) else [resp]
+                    # Surface reasoning_content as its own event (never to TTS)
+                    for m in lst:
+                        # qwen_agent messages can be dict or Message objects
+                        rc = None
+                        if isinstance(m, dict):
+                            rc = m.get('reasoning_content')
+                        elif hasattr(m, 'reasoning_content'):
+                            rc = getattr(m, 'reasoning_content', None)
+                        if isinstance(rc, str) and rc:
+                            if len(rc) > reasoning_len:
+                                _emit({"type": "llm_reasoning", "text": rc[reasoning_len:]})
+                                reasoning_len = len(rc)
                     last = lst[-1] if lst else None
-                    if isinstance(last, dict) and last.get('role') == 'assistant' and not last.get('function_call'):
-                        c = last.get('content')
+                    # Normalize last to dict
+                    last_dict = None
+                    if isinstance(last, dict):
+                        last_dict = last
+                    elif last is not None and hasattr(last, 'role'):
+                        last_dict = {'role': getattr(last, 'role', ''), 'content': getattr(last, 'content', ''), 'function_call': getattr(last, 'function_call', None)}
+                    if isinstance(last_dict, dict) and last_dict.get('role') == 'assistant' and not last_dict.get('function_call'):
+                        c = last_dict.get('content')
                         if isinstance(c, str):
                             if '<tool_call>' in c or '<arg_' in c or '<|' in c:
                                 abandoned = True
@@ -643,7 +684,12 @@ async def run_agent_task(task: str, event_q=None, history=None) -> str:
                                     _emit({"type": "llm_delta", "text": "", "reset": True})
                                 stream_step, streamed_len = len(lst), 0
                             if len(c) > streamed_len:
-                                _emit({"type": "llm_delta", "text": c[streamed_len:]})
+                                delta = c[streamed_len:]
+                                # Spillover: reasoning truncated into content (budget exceeded)
+                                if _is_reasoning_chunk(delta):
+                                    _emit({"type": "llm_reasoning", "text": delta})
+                                else:
+                                    _emit({"type": "llm_delta", "text": delta})
                                 streamed_len = len(c)
                     else:
                         # Tail is a tool call / tool result: this step isn't the answer.

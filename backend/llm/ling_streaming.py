@@ -27,6 +27,152 @@ def _strip_tool_xml(t: str) -> str:
     return t.strip(" \n,;")
 
 _THINK_RE = re.compile(r"<\|im_start\|>think.*?(?:\*/?<\|im_end\|>|\*/|</think>|$)|<think\b[^>]*>.*?(?:</think>|$)", re.S)
+# Fallback for models that emit plain-English thinking without tags (observed with
+# Qwen3.5-0.8B via --reasoning-format deepseek where reasoning_budget truncated the
+# thinking block and the remainder spilled into `content` as "Thinking Process: …").
+# Shape-based, not per-question: matches the template header plus any bullet checklist.
+_THINK_PLAIN_RE = re.compile(
+    r"Thinking Process:.*?(?:\n\s*\n|$)|"
+    r"(?:^|\n)\s*\*\*?Analyze the Request.*?(?:\n\s*\n|$)|"
+    r"(?:^|\n)\s*Constraint Checklist.*?(?:\n\s*\n|$)",
+    re.S | re.I,
+)
+
+# Generic reasoning-marker detector for streaming deltas that arrived as `content`
+# after reasoning_content was truncated (reasoning_budget). No CJK + deliberation
+# verbs + tool/meta nouns = thinking, regardless of exact wording.
+_REASONING_MARKER_RE = re.compile(
+    # Deliberation the model narrates about its own task. Kept to phrases that are
+    # *about reasoning itself* — anything that is merely our own instruction text
+    # coming back is caught generically by _is_own_prompt_echo() instead of being
+    # listed here, so a reworded system prompt cannot silently start leaking.
+    r"(Thinking Process|Analyze the Request|Constraint Checklist|Constraint Check|Confidence Score"
+    r"|This is unusual|However,\s+I must|I must acknowledge|Let.s break down"
+    r"|The user wants me to|the user.s prompt says|the instruction says|system instruction says"
+    r"|looking closely at the prompt|prompt structure|System constraints"
+    r"|\bQuery:\s*\"|\* Query:|\* Language:|\* Constraint:|Tool Call:|User asks:)",
+    re.I,
+)
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _norm_for_echo(t: str) -> str:
+    """Normalize for substring comparison: casefold, drop punctuation/whitespace."""
+    return re.sub(r"[^\w一-鿿]+", "", (t or "").lower())
+
+
+class SpokenGuard:
+    """Tracks what has already been spoken within one turn so nothing is said twice.
+
+    The agent harness re-streams an assistant message from the beginning whenever
+    qwen_agent opens a new step (it emits `reset` so the UI can redraw its bubble),
+    but audio that has already played cannot be withdrawn. The re-stream also splits
+    at different sentence boundaries than the first pass, so comparing whole
+    sentences for equality misses it — "…輝達與 Lambda 簽署了…" the first time can come
+    back as a bare "Lambda 簽署了…". Matching against the normalized concatenation of
+    everything spoken so far catches the exact repeat and the re-chunked fragment
+    alike, without needing to know anything about the content."""
+
+    #
+
+    MIN_DEDUP_LEN = 8  # below this, a legitimately repeated short reply is likelier than a bug
+
+    def __init__(self) -> None:
+        self._spoken = ""
+
+    def should_speak(self, text: str) -> bool:
+        norm = _norm_for_echo(text)
+        if not norm:
+            return False
+        if len(norm) >= self.MIN_DEDUP_LEN and norm in self._spoken:
+            return False
+        self._spoken += norm
+        return True
+
+
+_ECHO_CORPUS: str | None = None
+
+
+def _is_own_prompt_echo(s: str) -> bool:
+    """True when the text is a verbatim span of our OWN instructions.
+
+    The model sometimes replays part of its system prompt (or the appended
+    language hint) as if it were the answer — observed spoken aloud as
+    "proper nouns, technical terms, or vocabulary that doesn't translate
+    well; never answer a whole sentence in Simplified Chinese or English."
+    Nothing we told the model is ever a legitimate answer to the user, so
+    rather than blocklisting the individual sentences that happened to leak
+    (which would be per-case hard-coding that the next paraphrase escapes),
+    check membership in the instruction text itself. Built lazily because
+    SYSTEM_PROMPT/LANG_HINT are defined below this helper."""
+    global _ECHO_CORPUS
+    norm = _norm_for_echo(s)
+    # Short fragments ("繁體中文", "web_search") legitimately appear in real answers.
+    if len(norm) < 30:
+        return False
+    if _ECHO_CORPUS is None:
+        parts = []
+        for name in ("SYSTEM_PROMPT", "LANG_HINT"):
+            v = globals().get(name)
+            if isinstance(v, str):
+                parts.append(v)
+        try:  # the agent harness carries its own, differently-worded system message
+            from agent.qwen_harness import AGENT_SYSTEM_MESSAGE
+            if isinstance(AGENT_SYSTEM_MESSAGE, str):
+                parts.append(AGENT_SYSTEM_MESSAGE)
+        except Exception:
+            pass
+        _ECHO_CORPUS = _norm_for_echo(" ".join(parts))
+    return bool(_ECHO_CORPUS) and norm in _ECHO_CORPUS
+
+
+# A deliberation checklist header ("2. Evaluate Tool Call Need:", "Determine the
+# language:"). Shape-based: an English decision verb aimed at a meta noun, not at
+# anything the user asked about.
+_CHECKLIST_HEADER_RE = re.compile(
+    r"^\s*(?:[*\-#\d.]+\s*)*(?:\*\*)?\s*"
+    r"(evaluate|analyz[es]?|analyse|determine|identify|assess|consider|review|verify|check|decide|formulate|construct)\b"
+    r"[^.?!\n]{0,60}?\b(tool|call|request|constraint|language|query|need|response|answer|output|prompt|instruction)s?\b"
+    r"[^.?!\n]{0,40}:\s*(?:\*\*)?\s*$",
+    re.I,
+)
+
+
+def _is_reasoning_text(text: str) -> bool:
+    """Heuristic: does this sentence look like internal deliberation, not an answer?"""
+    if not text or not text.strip():
+        return False
+    s = text.strip()
+    # Pure markup-thinking blocks
+    if "Thinking Process" in text or "Analyze the Request" in text:
+        return True
+    if _REASONING_MARKER_RE.search(text):
+        return True
+    # Our own instructions replayed back at us are never an answer
+    if _is_own_prompt_echo(s):
+        return True
+    if _CHECKLIST_HEADER_RE.match(s):
+        return True
+    # No CJK at all -> likely spillover (answer must be zh-TW per system prompt)
+    if not _CJK_RE.search(text):
+        low = s.lower()
+        if re.search(r"^\s*\"?\s*wait\b", low):
+            return True
+        if re.search(r"\bi need to\b", low) and len(s) < 160:
+            return True
+        # Any English sentence that is meta-talk about the task/prompt/system is reasoning
+        if any(kw in low for kw in ["constraint", "prompt already included", "tool call example", "system constraints", "the user prompt", "instruction says", "user asks:"]):
+            return True
+        if len(s) > 20:
+            has_first_person = any(p in low for p in ["i must", "i need to", "i should", "let me", "wait,", "however"])
+            has_meta = any(m in low for m in ["tool", "instruction", "prompt", "search", "constraint", "checklist", "acknowledge", "system"])
+            if has_first_person and has_meta:
+                return True
+            if text.count("*") >= 2 and "-" in text and "tool" in low:
+                return True
+            if re.match(r"^[A-Za-z\s,']{10,}\.?$", s) and has_first_person:
+                return True
+    return False
 
 
 def _strip_thinking(text: str) -> str:
@@ -47,12 +193,24 @@ def _strip_thinking(text: str) -> str:
     test_live_paths_hold_no_benchmark_query_literals)."""
     if not text:
         return text
-    if "<" not in text:
-        return text
-    out = _THINK_RE.sub(" ", text)
-    # A thinking block that never closed swallows the answer too; prefer the tail after the
-    # last marker if that leaves something speakable, else keep the pre-block prose.
-    return re.sub(r"\s{2,}", " ", out).strip()
+    # Strip tag-based thinking first
+    if "<" in text:
+        text = _THINK_RE.sub(" ", text)
+    # Strip plain-English Thinking Process blocks (no tags, from truncated budget)
+    if "Thinking Process" in text or "Analyze the Request" in text:
+        text = _THINK_PLAIN_RE.sub(" ", text)
+    # Always strip any remaining reasoning sentences — entry 9 leaked "The user wants me to
+    # summarize... However, looking closely at the prompt structure..." as the final answer
+    # without any Thinking Process header, so header-only filtering missed it.
+    parts = re.split(r"(?<=[.!?。！？\n])\s+", text)
+    kept = [p for p in parts if not _is_reasoning_text(p)]
+    # Only apply if we actually removed at least one reasoning sentence and kept something
+    # meaningful — avoids stripping a legitimate short answer that happens to contain a marker word.
+    if kept and len(kept) != len(parts) and len(" ".join(kept).strip()) > 10:
+        text = " ".join(kept)
+    elif "Thinking Process" in text:
+        text = _REASONING_MARKER_RE.sub(" ", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
 
 
 def _clean_leakage(text: str) -> str:
@@ -131,11 +289,12 @@ TOOL_DEFS = [
 
 SYSTEM_PROMPT = "You are a helpful, informative voice assistant with web search. Be conversational and natural for voice chat. For casual chat keep under 80 words; for news/weather/factual queries be more detailed (up to 150 words) and highly informative. For ANY question about current events, news, weather, real-time info, or specific regional events (e.g., '今天台湾有什么重大事件', 'latest news'), you MUST use web_search tool to get the latest information — never refuse or say you cannot provide real-time info. Every new news/headline request needs a FRESH web_search, even short follow-ups like 'BBC headlines' or 'CNN now' — never answer from stale results of an earlier query. Use search results to answer. For questions about today's date, weekday, or current time (今天/星期几/几点), you MUST call the get_current_datetime tool instead of guessing. For ANY weather/forecast question (including 明天/後天/next week) you MUST call web_search — the search engine returns the forecast for the requested day, so do NOT call get_current_datetime for weather. For date/time questions call get_current_datetime. When both are needed, call both in the same turn. Always answer using the tool RESULTS verbatim (weekday, date, temperatures) — never from memory. Always respond in Traditional Chinese (Taiwan usage, 繁體中文) by default, regardless of what language the question was asked in — only keep English for proper nouns, technical terms, or vocabulary that doesn't translate well; never answer a whole sentence in Simplified Chinese or English. IMPORTANT: when the web_search tool results contain the answer (weather numbers, news headlines, dates), be highly informative: quote specifics directly with numbers, names, dates, and sources. For news, list 3-4 concrete recent headlines with source + one-sentence summary each + date if available. Never claim results lack information they contain. Interpret loose phrasing generously (e.g. 'big news' = latest major news) instead of saying no such thing exists."
 
-# zh-TW is this app's default/primary language — appended to every turn's prompt (not
-# just relied on via SYSTEM_PROMPT above) since that's the most reliable way to keep a
-# small model from drifting into English or Simplified Chinese as context grows. Applied
-# unconditionally regardless of the input's own language (a confirmed product decision,
-# not reactive): English is only ever kept for terms/names that don't translate well.
+# zh-TW is this app's default/primary language, stated once in SYSTEM_PROMPT above and
+# in the agent harness's own system message. It is deliberately NOT appended to each
+# user turn any more: glued onto the transcript it became part of what the model was
+# asked, so it got copied verbatim into web_search queries and read back aloud as the
+# answer. Kept here only so _is_own_prompt_echo() still recognizes the old wording if a
+# model replays it; nothing sends it.
 LANG_HINT = "\n（請一律使用繁體中文（台灣用語）簡潔回答；僅專有名詞、技術術語或無法翻譯的詞彙可保留英文原文，不要整句使用簡體中文或英文作答。）"
 
 # Heuristic for fast tool trigger — bilingual (en/zh) - includes Chinese triggers for Taiwan/news
@@ -286,13 +445,18 @@ class LingStreaming:
                         if delta.get("tool_calls"):
                             for tc in delta["tool_calls"]:
                                 yield {"type": "tool_call_delta", "delta": tc}
-                        # Content - Ling returns both reasoning_content (thinking) and content (answer) when enable_thinking is used.
-                        # For voice chat, we ONLY speak content, never reasoning (thinking off for low latency)
+                        # Reasoning vs answer: reasoning must never be spoken, but the UI should show it.
+                        rc = delta.get("reasoning_content")
+                        if rc is not None:
+                            yield {"type": "reasoning", "token": rc}
                         token = delta.get("content")
                         if token is not None:
-                            yield {"type": "token", "token": token}
-                        # Ignore reasoning_content for voice (it's the internal thinking, not to be spoken)
-                        # If content is empty and reasoning contains the answer (rare with detailed thinking off), it would be empty anyway
+                            # Spillover guard: when reasoning_budget truncates, thinking leaks
+                            # into content as plain English checklist. Route it to reasoning.
+                            if _is_reasoning_text(token):
+                                yield {"type": "reasoning", "token": token}
+                            else:
+                                yield {"type": "token", "token": token}
                         # Finish reason
                         if choice.get("finish_reason"):
                             yield {"type": "finish", "reason": choice["finish_reason"]}
@@ -457,7 +621,9 @@ class LingStreaming:
                     if task.done():
                         break
                     continue
-                if ev["type"] == "tool_call":
+                if ev["type"] == "llm_reasoning":
+                    yield {"type": "llm_reasoning", "text": ev.get("text", "")}
+                elif ev["type"] == "tool_call":
                     yield {"type": "tool_call", "name": ev["name"],
                            "arguments": ev.get("arguments", {}), "query": ev.get("query", "")}
                 elif ev["type"] == "tool_result":

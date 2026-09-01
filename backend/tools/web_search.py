@@ -499,6 +499,29 @@ def _mock_search(query: str, count: int) -> List[Dict]:
         for i in range(min(count,3))
     ]
 
+def _sanitize_query(q: str) -> str:
+    """Strip language-hint and other system-prompt leakage from tool queries.
+
+    Observed: `搜尋最新的科技新聞（請一律使用繁體中文…）` — the LANG_HINT that was appended
+    to the user turn got copied verbatim into web_search's `query` arg, producing a
+    literal parenthetical search that returns `no_results`. This is defense-in-depth:
+    the hint is no longer appended on the agent path, but any hint that still slips
+    through is removed here so the search itself stays honest."""
+    if not q:
+        return q
+    # Remove the Traditional-Chinese language hint that used to be appended to user text
+    if "（請一律使用繁體中文" in q:
+        q = q.split("（請一律使用繁體中文")[0].strip()
+    if "(請一律使用" in q:
+        q = q.split("(請一律使用")[0].strip()
+    # Also strip any trailing parenthetical that is purely the language instruction
+    q = re.sub(r"[（(]請一律.*?[）)]\s*$", "", q).strip()
+    # Remove quoted instruction leakage like 'Never do more than 2 tool calls...'
+    if len(q) > 60 and "Never do more than" in q:
+        q = q.split("Never do more than")[0].strip()
+    return q.strip(" \t\n，。、；：")
+
+
 async def web_search(query: str, count: int = 5) -> Dict:
     """
     Tool function: web_search
@@ -514,7 +537,7 @@ async def web_search(query: str, count: int = 5) -> Dict:
                 _raw = str(d['query']).strip()
         except Exception:
             _raw = repair_truncated_json_query(_raw)
-    query = _raw.strip()
+    query = _sanitize_query(_raw.strip())
     if not query:
         return {"query": query, "results": [], "source": "none", "latency_ms": 0}
     ck = _cache_key(query, count)
