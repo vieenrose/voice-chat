@@ -47,32 +47,34 @@ LLM_SEED = int(os.getenv("LLM_SEED", "-1"))
 # tool template, quoted the prompt back, or repeated itself — each needing another
 # filter. Unquantized f16 scored the same as q8, so this is capacity, not quantization.
 MODEL_REGISTRY: dict[str, dict] = {
-    # UD-Q4_K_XL. UD (Unsloth Dynamic) spends its extra bits on the quantization-sensitive
-    # layers rather than raising every layer's bit-width, which is what separates it from
-    # both Q4_K_M and IQ4_XS at a comparable size.
+    # UD-Q8_K_XL with MTP. Chosen on perplexity over 194 kB of non-repeating zh-TW
+    # Wikipedia prose, which is a deterministic measure of how far quantization moved the
+    # model — unlike the four-prompt UI matrix, whose spread (4-6 out of 8 across builds
+    # that differ only in throughput) is pure noise and cannot rank anything:
     #
-    # Measured on the four UI prompts across both sizes (8 runs): Q4_K_M 4/8, IQ4_XS 2/8,
-    # UD-Q4_K_XL 6/8, UD-Q8_K_XL 5/8. IQ4_XS was the instructive failure — faster and
-    # lighter, but every one of its extra failures was a repeated sentence, which is real
-    # quantization damage rather than sampling noise. Q8 cost ~40% of the throughput
-    # (100 vs 174 tok/s on 2B) and bought nothing measurable over Q4_K_XL, so the speed
-    # is worth more here: first audio on a tool turn went 6.5-8.3s at Q8 against ~5s.
+    #   2B  UD-Q8_K_XL 16.738   UD-Q4_K_XL 17.080   Q4_K_M 17.091
+    #   4B  UD-Q8_K_XL 13.027   UD-Q4_K_XL 13.173
     #
-    # These are the MTP builds, carrying the NextN layers, but "mtp" is NOT set so
-    # _mtp_args() adds nothing and they decode exactly like the plain weights. The ~60 MB
-    # the layers cost buys the option: turning self-speculative decoding on is a one-key
-    # change here rather than a re-download. It stays off because the case for it being
-    # lossless rests on byte-identical greedy output over two prompts at temperature 0,
-    # which is thinner evidence than it first appeared.
+    # Q8 is the most faithful at both sizes (~2% lower), and UD-Q4_K_XL edges plain
+    # Q4_K_M, which is what UD (Unsloth Dynamic) claims: spend the extra bits on the
+    # quantization-sensitive layers rather than raising every layer uniformly.
+    #
+    # MTP is ON here. The weights carry NextN layers, so the model drafts its own next
+    # tokens and the target model verifies them — accepted drafts are the tokens that
+    # would have been produced anyway, which is why it recovers throughput without
+    # touching the precision this quantization was chosen for. Measured +20% on 4B with
+    # byte-identical greedy output. See _mtp_args(); LLM_MTP=0 disables it.
     "qwen3.5-2b-q4": {
-        "label": "Qwen3.5 2B UD-Q4_K_XL",
-        "path": os.getenv("LLM_PATH_2B", "/home/user/llms/mtp/Qwen3.5-2B-UD-Q4_K_XL.gguf"),
+        "label": "Qwen3.5 2B UD-Q8_K_XL (MTP)",
+        "path": os.getenv("LLM_PATH_2B", "/home/user/llms/mtp/Qwen3.5-2B-UD-Q8_K_XL.gguf"),
         "alias": "qwen3.5-2b",
+        "mtp": True,
     },
     "qwen3.5-4b-q4": {
-        "label": "Qwen3.5 4B UD-Q4_K_XL",
-        "path": os.getenv("LLM_PATH_4B", "/home/user/llms/mtp/Qwen3.5-4B-UD-Q4_K_XL.gguf"),
+        "label": "Qwen3.5 4B UD-Q8_K_XL (MTP)",
+        "path": os.getenv("LLM_PATH_4B", "/home/user/llms/mtp/Qwen3.5-4B-UD-Q8_K_XL.gguf"),
         "alias": "qwen3.5-4b",
+        "mtp": True,
     },
 }
 # Ling 3.0 tiny (bailingmoe3 MoE) was evaluated here and dropped. At IQ4_XS it scored the
