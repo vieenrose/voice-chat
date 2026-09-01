@@ -3,7 +3,10 @@ MOSS-TTS-Realtime streaming wrapper — replaces VoxCPM2
 Real streaming: OpenMOSS-Team/MOSS-TTS-Realtime, 1.7B, 20 langs, 48kHz, 32K ctx, RTF 0.5, TTFB 180ms
 Context-aware multi-turn streaming via MossTTSRealtimeInference (prefill/step)
 """
-import asyncio, time, re, numpy as np
+import asyncio
+import time
+import re
+import numpy as np
 from typing import AsyncGenerator
 from loguru import logger
 from pathlib import Path
@@ -42,7 +45,7 @@ class StreamingPrimeTTS:
             # Codec for decoding
             try:
                 self.codec = AutoModel.from_pretrained("OpenMOSS-Team/MOSS-Audio-Tokenizer", trust_remote_code=True).eval().to(device)
-            except:
+            except Exception:
                 logger.warning("MOSS codec not available, will try without")
                 self.codec = None
             # Inference wrapper for streaming
@@ -52,12 +55,14 @@ class StreamingPrimeTTS:
             try:
                 import sys
                 sys.path.insert(0, str(Path.home() / ".cache/huggingface/hub"))
-            except: pass
+            except Exception:
+                pass
             self.inferencer = MossTTSRealtimeInference(self.model, self.tokenizer, max_length=2000)
             logger.info(f"MOSS-TTS-Realtime loaded ✓ {model_id} sample_rate={SAMPLE_RATE}Hz")
         except Exception as e:
             logger.error(f"MOSS-TTS-Realtime load failed {e}, fallback to mock")
-            import traceback; traceback.print_exc()
+            import traceback
+            traceback.print_exc()
             # Fallback to mock for demo continuity
             self.backend = "mock"
             self.model = None

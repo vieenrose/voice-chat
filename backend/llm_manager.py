@@ -29,6 +29,12 @@ LLAMA_SERVER_BIN = os.getenv("LLAMA_SERVER_BIN", "/home/user/llama.cpp/build/bin
 LLM_HOST = "127.0.0.1"
 LLM_PORT = int(os.getenv("LLM_PORT", "11435"))
 LLM_CTX = int(os.getenv("LLM_CTX", "16384"))
+# Sampling seed for llama-server. Default -1 == llama.cpp's own default (random per
+# process). Set LLM_SEED=4711 to make a benchmark run comparable to the previous one:
+# tool-call routing at temperature 0.7 flips between 4/7 and 5/7 across runs, so without
+# a seed "did my change help?" is unanswerable at this sample size. It changes nothing
+# unless you ask it to.
+LLM_SEED = int(os.getenv("LLM_SEED", "-1"))
 
 # id -> {label, path, alias}. `label` is what the UI shows; `alias` is what
 # llama-server reports in /v1/models and what must match LingStreaming's
@@ -65,6 +71,28 @@ def _alias_to_model_id(alias: str) -> Optional[str]:
     return None
 
 
+_FLAG_SUPPORT: dict[tuple[str, str], bool] = {}
+
+
+def _supports_llama_flag(bin_path: str, flag: str) -> bool:
+    """Does this llama-server binary advertise `flag`? Probed once per (binary, flag).
+
+    Deliberately probed instead of version-compared: an unrecognised argument makes
+    llama-server exit at startup, so a wrong guess costs a dead LLM, not a missing
+    feature. If --help cannot be run, we assume the flag is absent (degrade, don't break).
+    """
+    key = (bin_path, flag)
+    if key not in _FLAG_SUPPORT:
+        ok = False
+        try:
+            r = subprocess.run([bin_path, "--help"], capture_output=True, text=True, timeout=15)
+            ok = flag in (r.stdout or "") or flag in (r.stderr or "")
+        except Exception as e:
+            logger.warning(f"could not probe {bin_path} for {flag}: {e!r}")
+        _FLAG_SUPPORT[key] = ok
+    return _FLAG_SUPPORT[key]
+
+
 class LLMServerManager:
     def __init__(self):
         self.proc: Optional[subprocess.Popen] = None
@@ -72,6 +100,29 @@ class LLMServerManager:
         self.current_alias: Optional[str] = None
         self.switching = False
         self._lock = asyncio.Lock()
+
+    def _reasoning_args(self) -> list[str]:
+        """`--reasoning-format deepseek` moves the model's thinking pass out of
+        `message.content` and into `message.reasoning_content`.
+
+        Default is `auto`, which for this template leaves the deliberation unparsed in the
+        content body — and the agent path speaks `content`, so users were hearing
+        "…但根据规则，必须调用工具。所以步骤应该是先调用 get_current_datetime…" as the answer to
+        "What time is it right now?". The thinking pass itself is worth keeping (tool
+        routing measures 81 % with it vs 71 % without, and the 71 % variant fabricates
+        weather and news), so the fix is server-side separation rather than a text filter
+        or disabling thinking. Older llama.cpp builds reject unknown arguments outright —
+        which would stop the server from starting at all — so the flag is probed, not
+        assumed. Set LLM_REASONING_FORMAT=none to opt out.
+        """
+        fmt = os.getenv("LLM_REASONING_FORMAT", "deepseek").strip()
+        if not fmt or fmt == "none":
+            return []
+        if not _supports_llama_flag(LLAMA_SERVER_BIN, "--reasoning-format"):
+            logger.warning("this llama-server build has no --reasoning-format; thinking text will stay "
+                           "in message.content (LLM_REASONING_FORMAT to override)")
+            return []
+        return ["--reasoning-format", fmt]
 
     def _spawn(self, model_id: str) -> None:
         info = MODEL_REGISTRY[model_id]
@@ -84,6 +135,9 @@ class LLMServerManager:
             "-c", str(LLM_CTX), "--alias", info["alias"],
             "--n-gpu-layers", "99", "--jinja",
         ]
+        cmd += self._reasoning_args()
+        if LLM_SEED != -1:
+            cmd += ["--seed", str(LLM_SEED)]
         logger.info(f"LLMServerManager: spawning {model_id} ({info['label']}): {' '.join(cmd)}")
         self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -108,13 +162,23 @@ class LLMServerManager:
         """Only used the first time we take over a server we didn't spawn
         ourselves (adopted an already-running one at startup) — finds
         whatever process is bound to our configured port and terminates it so
-        we can start our own in its place."""
+        we can start our own in its place.
+
+        Restricted to processes that actually look like llama-server: POST /api/model
+        reaches this path, and terminating *whatever* PID happened to hold :11435
+        meant an unauthenticated request could kill an unrelated service that had
+        merely been assigned the same port."""
         killed_any = False
         for conn in psutil.net_connections(kind="tcp"):
             if conn.laddr and conn.laddr.port == port and conn.status == psutil.CONN_LISTEN and conn.pid:
                 try:
                     p = psutil.Process(conn.pid)
-                    logger.info(f"LLMServerManager: terminating unowned listener on :{port} pid={conn.pid} ({p.name()})")
+                    name = p.name() or ""
+                    if "llama-server" not in name.lower() and "llama" not in (p.cmdline()[0] or "").lower():
+                        logger.error(f"LLMServerManager: :{port} is held by pid={conn.pid} ({name}) which is "
+                                     "not llama-server — refusing to kill it; stop it manually and retry")
+                        continue
+                    logger.info(f"LLMServerManager: terminating unowned listener on :{port} pid={conn.pid} ({name})")
                     p.terminate()
                     p.wait(timeout=10)
                     killed_any = True

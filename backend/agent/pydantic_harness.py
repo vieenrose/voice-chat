@@ -5,19 +5,17 @@ Native parallel tool calls, async streaming, validation.
 import asyncio
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from typing import List
 from loguru import logger
 
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
+import asyncio as _asyncio
 
 from agent._shared import set_emit_target, emit as _emit, agent_call_lock
 
 API_BASE = "http://127.0.0.1:11435/v1"
 MODEL_ID = "apodex-1.0-2b"
-
-import asyncio as _asyncio
 
 def _make_model():
     # OpenAI-compatible llama-server, no thinking for voice
@@ -77,22 +75,21 @@ def reset_agent():
     global _agent
     _agent = None
 
-async def run_agent_task(task: str, event_q=None) -> str:
+async def run_agent_task(task: str, event_q=None, history=None) -> str:
+    """Run one turn; `history` (real role/content turns) becomes PydanticAI's
+    message_history. See the identical note in agent/qwen_harness.py.
+    """
     loop = _asyncio.get_running_loop()
     set_emit_target(loop, event_q)
     agent = _get_agent()
-    # Fast greeting path
-    import re
-    m = re.search(r"Current question:\s*(.*)", task, re.S)
-    cur = m.group(1).strip() if m else task.strip()
-    if re.match(r'^\s*(hi|hello|hey|你好|您好)\b', cur.lower()) and len(cur) < 50 and not re.search(r'(weather|news|search|find|what is|who is|星期|幾號|幾點|天气|天氣|新闻|新聞)', cur.lower()):
-        # zh-TW default: greet in Traditional Chinese even for an English "hello".
-        return "你好！有什麼可以幫你的？"
+    hist = [{"role": m["role"], "content": m["content"]} for m in (history or [])
+            if isinstance(m, dict) and m.get("role") in ("user", "assistant") and m.get("content")]
+
     def _run():
         try:
             # PydanticAI run with history handling
             with agent_call_lock:
-                result = agent.run_sync(task)
+                result = agent.run_sync(task, message_history=hist) if hist else agent.run_sync(task)
             return result.output if hasattr(result, 'output') else str(result)
         except Exception as e:
             # Spoken via TTS with no filtering for an "error"-looking string (see the

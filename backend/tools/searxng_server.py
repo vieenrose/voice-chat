@@ -23,10 +23,8 @@ But this lightweight version works everywhere (no docker needed) and still
 satisfies "self-host searxng to support it".
 """
 import argparse
-import asyncio
 import html as _html
 import re as _re
-import time
 from typing import Optional
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse, HTMLResponse
@@ -35,7 +33,8 @@ import uvicorn
 from loguru import logger
 
 # Import search backends directly — avoid recursion (web_search -> _try_searxng -> http://localhost:8888 -> web_search loop)
-import sys, os
+import sys
+import os
 sys.path.insert(0, os.path.dirname(__file__))
 try:
     from web_search import _try_ddgs, _try_lite_scrape, _mock_search, format_results
@@ -128,7 +127,6 @@ async def search(
         # keep explicit format param
         pass
 
-    t0 = time.time()
     result = await _direct_search(q, count=count)
     latency_ms = result["latency_ms"]
 
@@ -193,7 +191,8 @@ async def search_post(request: Request):
         try:
             j = await request.json()
             q = j.get("q","") or j.get("query","")
-        except: pass
+        except Exception:
+            pass
     if not q:
         q = request.query_params.get("q","")
     if not q:

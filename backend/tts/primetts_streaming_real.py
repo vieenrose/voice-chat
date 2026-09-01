@@ -90,13 +90,13 @@ class StreamingPrimeTTSReal:
             for fname in ["scripts/frontend_bopomofo.py", "scripts/text_norm.py", "scripts/symbol_table.json"]:
                 try:
                     hf_hub_download(self.model_id, fname, local_dir="/tmp/PrimeTTS", local_dir_use_symlinks=False)
-                except:
+                except Exception:
                     pass
             # Also ensure the file we already downloaded in /tmp/PrimeTTS_test is available
             if Path("/tmp/PrimeTTS_test/v21_streaming/v21_enc.onnx").exists():
                 self.enc_path = "/tmp/PrimeTTS_test/v21_streaming/v21_enc.onnx"
                 self.dec_path = "/tmp/PrimeTTS_test/v21_streaming/v21_dec.onnx"
-        except:
+        except Exception:
             pass
 
         so = ort.SessionOptions()
@@ -108,7 +108,7 @@ class StreamingPrimeTTSReal:
             try:
                 # Try CUDA, fallback to CPU
                 providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            except:
+            except Exception:
                 providers = ["CPUExecutionProvider"]
         self.enc = ort.InferenceSession(self.enc_path, so, providers=providers)
         self.dec = ort.InferenceSession(self.dec_path, so, providers=providers)
@@ -130,7 +130,7 @@ class StreamingPrimeTTSReal:
             # We need to ensure G2PWConverter is created with num_workers=0
             # Do it by monkey-patching the module's _lazy
             import frontend_bopomofo
-            orig_lazy = frontend_bopomofo._lazy
+            _orig_lazy = frontend_bopomofo._lazy   # kept handle in case patched_lazy must be undone
             def patched_lazy():
                 global _g2pw, _g2pen
                 if frontend_bopomofo._g2pw is None:
@@ -146,7 +146,7 @@ class StreamingPrimeTTSReal:
                         try:
                             frontend_bopomofo._g2pw = G2PWConverter(turnoff_tqdm=True)
                             frontend_bopomofo._g2pw.num_workers = 0
-                        except:
+                        except Exception:
                             frontend_bopomofo._g2pw = G2PWConverter()
                             frontend_bopomofo._g2pw.num_workers = 0
                     frontend_bopomofo._g2pen = G2p()
@@ -155,7 +155,7 @@ class StreamingPrimeTTSReal:
             try:
                 import nltk
                 nltk.data.find('taggers/averaged_perceptron_tagger_eng')
-            except:
+            except Exception:
                 import nltk
                 nltk.download('averaged_perceptron_tagger_eng', quiet=True)
                 nltk.download('averaged_perceptron_tagger', quiet=True)
@@ -328,7 +328,6 @@ class StreamingPrimeTTSReal:
                     off = (a - s0) * HOP
                     keep = (b - a) * HOP
                     chunk = w[off:off+keep]
-                    peak = np.max(np.abs(chunk)) if chunk.size else 1
                     # Don't normalize per chunk, keep consistent with full
                     return (chunk * 32767).astype(np.int16)
                 pcm_chunk = await asyncio.to_thread(_dec)

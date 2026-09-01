@@ -21,7 +21,6 @@ import time
 import statistics
 import os
 import sys
-import tracemalloc
 import numpy as np
 
 # For peak RSS measurement
@@ -36,7 +35,7 @@ def get_rss_mb():
     for child in proc.children(recursive=True):
         try:
             rss += child.memory_info().rss
-        except:
+        except Exception:
             pass
     return rss / 1024 / 1024
 
@@ -119,8 +118,6 @@ async def run_pipeline_benchmark(args):
         llm_start = time.time()
         llm_text = ""
         llm_ttft = None
-        tts_first = None
-        tts_total_ms = 0
         # stream LLM
         async for ev in pipe.llm.generate_stream(stt_text):
             if ev["type"] == "llm_token":
@@ -187,10 +184,10 @@ async def run_pipeline_benchmark(args):
             vram = torch.cuda.memory_allocated()/1024/1024
             vram_max = torch.cuda.max_memory_allocated()/1024/1024
             print(f"  VRAM allocated : {vram:.1f} MB (peak {vram_max:.1f} MB)")
-    except:
+    except Exception:
         pass
     if e2e_list:
-        print(f"\n  E2E latency (ms):")
+        print("\n  E2E latency (ms):")
         print(f"    avg  : {statistics.mean(e2e_list):.1f}")
         print(f"    median (p50): {statistics.median(e2e_list):.1f}")
         if len(e2e_list) >= 4:
@@ -204,19 +201,19 @@ async def run_pipeline_benchmark(args):
         print(f"    stdev: {statistics.pstdev(e2e_list):.1f}" if len(e2e_list)>1 else "")
 
         # per-stage avg
-        avg_stt = statistics.mean([l["stt_ms"] for l in latencies])
-        avg_ttft = statistics.mean([l["llm_ttft_ms"] for l in latencies])
-        avg_ttfb = statistics.mean([l["tts_ttfb_ms"] for l in latencies])
-        print(f"\n  Per-stage avg:")
+        avg_stt = statistics.mean([rec["stt_ms"] for rec in latencies])
+        avg_ttft = statistics.mean([rec["llm_ttft_ms"] for rec in latencies])
+        avg_ttfb = statistics.mean([rec["tts_ttfb_ms"] for rec in latencies])
+        print("\n  Per-stage avg:")
         print(f"    STT (X-ASR)   : {avg_stt:.1f} ms")
         print(f"    LLM TTFT      : {avg_ttft:.1f} ms (MiniCPM5)")
         print(f"    TTS TTFB      : {avg_ttfb:.1f} ms (PrimeTTS)")
-        print(f"    LLM total     : {statistics.mean([l['llm_total_ms'] for l in latencies]):.1f} ms")
-        print(f"    TTS total     : {statistics.mean([l['tts_total_ms'] for l in latencies]):.1f} ms")
+        print(f"    LLM total     : {statistics.mean([rec['llm_total_ms'] for rec in latencies]):.1f} ms")
+        print(f"    TTS total     : {statistics.mean([rec['tts_total_ms'] for rec in latencies]):.1f} ms")
 
     print("\n  Latency breakdown (first 5 iters):")
-    for l in latencies[:5]:
-        print(f"    #{l['iter']:02d} e2e={l['e2e_ms']:4d}  (stt {l['stt_ms']:3d} + llm_ttft {l['llm_ttft_ms']:3d} + tts {l['tts_ttfb_ms']:3d})")
+    for rec in latencies[:5]:
+        print(f"    #{rec['iter']:02d} e2e={rec['e2e_ms']:4d}  (stt {rec['stt_ms']:3d} + llm_ttft {rec['llm_ttft_ms']:3d} + tts {rec['tts_ttfb_ms']:3d})")
 
     print("\n  Verdict:")
     avg_e2e = statistics.mean(e2e_list) if e2e_list else 0
@@ -230,7 +227,8 @@ async def run_pipeline_benchmark(args):
     print("="*78 + "\n")
 
     # Also write JSON report
-    import json, pathlib
+    import json
+    import pathlib
     report = {
         "mode": "mock" if args.mock else "real",
         "device": device,
@@ -254,7 +252,8 @@ async def run_pipeline_benchmark(args):
     return report
 
 async def run_server_benchmark(args):
-    import aiohttp, base64, json, statistics
+    import aiohttp
+    import statistics
     url = args.server.rstrip("/")
     print(f"\n[Server Benchmark] Hitting {url} ...")
     # check health
@@ -284,7 +283,7 @@ async def run_server_benchmark(args):
                         rss = j.get("rss_mb", 0)
                         if rss > peak_rss:
                             peak_rss = rss
-            except:
+            except Exception:
                 pass
             await asyncio.sleep(0.1)
 
@@ -293,7 +292,6 @@ async def run_server_benchmark(args):
     await asyncio.sleep(0.5)
 
     for i, txt in enumerate(texts):
-        t0 = time.time()
         # Use /api/chat text path for lowest overhead
         payload = {"text": txt}
         # Need aiohttp
@@ -306,9 +304,10 @@ async def run_server_benchmark(args):
                     stt = j["latencies"]["stt_ms"]
                     ttft = j["latencies"]["llm_ttft_ms"]
                     tts = j["latencies"]["tts_ms"]
-        except Exception as e:
+        except Exception:
             # fallback to urllib
-            import urllib.request, json as js
+            import urllib.request
+            import json as js
             req = urllib.request.Request(url+"/api/chat", data=js.dumps(payload).encode(), headers={"Content-Type":"application/json"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 j = js.loads(r.read().decode())
@@ -329,7 +328,7 @@ async def run_server_benchmark(args):
     print("  PEAK RSS & E2E (SERVER MODE) — FINAL REPORT")
     print("="*78)
     print(f"  Peak RSS (server) : {peak_rss:.1f} MB")
-    import statistics, numpy as np
+    import numpy as np
     if latencies:
         print(f"  E2E avg : {statistics.mean(latencies):.1f} ms")
         print(f"  p50     : {statistics.median(latencies):.1f} ms")

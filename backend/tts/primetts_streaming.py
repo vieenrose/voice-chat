@@ -48,8 +48,9 @@ class StreamingPrimeTTS:
             self.sample_rate = getattr(self.model.config, 'codec_sample_rate', SAMPLE_RATE)
         except Exception as e:
             logger.error(f"Audio8 TTS load failed {e}")
-            import traceback; traceback.print_exc()
-            raise RuntimeError(f"Audio8 TTS required: {e}")
+            import traceback
+            traceback.print_exc()
+            raise RuntimeError(f"Audio8 TTS required: {e}") from e
 
     async def synthesize(self, text: str, reference_audio: str = None, reference_text: str = None) -> np.ndarray:
         try:
@@ -90,7 +91,8 @@ class StreamingPrimeTTS:
             return pcm
         except Exception as e:
             logger.error(f"Audio8 synthesize failed {e}")
-            import traceback; traceback.print_exc()
+            import traceback
+            traceback.print_exc()
             # Fallback to silence
             return np.zeros(int(SAMPLE_RATE*0.5), dtype=np.int16)
 

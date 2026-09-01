@@ -1,0 +1,32 @@
+# Build-context hygiene. Without this, every `docker build` / `podman build` uploads
+# the whole repo — including model weights, the frontend's node_modules, and .git —
+# before the first instruction runs. The Dockerfile only COPYs frontend/{package*.json,}
+# and backend/, so everything below is pure upload cost.
+.git
+.github
+.gitignore
+*.bak
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Frontend deps and build output: stage 1 installs/builds them itself. node_modules in
+# particular is host-built (wrong platform/libc for a linux/amd64 build) and gets replaced.
+frontend/node_modules/
+frontend/dist/
+
+# Runtime artifacts that are written *by* the app and must not be baked in or cached
+backend/benchmark_report.md
+backend/benchmark_report.json
+backend/index/
+backend/logs/
+backend/.fake_secrets/
+models/
+*.gguf
+
+# Editor / agent scratch
+.qoder/
+tools/
+*.md.bak

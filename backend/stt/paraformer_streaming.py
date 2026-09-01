@@ -35,8 +35,9 @@ class StreamingXASR:
             logger.info(f"Paraformer loaded ✓ {model_id}")
         except Exception as e:
             logger.error(f"Paraformer load failed {e}")
-            import traceback; traceback.print_exc()
-            raise RuntimeError(f"Paraformer required: {e}")
+            import traceback
+            traceback.print_exc()
+            raise RuntimeError(f"Paraformer required: {e}") from e
 
     def _generate(self, pcm_f32_16k: np.ndarray) -> str:
         # pcm_f32_16k: float32 -1..1 @16k mono
@@ -51,13 +52,15 @@ class StreamingXASR:
                 return str(txt).strip()
             return ""
         finally:
-            try: os.unlink(path)
-            except OSError: pass
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
     async def transcribe_once(self, pcm_f32_16k: np.ndarray) -> str:
         return await asyncio.to_thread(self._generate, pcm_f32_16k)
 
-    async def transcribe_stream(self, pcm_queue: asyncio.Queue, stop_event: asyncio.Event) -> AsyncGenerator[dict, None]:
+    async def transcribe_stream(self, pcm_queue: asyncio.Queue, stop_event: asyncio.Event, session_id: str | None = None) -> AsyncGenerator[dict, None]:
         """Accumulate PCM until flush, transcribe; yield stt_partial every ~1s, stt_final on flush."""
         buf: list[np.ndarray] = []
         buf_len = 0
@@ -75,7 +78,8 @@ class StreamingXASR:
                     text = await self.transcribe_once(pcm_f32)
                     transcript_cache["text"] = text
                     yield {"type": "stt_final", "text": text, "latency_ms": 0}
-                buf = []; buf_len = 0
+                buf = []
+                buf_len = 0
                 continue
             if item is None:
                 continue

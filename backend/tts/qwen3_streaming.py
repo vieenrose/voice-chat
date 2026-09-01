@@ -72,7 +72,7 @@ def _segment_by_language(text: str) -> list[tuple[str, str]]:
     changed = True
     while changed and len(runs) > 1:
         changed = False
-        for i, (lang, seg) in enumerate(runs):
+        for i, (_lang, seg) in enumerate(runs):
             has_letters = bool(_CJK_RE.search(seg) or _LATIN_RE.search(seg))
             if not has_letters and seg.strip():
                 if i + 1 < len(runs):
@@ -123,8 +123,9 @@ class StreamingPrimeTTS:
             logger.info(f"Qwen3-TTS loaded ✓ {model_id} sample_rate={self.sample_rate}Hz (TRUE streaming enabled)")
         except Exception as e:
             logger.error(f"Qwen3-TTS load failed {e}")
-            import traceback; traceback.print_exc()
-            raise RuntimeError(f"Qwen3-TTS required: {e}")
+            import traceback
+            traceback.print_exc()
+            raise RuntimeError(f"Qwen3-TTS required: {e}") from e
         # --- voice presets: CustomVoice built-in speakers (stable; clone refs are Base-only & unstable here) ---
         # speakers: serena, vivian, uncle_fu, ryan, aiden, ono_anna, sohee, eric, dylan
         self.VOICE_PRESETS = {
@@ -143,13 +144,33 @@ class StreamingPrimeTTS:
     @property
     def voice(self) -> str:
         return self._vv
+    @property
     def voices(self) -> list[str]:
         return list(self.VOICE_PRESETS.keys())
     def set_voice(self, name: str):
+        """Set the process-wide default voice. Kept for back-compat (POST /api/chat
+        without a per-call voice). Prefer passing voice= to synthesize*/
+        synthesize_streaming: this instance is shared by every session, so mutating
+        it for one caller silently changes what *other* callers hear."""
         if name not in self.VOICE_PRESETS:
-            raise KeyError(f"unknown voice {name}; available {self.voices()}")
+            raise KeyError(f"unknown voice {name}; available {self.voices}")
         self._vv = name
         self.speaker = self.VOICE_PRESETS[name].get("name", name)
+
+    def _preset(self, voice: str | None = None) -> tuple[dict, str]:
+        """Resolve the voice preset + speaker for ONE synthesis call.
+
+        voice=None falls back to the instance default (set_voice). A bad name is
+        reported to the caller (KeyError) instead of being swallowed at the call
+        site, which is what app.py's `except KeyError: pass` used to do — asking for
+        a nonexistent voice then spoke the reply in whatever the previous caller's
+        voice happened to be."""
+        if not voice or voice == self._vv:
+            return self.VOICE_PRESETS[self._vv], self.speaker
+        if voice not in self.VOICE_PRESETS:
+            raise KeyError(f"unknown voice {voice}; available {self.voices}")
+        preset = self.VOICE_PRESETS[voice]
+        return preset, preset.get("name", self.speaker)
     async def _ensure_voice_ref(self, preset: dict) -> dict:
         """Extract & cache .spk/.rvq from reference audio (24k mono f32) — like MOSS voice_clone."""
         key = preset["ref_audio"]
@@ -157,7 +178,8 @@ class StreamingPrimeTTS:
             self.voice_refs[key] = preset
             return preset
         logger.info(f"Extracting voice clone ref from {key} (台湾腔)...")
-        import soundfile as sf, scipy.signal as sp
+        import soundfile as sf
+        import scipy.signal as sp
         wav, sr = sf.read(preset["ref_audio"], dtype="float32")
         if wav.ndim == 2:
             wav = wav.mean(axis=1)
@@ -171,8 +193,8 @@ class StreamingPrimeTTS:
         logger.info(f"Saved 台湾腔 voice ref -> {preset['ref_spk']}/{preset['ref_rvq']}")
         return preset
 
-    async def synthesize(self, text: str, reference_audio: str = None) -> np.ndarray:
-        preset = self.VOICE_PRESETS[self._vv]
+    async def synthesize(self, text: str, reference_audio: str = None, voice: str = None) -> np.ndarray:
+        preset, speaker = self._preset(voice)
         try:
             segments = [(lang, seg) for lang, seg in _segment_by_language(text) if seg.strip()] or [("chinese", text)]
             pcm_parts = []
@@ -198,7 +220,8 @@ class StreamingPrimeTTS:
                         return audio, sr
                     audio, sr = await asyncio.to_thread(_infer_clone)
                     arr = np.array(audio, dtype=np.float32).squeeze()
-                    arr = np.nan_to_num(arr); arr = np.clip(arr, -1.0, 1.0)
+                    arr = np.nan_to_num(arr)
+                    arr = np.clip(arr, -1.0, 1.0)
                     pcm_parts.append((arr * 32767).astype(np.int16))
                 return np.concatenate(pcm_parts) if pcm_parts else np.zeros(0, dtype=np.int16)
             for seg_lang, seg_text in segments:
@@ -206,7 +229,7 @@ class StreamingPrimeTTS:
                     audio, sr = self.runtime.synthesize(
                         text=seg_text,
                         lang=seg_lang,
-                        speaker=self.speaker,
+                        speaker=speaker,
                         max_new_tokens=512,
                         temperature=0.9,
                         top_k=50,
@@ -222,7 +245,8 @@ class StreamingPrimeTTS:
             return np.concatenate(pcm_parts) if pcm_parts else np.zeros(0, dtype=np.int16)
         except Exception as e:
             logger.error(f"Qwen3-TTS synthesize failed {e}")
-            import traceback; traceback.print_exc()
+            import traceback
+            traceback.print_exc()
             return np.zeros(int(SAMPLE_RATE*0.4), dtype=np.int16)
 
     @staticmethod
@@ -233,7 +257,8 @@ class StreamingPrimeTTS:
         thresh = 40  # int16 level (~ -58dB) counts as silence
         abs_w = np.abs(pcm16.astype(np.int32))
         quiet = abs_w < thresh
-        max_n = int(max_gap_s * sr); keep_n = int(keep_s * sr)
+        max_n = int(max_gap_s * sr)
+        keep_n = int(keep_s * sr)
         # trim edge padding: leading/trailing silence of a chunk -> tiny 30ms
         edge_n = int(0.03 * sr)
         nz = np.nonzero(~quiet)[0]
@@ -250,7 +275,8 @@ class StreamingPrimeTTS:
                         pcm16 = pcm16[:last2 + edge_n]
                         quiet = np.abs(pcm16.astype(np.int32)) < thresh
         out = []
-        i = 0; n = len(pcm16)
+        i = 0
+        n = len(pcm16)
         while i < n:
             if quiet[i]:
                 j = i
@@ -261,15 +287,17 @@ class StreamingPrimeTTS:
                     out.append(pcm16[i:i + keep_n])      # keep a short natural pause
                     i = j
                 else:
-                    out.append(pcm16[i:j]); i = j
+                    out.append(pcm16[i:j])
+                    i = j
             else:
                 j = i
                 while j < n and not quiet[j]:
                     j += 1
-                out.append(pcm16[i:j]); i = j
+                out.append(pcm16[i:j])
+                i = j
         return np.concatenate(out) if out else pcm16
 
-    async def synthesize_streaming(self, text: str, chunk_frames: int = 24) -> AsyncGenerator[np.ndarray, None]:
+    async def synthesize_streaming(self, text: str, chunk_frames: int = 24, voice: str = None) -> AsyncGenerator[np.ndarray, None]:
         """TRUE token-streaming via generate_custom_voice_streaming (TTFA ~20ms, like HF framework).
         chunk_frames=24 -> ~1.7s audio per chunk (bigger chunks = fewer jitter boundaries).
 
@@ -281,10 +309,12 @@ class StreamingPrimeTTS:
         q: asyncio.Queue = asyncio.Queue(maxsize=16)
         loop = asyncio.get_running_loop()
         stop_flag = threading.Event()
+        # Resolved once, here, on the event loop: per-call voice so a second session
+        # asking for a different voice can't retune this shared instance mid-utterance.
+        preset, speaker = self._preset(voice)
 
         def _run():
             try:
-                preset = self.VOICE_PRESETS[self._vv]
                 is_clone = preset.get("type") == "clone"
                 if is_clone:
                     # 台湾腔 streaming via voice-clone generator
@@ -310,11 +340,11 @@ class StreamingPrimeTTS:
                     else:
                         gen = self.model.generate_custom_voice_streaming(
                             text=seg_text,
-                            speaker=self.speaker,
+                            speaker=speaker,
                             language=seg_lang,
                             chunk_size=max(4, int(chunk_frames)),
                         )
-                    for chunk, sr, meta in gen:
+                    for chunk, _sr, meta in gen:
                         if stop_flag.is_set():
                             break
                         arr = np.array(chunk, dtype=np.float32).squeeze()
@@ -382,22 +412,30 @@ class StreamingPrimeTTS:
                     break
 
     async def stream_tts(self, token_stream: AsyncGenerator[dict, None]) -> AsyncGenerator[dict, None]:
-        buf = ""; token_count = 0
+        buf = ""
+        token_count = 0
         async for chunk in token_stream:
             if chunk["type"] == "llm_token":
-                token = chunk["token"]; buf += token; token_count += 1
+                token = chunk["token"]
+                buf += token
+                token_count += 1
                 should_flush = False
-                if SENTENCE_END.search(token): should_flush = True
-                elif token_count >= FLUSH_TOKENS and buf and buf[-1] in " ,": should_flush = True
+                if SENTENCE_END.search(token):
+                    should_flush = True
+                elif token_count >= FLUSH_TOKENS and buf and buf[-1] in " ,":
+                    should_flush = True
                 if should_flush and buf.strip():
-                    txt = buf.strip(); buf = ""; token_count = 0
+                    txt = buf.strip()
+                    buf = ""
+                    token_count = 0
                     async for pcm_chunk in self.synthesize_streaming(txt):
                         yield {"type": "tts_chunk", "pcm": pcm_chunk, "text": txt, "sampleRate": self.sample_rate, "latency_ms": 40}
             elif chunk["type"] == "llm_done":
                 if buf.strip():
                     async for pcm_chunk in self.synthesize_streaming(buf.strip()):
                         yield {"type": "tts_chunk", "pcm": pcm_chunk, "text": buf.strip(), "sampleRate": self.sample_rate, "latency_ms": 40}
-                yield {"type": "tts_end"}; return
+                yield {"type": "tts_end"}
+                return
         if buf.strip():
             async for pcm_chunk in self.synthesize_streaming(buf.strip()):
                 yield {"type": "tts_chunk", "pcm": pcm_chunk, "text": buf.strip(), "sampleRate": self.sample_rate, "latency_ms": 40}
@@ -407,7 +445,8 @@ class StreamingPrimeTTS:
         sentences = re.split(r'([.!?]+)', text)
         for i in range(0, len(sentences), 2):
             sent = (sentences[i] + (sentences[i+1] if i+1 < len(sentences) else "")).strip()
-            if not sent: continue
+            if not sent:
+                continue
             async for pcm_chunk in self.synthesize_streaming(sent):
                 yield {"type": "tts_chunk", "pcm": pcm_chunk, "text": sent, "sampleRate": self.sample_rate, "latency_ms": 40}
         yield {"type": "tts_end"}

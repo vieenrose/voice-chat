@@ -1,0 +1,72 @@
+name: ci
+
+# What this covers: the pure-logic regression tests (backend/tests/) and a lint pass.
+# The model stack (X-ASR, llama-server, Qwen3-TTS, SearXNG) needs a GPU + mounted
+# weights and is exercised out-of-band by backend/test_e2e_report.py against a live
+# deployment — see README "Validating a change".
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: pip install "ruff==0.6.*"
+      # YAML gotcha that made this file unparseable (and so never runnable): an unquoted
+      # scalar containing ": " is a mapping. Any step name with a colon must be quoted.
+      - name: "ruff (enforced gate: F, E9, B, E4, E7 — see ruff.toml)"
+        run: ruff check backend --config ruff.toml
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - name: "install the subset needed by the CPU-only tests"
+        # The tests import backend/app.py, which exercises the STT/TTS import ladders.
+        # Those ladders now terminate in mock adapters, so the whole app imports and
+        # boots with none of the model libraries present — which is itself the point.
+        run: |
+          pip install fastapi "uvicorn[standard]" httpx "websockets>=14" numpy scipy \
+                      psutil loguru jieba lxml soundfile
+      - name: unit tests
+        run: python3 -m unittest discover -s backend/tests -v
+      - name: environment self-check (expected to report missing optional ML deps)
+        run: python3 backend/check_env.py || true
+
+  # The container path, without a GPU runner or an 8 GB image. Builds the same Dockerfile
+  # (stage `smoke`, INSTALL_MODE=light), boots it and checks /health — this is the check
+  # that found two real boot blockers (a hard `import torch` in main(), and adapters that
+  # fail at *construction* rather than import). Takes ~2 min; skip it on doc-only changes
+  # by keeping the paths filter below.
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the light image (same Dockerfile, no model stack)
+        run: |
+          docker build --target smoke --build-arg INSTALL_MODE=light -t voice-chat-smoke .
+      - name: Boot it and check /health + the API surface
+        run: |
+          docker run -d --name vc -p 8010:8000 voice-chat-smoke
+          for i in $(seq 1 30); do
+            sleep 2
+            curl -fsS http://127.0.0.1:8010/health && break || { [ "$i" = 30 ] && docker logs vc && exit 1; }
+          done
+          curl -fsS http://127.0.0.1:8010/health | grep -q '"status":"ok"'
+          curl -fsS http://127.0.0.1:8010/health | grep -q '"stt":"mock"'
+          curl -fsS -X POST http://127.0.0.1:8010/api/chat -H 'content-type: application/json' \
+               -d '{"text":"ci smoke"}' | grep -q 'llm_text'
+          # the XSS fix must survive the container path too
+          test "$(curl -fsS 'http://127.0.0.1:8010/search?q=%3Cscript%3E1%3C/script%3E&format=html' \
+                 | grep -c '<script>')" = "0"
+      - name: Container logs (for the failure case)
+        if: failure()
+        run: docker logs vc

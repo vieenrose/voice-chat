@@ -87,7 +87,8 @@ class StreamingXASR:
             logger.info(f"X-ASR sherpa-onnx loaded ✓ {self.backend} {model_id} (160ms streaming, {enc_mb:.0f}M encoder{' int8' if 'int8' in enc else ''})")
         except Exception as e:
             logger.warning(f"X-ASR sherpa load failed {e}, trying whisper fallback")
-            import traceback; traceback.print_exc()
+            import traceback
+            traceback.print_exc()
             # Fallback to whisper
             try:
                 from faster_whisper import WhisperModel
@@ -113,10 +114,15 @@ class StreamingXASR:
         energy = np.sqrt(np.mean(pcm_f32.astype(np.float32)**2))
         return energy > 0.01
 
-    async def transcribe_stream(self, pcm_queue: asyncio.Queue, stop_event: asyncio.Event) -> AsyncGenerator[dict, None]:
+    async def transcribe_stream(self, pcm_queue: asyncio.Queue, stop_event: asyncio.Event, session_id: str | None = None) -> AsyncGenerator[dict, None]:
+        """Yield stt_partial/stt_final events for one connection.
+
+        `session_id` is accepted for interface parity with the other STT adapters
+        (the paraformer/ark wrappers share this signature); this backend doesn't
+        need it because each call creates its own private decoder stream.
+        """
         if self.mock or self.backend == "mock":
             # Mock streaming as before
-            buffer = np.zeros(0, dtype=np.float32)
             last_partial_t = time.time()
             last_speech_t = time.time()
             partial_text = ""
@@ -162,12 +168,32 @@ class StreamingXASR:
 
         # Real X-ASR sherpa streaming
         if self.backend.startswith("x-asr-sherpa"):
-            import sherpa_onnx
-            # Ensure stream exists
-            if self.stream is None:
-                self.stream = self.recognizer.create_stream()
+            # ONE STREAM PER CONNECTION. This used to reuse the single self.stream
+            # created in __init__, so two browser tabs (or a tab plus a test client)
+            # both pushed audio into the same decoder state and their utterances
+            # interleaved into each other's transcripts. `recognizer` is safe to
+            # share; `stream` is per-utterance-by-design, so it is created here.
+            # All sherpa calls are serialized because each burst is awaited before the
+            # next is issued (no two threads touch the same stream concurrently).
+            stream = self.recognizer.create_stream()
             last_partial = ""
             last_partial_t = time.time()
+
+            def _burst(st: "object", finish: bool = False):
+                """Blocking sherpa ONNX inference, run OFF the event loop.
+
+                These calls are synchronous native code on the hot path: run inline
+                they stalled the whole asyncio loop (LLM token streaming, WS sends,
+                every other session) once per 20ms audio frame."""
+                if finish:
+                    st.input_finished()
+                while self.recognizer.is_ready(st):
+                    self.recognizer.decode_stream(st)
+                # OnlineStream has no .text attribute — the result comes from the
+                # recognizer (get_result_all), which is also why this whole burst is
+                # one function run off-loop.
+                return self.recognizer.get_result_all(st).text.strip()
+
             try:
                 while not stop_event.is_set():
                     try:
@@ -177,51 +203,42 @@ class StreamingXASR:
                     # Handle flush
                     if item is not None and isinstance(item, dict) and item.get("type") == "flush":
                         # Signal end, get final
-                        self.stream.input_finished()
-                        while self.recognizer.is_ready(self.stream):
-                            self.recognizer.decode_stream(self.stream)
-                        text = self.recognizer.get_result_all(self.stream).text.strip()
+                        text = await asyncio.to_thread(_burst, stream, True)
                         if text:
                             yield {"type": "stt_final", "text": text, "latency_ms": 30}
                         # Reset for next utterance
-                        self.recognizer.reset(self.stream)
-                        self.stream = self.recognizer.create_stream()
+                        # Discard the utterance's stream outright (a fresh one is
+                        # created anyway); reset() only mutates state we throw away.
+                        stream = self.recognizer.create_stream()
                         last_partial = ""
                         continue
                     if item is not None:
                         # item is int16 PCM
                         pcm_f32 = item.astype(np.float32) / 32768.0
                         # sherpa expects float32 [-1,1] at 16k
-                        self.stream.accept_waveform(SAMPLE_RATE, pcm_f32)
-                        # Decode if ready
-                        while self.recognizer.is_ready(self.stream):
-                            self.recognizer.decode_stream(self.stream)
+                        stream.accept_waveform(SAMPLE_RATE, pcm_f32)
+                        # Decode if ready (off-loop)
+                        text = await asyncio.to_thread(_burst, stream)
                         # Try to get partial
                         now = time.time()
                         if (now - last_partial_t)*1000 >= PARTIAL_INTERVAL_MS:
                             last_partial_t = now
-                            text = self.recognizer.get_result_all(self.stream).text.strip()
                             if text and text != last_partial:
                                 last_partial = text
                                 yield {"type": "stt_partial", "text": text, "latency_ms": 40}
                         # Check endpoint
-                        if self.recognizer.is_endpoint(self.stream):
-                            text = self.recognizer.get_result_all(self.stream).text.strip()
+                        if self.recognizer.is_endpoint(stream):
                             if text:
                                 yield {"type": "stt_final", "text": text, "latency_ms": 40}
-                            self.recognizer.reset(self.stream)
-                            self.stream = self.recognizer.create_stream()
+                            stream = self.recognizer.create_stream()
                             last_partial = ""
                     else:
                         # No new audio, still decode and check endpoint
-                        while self.recognizer.is_ready(self.stream):
-                            self.recognizer.decode_stream(self.stream)
-                        if self.recognizer.is_endpoint(self.stream):
-                            text = self.recognizer.get_result_all(self.stream).text.strip()
+                        text = await asyncio.to_thread(_burst, stream)
+                        if self.recognizer.is_endpoint(stream):
                             if text:
                                 yield {"type": "stt_final", "text": text, "latency_ms": 40}
-                            self.recognizer.reset(self.stream)
-                            self.stream = self.recognizer.create_stream()
+                            stream = self.recognizer.create_stream()
                             last_partial = ""
             except asyncio.CancelledError:
                 pass
@@ -230,8 +247,7 @@ class StreamingXASR:
             return
 
         # Fallback whisper streaming (existing logic)
-        # Simplified: use buffer + transcribe
-        buffer = np.zeros(0, dtype=np.float32)
+        # Simplified: use utterance_buffer + transcribe
         utterance_buffer = np.zeros(0, dtype=np.float32)
         last_partial_t = time.time()
         last_speech_t = time.time()

@@ -1,0 +1,37 @@
+# The dependency subset needed to BOOT the service with no model stack at all — i.e.
+# `python app.py --mock`, where every adapter degrades to its mock rung (see the import
+# ladders in pipeline/speech_to_speech.py and the constructor fallbacks in __init__).
+#
+# Why a second file: it makes the container boot path testable in seconds. `docker build`
+# of the real image pulls ~8 GB (torch cu128 + 5 model stacks) and needs a GPU to mean
+# anything, so the thing people actually want to know — "does the service still start,
+# serve /health and speak?" — went unverified. Build with
+# `--build-arg INSTALL_MODE=light` and it is a ~300 MB image that answers that in ~1 min.
+#
+# CI asserts this list stays a SUBSET of requirements.txt (same pins, no drift), so a
+# light-mode green build can never validate a dependency set production does not use.
+#
+# Everything excluded here is a model runtime: torch/transformers/sherpa-onnx/funasr/
+# faster-whisper/faster-qwen3-tts/qwentts-cpp-python/kokoro/moss/voxcpm/qwen-agent.
+# Their absence is what the mock rungs exist for, and /health then reports
+# {"stt":"mock","llm":"mock","tts":"mock"} rather than pretending otherwise.
+
+# --- core web / streaming ---
+fastapi==0.141.*
+uvicorn[standard]==0.52.*
+starlette==1.6.*
+websockets==16.*
+httpx==0.28.*
+pydantic==2.13.*
+aiohttp==3.14.*
+python-multipart==0.0.*
+
+# --- utils (not optional: soundfile is imported by the audio codecs, numpy by every
+#     buffer, scipy+jieba+lxml by web_search, loguru by every module, psutil by /health) ---
+numpy==2.4.*
+scipy==1.16.*
+soundfile==0.14.*
+lxml==6.1.*
+jieba==0.42.*
+loguru==0.7.*
+psutil==7.*

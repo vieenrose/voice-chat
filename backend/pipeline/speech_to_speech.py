@@ -8,10 +8,56 @@ All streaming, so TTS starts before LLM finishes.
 Also exposes HF `pipeline("speech-to-speech")` style API for compatibility.
 """
 import asyncio
+import os as _os
+import re
 import time
 from typing import AsyncGenerator, Awaitable, Callable, Optional
 from loguru import logger
 import numpy as np
+
+
+# Text that is tool plumbing rather than speech must never reach the speaker. One case is
+# not XML: a small model "calling" a tool by printing its name and then answering
+# (現在的時間是 [get_current_datetime]。). agent/qwen_harness.detect_unexecuted_tool repairs
+# the answer; this guard keeps the broken draft out of the audio while the repair runs.
+_TOOL_NAME_RE = re.compile(r"\[\s*(get_current_datetime|get_weather|web_search)\s*\]")
+# CJK has no word separators, so `len(s.split()) < 4` is true for almost every Chinese
+# sentence — the pre-existing "short fragment mentioning web_search" junk filter used to
+# silence legitimate spoken Chinese ("我可以用 web_search 幫你查…"). It was written for bare
+# Latin fragments like `web_search` / `query`, so it now only applies to those.
+_CJK_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
+
+
+def _norm_phrase(s: str) -> str:
+    return re.sub(r"[^\w\u4e00-\u9fff\u3400-\u4dbf]+", " ", (s or "").lower()).strip()
+
+
+def is_echo_of_prompt(candidate: str, question: str = "", tool_queries=()) -> bool:
+    """True when a would-be spoken sentence is really an echo of the user's own question
+    (or of a query a tool was called with) rather than an answer to it.
+
+    Small models sometimes read the prompt back before answering. The original
+    suppression for that matched the literal opening words of ONE benchmark question — a
+    rule that would silently skip any answer beginning with those words and nothing else.
+    Compare content instead: a short candidate whose normalized text IS the question (or a
+    prefix of it), or equals a query a tool was called with this turn.
+    """
+    c = _norm_phrase(candidate)
+    if not c or len(c.split()) > 14:
+        return False
+    q = _norm_phrase(question)
+    if q and (c == q or (len(c.split()) >= 3 and q.startswith(c))):
+        return True
+    return any(c == _norm_phrase(tq) for tq in tool_queries if tq)
+
+
+def _is_tool_artifact(s: str) -> bool:
+    low = s.lower()
+    return bool(_TOOL_NAME_RE.search(s)) or (
+        ("<" in s and ">" in s)
+        or "tool_call" in low or "arg_key" in low or "arg_value" in low
+        or s.strip().lower() in ["web_search", "query"]
+        or ("web_search" in low and len(s.split()) < 4 and not _CJK_RE.search(s)))
 
 # STT: X-ASR (sherpa-onnx Zipformer transducer, 160ms streaming, zh+en) — user requested
 # Light (593M ONNX, no torch in-process), true streaming partials every 160ms.
@@ -22,37 +68,40 @@ try:
         raise ImportError("X-ASR local model not found")
     from stt.xasr_streaming import StreamingXASR
     STT_NAME = "X-ASR-160ms"
-    print(f"[STT] Using X-ASR sherpa-onnx 160ms (Zipformer transducer, zh+en, 16k)")
+    print("[STT] Using X-ASR sherpa-onnx 160ms (Zipformer transducer, zh+en, 16k)")
 except ImportError as e_x:
     print(f"[STT] X-ASR not ready {e_x}, fallback to Paraformer/ARK")
     try:
         from stt.paraformer_streaming import StreamingXASR
         STT_NAME = "Paraformer-seaco"
-        print(f"[STT] Using Paraformer seaco large (FunASR, 16k, zh+en)")
+        print("[STT] Using Paraformer seaco large (FunASR, 16k, zh+en)")
     except ImportError as e_pf:
         print(f"[STT] Paraformer not ready {e_pf}, fallback to ARK-ASR 0.6B")
         try:
             from stt.ark_streaming import StreamingXASR
             if pathlib.Path("/tmp/ARK/model.safetensors").exists():
                 STT_NAME = "ARK-ASR-0.6B"
-                print(f"[STT] Using ARK-ASR 0.6B at /tmp/ARK")
+                print("[STT] Using ARK-ASR 0.6B at /tmp/ARK")
             else:
                 raise ImportError("ARK not downloaded")
         except ImportError as e2:
-            print(f"[STT] ARK not ready {e2}, fallback to X-ASR")
-            from stt.xasr_streaming import StreamingXASR
-            STT_NAME = "X-ASR-160ms"
+            print(f"[STT] ARK not ready {e2}, falling back to MOCK STT")
+            # Previously the last rung re-imported X-ASR — the one that just failed —
+            # so the ImportError escaped the module import and even `app.py --mock`
+            # could not start without the model libraries installed.
+            from stt.mock_streaming import StreamingXASR
+            STT_NAME = "MOCK"
+            print("[STT] Using MOCK STT adapter (energy-segmented fake transcripts)")
 # LLM: Qwen3.5-0.8B-MTP GGUF via llama.cpp (native tool calling) — default production LLM
 # (was Ling 3.0 tiny earlier; keep LingStreaming class name for API compat)
 try:
     from llm.ling_streaming import LingStreaming as MiniCPMStreaming
     LLM_NAME = "Qwen3.5-0.8B-MTP-GGUF"
-    print(f"[LLM] configured at runtime (llama-server, native tools)")
+    print("[LLM] configured at runtime (llama-server, native tools)")
 except ImportError:
     from llm.minicpm_streaming import MiniCPMStreaming
     LLM_NAME = "MiniCPM5"
 # HF Official switch: use paraformer + Ling HF + Qwen3-TTS if HF_OFFICIAL=1 (default 0 for fast boot, custom ARK+MOSS is already HF Hub)
-import os as _os
 HF_OFFICIAL = False  # force custom ARK+MOSS for now, HF download is slow (SenseVoice 936M @ 500kB/s)
 # To enable HF official: set HF_OFFICIAL=True manually or via HF_OFFICIAL=1 env and ensure models cached
 if HF_OFFICIAL:
@@ -65,7 +114,7 @@ if HF_OFFICIAL:
         TTS_SR = _HFSR
         # For HFOfficialPipeline we will directly use HFOfficialPipeline class, not individual STT/LLM/TTS here
         # This block just sets names; actual pipeline will be HFOfficialPipeline
-        print(f"[HF Official] paraformer + Ling-3.0-tiny HF + Qwen3-TTS 0.6b (official)")
+        print("[HF Official] paraformer + Ling-3.0-tiny HF + Qwen3-TTS 0.6b (official)")
     except Exception as e_hf:
         print(f"[HF Official] not ready {e_hf}, fallback to MOSS")
         HF_OFFICIAL = False
@@ -77,32 +126,45 @@ if not HF_OFFICIAL:
         from tts.qwen3_streaming import StreamingPrimeTTS
         from tts.qwen3_streaming import SAMPLE_RATE as TTS_SR
         TTS_NAME = "Qwen3-TTS-0.6b-CustomVoice-Q8"
-        print(f"[TTS] Using Qwen3-TTS 12Hz 0.6B CustomVoice Q8_0 (faster_qwen3_tts cu124, TRUE streaming, 24k)")
+        print("[TTS] Using Qwen3-TTS 12Hz 0.6B CustomVoice Q8_0 (faster_qwen3_tts cu124, TRUE streaming, 24k)")
     except ImportError as e_q3:
         print(f"[TTS] Qwen3-TTS not ready {e_q3}, fallback Kokoro-1.0 82M")
         try:
             from tts.kokoro_streaming import StreamingPrimeTTS
             from tts.kokoro_streaming import SAMPLE_RATE as TTS_SR
             TTS_NAME = "Kokoro-1.0-82M"
-            print(f"[TTS] Using Kokoro-1.0 82M (ONNX CPU, 24k, no prosody pauses)")
+            print("[TTS] Using Kokoro-1.0 82M (ONNX CPU, 24k, no prosody pauses)")
         except ImportError as e_k:
             print(f"[TTS] Kokoro not ready {e_k}, fallback MOSS-TTS-Nano-100M ONNX (CUDA EP)")
             try:
                 from tts.moss_onnx_streaming import StreamingPrimeTTS
                 from tts.moss_onnx_streaming import SAMPLE_RATE as TTS_SR
                 TTS_NAME = "MOSS-Nano-100M-ONNX"
-                print(f"[TTS] Using MOSS-TTS-Nano-100M ONNX (CUDA EP) 48k per-sentence streaming")
+                print("[TTS] Using MOSS-TTS-Nano-100M ONNX (CUDA EP) 48k per-sentence streaming")
             except ImportError as e_mn:
-                print(f"[TTS] MOSS-ONNX not ready {e_mn}, fallback VoxCPM2")
-                from tts.primetts_streaming import StreamingPrimeTTS, SAMPLE_RATE as TTS_SR
-                TTS_NAME = "VoxCPM2"
+                print(f"[TTS] MOSS-ONNX not ready {e_mn}, falling back to MOCK TTS")
+                try:
+                    from tts.primetts_streaming import StreamingPrimeTTS
+                    from tts.primetts_streaming import SAMPLE_RATE as TTS_SR
+                    TTS_NAME = "VoxCPM2"
+                except ImportError as e_vx:
+                    # Terminal rung: previously VoxCPM (hard onnx/vLLM deps), so a
+                    # machine without it could not boot even in --mock mode.
+                    from tts.mock_streaming import StreamingPrimeTTS
+                    from tts.mock_streaming import SAMPLE_RATE as TTS_SR
+                    TTS_NAME = "MOCK"
+                    print(f"[TTS] Using MOCK TTS adapter (tone audio; VoxCPM unavailable: {e_vx})")
 
 class HFSpeechToSpeechPipeline:
     """
     HuggingFace speech-to-speech pipeline compatible class.
-    Usage:
+    Usage (the one entry point is the interleaved generator; the old non-interleaved
+    `stream_chat` and the standalone `/ws/stt`, `/ws/tts`, `/ws/llm` debug sockets were
+    removed — they were a second, untested copy of the same logic):
         pipe = HFSpeechToSpeechPipeline(mock=True)
-        async for event in pipe.stream_chat(audio_queue, stop_event):
+        async for event in pipe.stream_chat_interleaved(pcm_queue, stop_event, session_id,
+                                                       barge_in_event=ev, barge_in_lock=lock,
+                                                       on_new_voice_turn=cancel_text_turns):
             ...
     """
     def __init__(self, stt_model="Audio8/ARK-ASR-0.6B", llm_model="noctrex/Ling-3.0-tiny-MXFP4_MOE-GGUF", tts_model="OpenMOSS-Team/MOSS-TTS-Nano-100M", device="cuda", mock=False):
@@ -133,16 +195,17 @@ class HFSpeechToSpeechPipeline:
                 self._get_history = self._hf._get_history
                 self._trim_history = self._hf._trim_history
                 logger.info(f"HF Official S2S ready (paraformer + Ling HF + Qwen3-TTS) sr={self.sample_rate}")
-                logger.warning(
-                    "HF_OFFICIAL mode delegates stream_chat_interleaved to HFOfficialPipeline, "
-                    "which does not implement voice barge-in or turn_id tagging (see hf_official.py) — "
-                    "self._voice_response_tasks/next_turn_id are never populated on this path, so "
-                    "app.py's do_barge_in will silently find nothing to cancel for voice turns."
+                logger.info(
+                    "HF_OFFICIAL mode delegates stream_chat_interleaved to HFOfficialPipeline, which "
+                    "implements the same pump/turn_id/barge-in contract as this one (see hf_official.py); "
+                    "self._voice_response_tasks is still owned by the delegate, so app.py's do_barge_in "
+                    "cancels via barge_in_event on that path rather than via this dict."
                 )
                 return
             except Exception as e_hf_init:
                 logger.warning(f"HF Official init failed {e_hf_init}, fallback to custom")
-                import traceback; traceback.print_exc()
+                import traceback
+                traceback.print_exc()
         # STT: X-ASR (local sherpa), else Paraformer/ARK
         if STT_NAME == "X-ASR-160ms":
             stt_model = "GilgameshWind/X-ASR-zh-en"
@@ -152,13 +215,25 @@ class HFSpeechToSpeechPipeline:
             stt_model = "/tmp/ARK"
         else:
             stt_model = "GilgameshWind/X-ASR-zh-en"
-        self.stt = StreamingXASR(model_id=stt_model, device=device, mock=False, chunk_ms=160)
-        logger.info(f"STT {STT_NAME} model_id={stt_model} backend={self.stt.backend}")
+        # Construction — not just import — is what needs a fallback here. An adapter can
+        # import cleanly and then fail inside __init__ (paraformer imports funasr in its
+        # constructor and raises RuntimeError), and the module-level ladder only proves
+        # the import. That is why a machine without the model stack died right here, even
+        # with --mock, which the mock rungs were added to make unnecessary.
+        try:
+            self.stt = StreamingXASR(model_id=stt_model, device=device, mock=False, chunk_ms=160)
+            logger.info(f"STT {STT_NAME} model_id={stt_model} backend={self.stt.backend}")
+        except Exception as e_stt_init:
+            logger.warning(f"STT {STT_NAME} would not construct ({e_stt_init!r}) — falling back to the MOCK STT "
+                           "adapter. /health reports models_loaded.stt='mock'; nothing is silently faked on a healthy boot.")
+            from stt.mock_streaming import StreamingXASR as _MockSTT
+            self.stt = _MockSTT(model_id=stt_model, device="cpu", mock=True, chunk_ms=160)
         # LLM: Qwen3.5-0.8B-MTP GGUF via llama.cpp :11436 — native tools, try real even in mock mode
         try:
             import os
             _llm_base = os.getenv("LLM_API_BASE", "http://127.0.0.1:11435/v1")
-            self.llm = MiniCPMStreaming(model_id="unsloth/Qwen3.5-2B-GGUF", api_base=_llm_base, model_name="qwen3.5-2b", device=device, mock=False)
+            self.llm = MiniCPMStreaming(model_id="unsloth/Qwen3.5-2B-GGUF", api_base=_llm_base, model_name="qwen3.5-2b",
+                                        device=device, mock=False, degraded_mode="mock" if mock else "error")
             # If it still ended up in mock due to server not ready, keep it but log
             if getattr(self.llm, 'mock', False):
                 logger.info(f"LLM {LLM_NAME} not ready (llama-server down), using mock fallback — will become real once GGUF downloaded and server up")
@@ -166,70 +241,16 @@ class HFSpeechToSpeechPipeline:
             logger.warning(f"LLM {LLM_NAME} init failed {e}, fallback to mock")
             from llm.minicpm_streaming import MiniCPMStreaming as FallbackLLM
             self.llm = FallbackLLM(model_id="openbmb/MiniCPM5-1B", device=device, mock=True)
-        self.tts = StreamingPrimeTTS(model_id=tts_model, device=device, mock=mock)
+        try:
+            self.tts = StreamingPrimeTTS(model_id=tts_model, device=device, mock=mock)
+        except Exception as e_tts_init:
+            logger.warning(f"TTS {TTS_NAME} would not construct ({e_tts_init!r}) — falling back to the MOCK TTS "
+                           "adapter (tone audio). /health reports models_loaded.tts='mock'.")
+            from tts.mock_streaming import StreamingPrimeTTS as _MockTTS
+            self.tts = _MockTTS(model_id=tts_model, device="cpu", mock=True)
         # Multi-turn session history for Ling 3.0 chat template (system + turns)
         self.sessions: dict[str, list] = {}
         logger.info(f"HF S2S Pipeline ready (mock={mock}, device={device}) — Ling 3.0 multi-turn + tool ready, history per session")
-
-    async def stream_chat(self, pcm_queue: asyncio.Queue, stop_event: asyncio.Event) -> AsyncGenerator[dict, None]:
-        """
-        Full duplex streaming: consumes PCM, yields unified events:
-          stt_partial, stt_final, llm_token, tts_chunk, tts_end, latency
-        """
-        e2e_start = None
-        stt_latency = None
-        llm_ttft = None
-        tts_ttfb = None
-
-        async for stt_event in self.stt.transcribe_stream(pcm_queue, stop_event):
-            yield stt_event
-            if stt_event["type"] == "stt_partial":
-                if e2e_start is None:
-                    e2e_start = time.time()
-            if stt_event["type"] == "stt_final":
-                final_text = stt_event["text"]
-                if not final_text.strip():
-                    continue
-                stt_latency = stt_event.get("latency_ms", 0)
-                if e2e_start is None:
-                    e2e_start = time.time()
-                # Start LLM → TTS cascading stream
-                llm_start = time.time()
-                tts_first = None
-
-                # Create async generator for LLM tokens
-                llm_gen = self.llm.generate_stream(final_text)
-
-                # We'll manually iterate LLM and flush to TTS with sentence buffering
-                # To keep true streaming, we wrap LLM gen as token_stream for TTS
-                async def token_stream_proxy():
-                    async for tok in llm_gen:
-                        yield tok
-
-                # Stream TTS from token stream
-                first_llm_token_time = None
-                first_tts_time = None
-                buffer_text = ""
-
-                # We need to iterate TTS which consumes token stream
-                async for tts_event in self.tts.stream_tts(token_stream_proxy()):
-                    # Intercept llm_token events? Actually TTS consumes them internally,
-                    # so we need to also emit llm_token separately.
-                    # Workaround: tee the stream — we run LLM twice? Instead refactor:
-                    # Let's implement direct loop here for proper event interleaving
-                    yield tts_event
-                    if tts_event["type"] == "tts_chunk":
-                        if first_tts_time is None:
-                            first_tts_time = time.time()
-                            tts_ttfb = int((first_tts_time - llm_start)*1000)
-                        # compute e2e
-                        e2e_ms = int((first_tts_time - e2e_start)*1000) if e2e_start else 0
-                        yield {"type": "latency", "stt_ms": stt_latency or 0, "llm_ttft_ms": llm_ttft or 40, "tts_ttfb_ms": tts_ttfb or 0, "e2e_ms": e2e_ms}
-
-                # If we used TTS.stream_tts we already consumed LLM, but we didn't emit llm_token.
-                # For proper llm_token emission, we do alternative path below if mock optimization not needed
-                # For now, emit a completed llm text as single event for metrics?
-                # The above proxy loses token granularity. Let's instead do manual buffered loop for real streaming:
 
     def next_turn_id(self, session_id: str) -> int:
         n = self._turn_counters.get(session_id, 0) + 1
@@ -283,7 +304,7 @@ class HFSpeechToSpeechPipeline:
 
         async def stt_pump():
             try:
-                async for ev in self.stt.transcribe_stream(pcm_queue, stop_event):
+                async for ev in self.stt.transcribe_stream(pcm_queue, stop_event, session_id):
                     await out_q.put(("stt", ev))
             finally:
                 await out_q.put(("stt_done", None))
@@ -299,6 +320,7 @@ class HFSpeechToSpeechPipeline:
             llm_ttft = None
             tts_ttfb = None
             first_chunk_of_turn = True
+            tool_queries: list[str] = []   # what the tools were asked, for echo suppression
             turn_history = self._trim_history(self._get_history(session_id))
 
             async def emit(ev):
@@ -308,14 +330,20 @@ class HFSpeechToSpeechPipeline:
                 nonlocal first_tts_t, tts_ttfb, first_chunk_of_turn
                 t0 = time.time()
                 async for pcm_chunk in self.tts.synthesize_streaming(text_to_synth):
-                    # Silence-placeholder check generalized to "all-zero" rather than the
-                    # old fixed-length match (`len==int(sr*0.3)`) inherited from a previous
-                    # TTS backend (MOSS, at a different sample rate) — the current Qwen3-TTS
-                    # backend's own exception fallback is a different fixed length (0.4s),
-                    # so an exact-length check would silently miss it too; checking peak
-                    # amplitude instead of an incidental length coincidence catches any
-                    # backend's zero-fill fallback regardless of its exact duration.
-                    if barge_in_event.is_set() or len(pcm_chunk) == 0 or int(np.max(np.abs(pcm_chunk))) == 0:
+                    # A barge-in means STOP consuming, not skip-and-keep-draining:
+                    # `continue` here kept pulling chunks and made the TTS worker
+                    # synthesize the entire rest of the sentence purely to discard it
+                    # (burning the GPU that the new turn needs). Breaking runs the
+                    # generator's finally, which sets its stop_flag and abandons the
+                    # synthesis thread immediately.
+                    if barge_in_event.is_set():
+                        logger.info("run_turn: barge-in set, aborting TTS stream mid-sentence")
+                        break
+                    if len(pcm_chunk) == 0 or int(np.max(np.abs(pcm_chunk))) == 0:
+                        # Silence-placeholder guard: peak amplitude, not a fixed length.
+                        # The old `len == sr*0.3` check was an incidental length match
+                        # inherited from a different TTS backend at a different sample
+                        # rate; amplitude catches any backend's zero-fill fallback.
                         continue
                     if first_chunk_of_turn:
                         await emit({"type": "tts_start", "sampleRate": self.tts.sample_rate})
@@ -334,7 +362,22 @@ class HFSpeechToSpeechPipeline:
                 prompt_with_hint = stt_final_text + LANG_HINT  # history keeps the raw transcript, not the hint
                 llm_gen = self.llm.generate_chat_with_tools(turn_history, prompt_with_hint) if hasattr(self.llm, 'generate_chat_with_tools') else self.llm.generate_with_tools(prompt_with_hint)
                 async for llm_event in llm_gen:
+                    if llm_event["type"] == "llm_reset":
+                        # The harness streamed answer text and then had to take it back
+                        # (an XML tool call appeared mid-stream, or a tool step followed).
+                        # Drop everything buffered from that speculation so it never
+                        # reaches TTS, and forward the signal so the UI clears its
+                        # streaming bubble too.
+                        logger.info("run_turn: llm_reset — discarding speculative text")
+                        tts_buffer = ""
+                        tts_token_count = 0
+                        llm_text_so_far = ""
+                        await emit({"type": "llm_reset"})
+                        continue
                     if llm_event["type"] == "tool_call":
+                        _tq = llm_event.get("query") or (llm_event.get("arguments") or {}).get("query") or ""
+                        if _tq:
+                            tool_queries.append(_tq)
                         await emit({"type": "tool_call", "name": llm_event["name"], "arguments": llm_event.get("arguments", {}), "query": llm_event.get("query","")})
                         continue
                     if llm_event["type"] == "tool_result":
@@ -366,7 +409,7 @@ class HFSpeechToSpeechPipeline:
                         if should_flush and tts_buffer.strip():
                             text_to_synth = tts_buffer.strip()
                             _low = text_to_synth.lower()
-                            if ("<" in text_to_synth and ">" in text_to_synth) or "tool_call" in _low or "arg_key" in _low or "arg_value" in _low or text_to_synth.strip().lower() in ["web_search", "query"] or "web_search" in _low and len(text_to_synth.split()) < 4:
+                            if _is_tool_artifact(text_to_synth):
                                 logger.info(f"Skip TTS for tool artifact: {text_to_synth[:60]}")
                                 tts_buffer = ""
                                 tts_token_count = 0
@@ -376,9 +419,9 @@ class HFSpeechToSpeechPipeline:
                                 tts_buffer = ""
                                 tts_token_count = 0
                                 continue
-                            # Also skip pure tool queries like "Who is the president of France 2024" when it's from tool call context
-                            if text_to_synth.strip().lower().startswith("who is the president") and len(text_to_synth.split()) < 10 and "tool" in str(turn_history).lower():
-                                logger.info(f"Skip TTS for tool query: {text_to_synth[:60]}")
+                            # an echo of the caller's own question is not an answer
+                            if is_echo_of_prompt(text_to_synth, stt_final_text, tool_queries):
+                                logger.info(f"Skip TTS for question echo: {text_to_synth[:60]}")
                                 tts_buffer = ""
                                 tts_token_count = 0
                                 continue

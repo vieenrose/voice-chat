@@ -5,7 +5,10 @@ Native OpenAI tools API via llama-server (same runtime, fair). Two-pass:
   2) append tool result -> expect coherent final answer
 Measures: tool_call validity, arg query, TTFT, tok/s, answer quality.
 """
-import asyncio, json, time, httpx, sys
+import asyncio
+import json
+import time
+import httpx
 
 PROMPTS = [
     {"id": "weather", "q": "What is the weather in Paris today?"},
@@ -30,25 +33,34 @@ MODELS = {
 }
 
 async def chat(base, model, messages, max_tokens=256):
-    t0=time.time(); first=None; text=""; tcalls=[]; ntok=0
+    t0=time.time()
+    first=None
+    text=""
+    tcalls=[]
+    ntok=0
     payload={"model":model,"messages":messages,"tools":TOOLS,"tool_choice":"auto",
              "stream":True,"max_tokens":max_tokens,"temperature":0.2}
     async with httpx.AsyncClient(timeout=120) as c:
         async with c.stream("POST", f"http://{base}/v1/chat/completions", json=payload) as r:
             async for line in r.aiter_lines():
-                if not line.startswith("data: "): continue
+                if not line.startswith("data: "):
+                    continue
                 d=line[6:].strip()
-                if d=="[DONE]": break
+                if d=="[DONE]":
+                    break
                 try:
                     j=json.loads(d)
-                    if first is None: first=time.time()-t0
+                    if first is None:
+                        first=time.time()-t0
                     ch=j["choices"][0]
                     delta=ch.get("delta",{})
                     ntok+=1
-                    if delta.get("content"): text+=delta["content"]
+                    if delta.get("content"):
+                        text+=delta["content"]
                     for tc in (delta.get("tool_calls") or []):
                         tcalls.append(tc)
-                except Exception: pass
+                except Exception:
+                    pass
     ttft=int((first or 0)*1000)
     # merge tool calls (streaming splits) + extract final JSON
     merged={}
@@ -58,12 +70,15 @@ async def chat(base, model, messages, max_tokens=256):
         m=merged.setdefault(i,{"name":"","arguments":""})
         m["name"]+=fn.get("name","")
         m["arguments"]+=fn.get("arguments","")
-    tool_calls=[]; args=None
-    for i,m in merged.items():
+    tool_calls=[]
+    args=None
+    for m in merged.values():
         tool_calls.append({"name":m["name"],"arguments":m["arguments"]})
         if "web_search" in m["name"]:
-            try: args=json.loads(m["arguments"])
-            except Exception: args={"query":m["arguments"][:60]}
+            try:
+                args=json.loads(m["arguments"])
+            except Exception:
+                args={"query":m["arguments"][:60]}
     tok_s = ntok/max((time.time()-t0),0.001)
     return {"text":text.strip(), "tool_calls":tool_calls, "args":args, "ttft":ttft, "tok_s":round(tok_s,1), "total_s":round(time.time()-t0,2)}
 
@@ -77,7 +92,6 @@ async def bench_one(model_key, base, alias):
             # pass 2: feed tool result, ask to answer
             msgs=[{"role":"user","content":p["q"]}]
             if valid:
-                aidx=tc[0].get("index",0)
                 msgs.append({"role":"assistant","content":None,
                              "tool_calls":[{"id":"call_0","type":"function","function":{"name":"web_search","arguments":json.dumps(r1["args"] or {"query":p["q"]})}}]})
                 msgs.append({"role":"tool","tool_call_id":"call_0","content":SNIPPET+" Source: SearXNG self-hosted."})
@@ -97,7 +111,9 @@ async def bench_one(model_key, base, alias):
     print(f"\n### {model_key}")
     print(f"tool_call_ok {tc_ok}/{n} | answer_ok {ans_ok}/{n} | TTFT1 avg {sum(ttfts)//len(ttfts) if ttfts else 0}ms")
     for r in rows:
-        if "err" in r: print("  ", r["id"], "ERR", r["err"]); continue
+        if "err" in r:
+            print("  ", r["id"], "ERR", r["err"])
+            continue
         print(f"  {r['id']:8s} tc={'Y' if r['tool_call_ok'] else 'N'} ans={'Y' if r['answer_ok'] else 'N'} "
               f"ttft1 {r['ttft1']:>4}ms tok/s {r['tok_s1']:>5} q=\"{r['query']}\"")
         print(f"            ans: {r['ans']}")
@@ -107,9 +123,12 @@ async def main():
         try:
             async with httpx.AsyncClient(timeout=5) as c:
                 r=await c.get(f"http://{base}/v1/models")
-            if r.status_code!=200: print(f"{key} not up"); continue
+            if r.status_code!=200:
+                print(f"{key} not up")
+                continue
         except Exception:
-            print(f"{key} not up on {base}"); continue
+            print(f"{key} not up on {base}")
+            continue
         await bench_one(key, base, alias)
 
 if __name__=="__main__":

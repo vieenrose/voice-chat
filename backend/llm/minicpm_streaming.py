@@ -87,7 +87,7 @@ class MiniCPMStreaming:
             # MiniCPM uses chat template if available
             try:
                 input_text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            except:
+            except Exception:
                 input_text = f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
 
             inputs = self.tokenizer(input_text, return_tensors="pt")
@@ -153,9 +153,12 @@ class MiniCPMStreaming:
         except ImportError:
             try:
                 from ..tools.web_search import web_search, format_results
-            except:
+            except Exception:
                 web_search = None
-                format_results = lambda x: str(x)
+                def format_results(x):
+                    # fallback shim: tools.web_search is absent, so there is nothing to
+                    # format — repr() is the honest degradation (E731: a def, not a lambda)
+                    return str(x)
 
         # Fast-path heuristic: check if prompt likely needs search and we haven't already included search results
         is_search_prompt = "web search results" not in prompt.lower() and "search results for" not in prompt.lower()
@@ -207,7 +210,6 @@ class MiniCPMStreaming:
         # Buffer tokens to detect <tool> pattern
         buffered = ""
         saw_tool_call = False
-        tool_query = None
         t0 = time.time()
         async for ev in self.generate_stream(prompt, max_new_tokens=max_new_tokens):
             if ev["type"] == "llm_token":
@@ -220,9 +222,8 @@ class MiniCPMStreaming:
                     try:
                         args = json.loads(m.group(2))
                         query = args.get("query") or args.get("q") or prompt[:60]
-                    except:
+                    except Exception:
                         query = prompt[:60]
-                    tool_query = query
                     # We have detected a tool call — stop streaming current tokens that are tool syntax
                     # Emit tool_call instead of the raw tokens that contain the tool markup
                     # First, strip the tool call markup from already yielded text (fronted will hide it)
@@ -257,14 +258,17 @@ class MiniCPMStreaming:
                 if jm and not saw_tool_call and '"query"' in buffered and web_search is not None and "tool_call" not in buffered:
                     # Try parse json
                     try:
-                        import re, json as js
+                        import re
+                        import json as js
                         # extract first json object
                         start = buffered.find('{')
                         depth=0
                         end=-1
                         for idx,ch in enumerate(buffered[start:]):
-                            if ch=='{': depth+=1
-                            elif ch=='}': depth-=1
+                            if ch=='{':
+                                depth+=1
+                            elif ch=='}':
+                                depth-=1
                             if depth==0:
                                 end=start+idx+1
                                 break
@@ -282,7 +286,8 @@ class MiniCPMStreaming:
                                 async for tok2 in self.generate_stream(augmented):
                                     yield tok2
                                 return
-                    except: pass
+                    except Exception:
+                        pass
                 # Normal token streaming
                 yield ev
             elif ev["type"] == "llm_done":

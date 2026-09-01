@@ -3,25 +3,31 @@
 WebSocket E2E latency test — connects to /ws/chat and streams text_input -> measures tts_chunk latency
 Peak RSS polled via /health
 """
-import asyncio, time, json, statistics, sys, os
+import asyncio
+import time
+import json
+import statistics
+import sys
+import os
 sys.path.insert(0, os.path.dirname(__file__))
-import psutil
 
 async def test_ws(server="ws://localhost:8000/ws/chat", iters=5):
-    import websockets, aiohttp, base64
+    import websockets
+    import aiohttp
     # poll RSS via http
     peak = 0
     async def poll_rss():
         nonlocal peak
-        import aiohttp
         while True:
             try:
                 async with aiohttp.ClientSession() as s:
                     async with s.get("http://localhost:8000/health") as r:
                         j=await r.json()
                         rss=j.get("rss_mb",0)
-                        if rss>peak: peak=rss
-            except: pass
+                        if rss>peak:
+                            peak=rss
+            except Exception:
+                pass
             await asyncio.sleep(0.05)
     poll_t = asyncio.create_task(poll_rss())
     await asyncio.sleep(0.2)
@@ -31,13 +37,14 @@ async def test_ws(server="ws://localhost:8000/ws/chat", iters=5):
         uri = f"{server}?session_id=test{i}"
         async with websockets.connect(uri, max_size=16*1024*1024) as ws:
             txt = "Hello how are you today"
-            if i%3==1: txt="Tell me a joke about AI"
-            if i%3==2: txt="What is low latency voice chat"
+            if i%3==1:
+                txt="Tell me a joke about AI"
+            if i%3==2:
+                txt="What is low latency voice chat"
             t0=time.time()
             await ws.send(json.dumps({"type":"text_input","text":txt}))
             first_tts=None
             llm_ttft=None
-            stt_ms=5
             # wait for events
             try:
                 async for msg in ws:
@@ -63,8 +70,10 @@ async def test_ws(server="ws://localhost:8000/ws/chat", iters=5):
             await asyncio.sleep(0.1)
 
     poll_t.cancel()
-    try: await poll_t
-    except: pass
+    try:
+        await poll_t
+    except Exception:
+        pass
     print("\n"+"="*68)
     print("  WS STREAMING — PEAK RSS & E2E")
     print("="*68)
@@ -72,8 +81,10 @@ async def test_ws(server="ws://localhost:8000/ws/chat", iters=5):
     if e2e_list:
         print(f"  E2E avg {statistics.mean(e2e_list):.0f} p50 {statistics.median(e2e_list):.0f} min {min(e2e_list)} max {max(e2e_list)} p95 {float(__import__('numpy').percentile(e2e_list,95)):.0f}")
         avg=statistics.mean(e2e_list)
-        if avg<800: print(f"  ✅ PASSED <800ms (avg {avg:.0f}ms)")
-        else: print(f"  ❌ avg {avg:.0f}ms")
+        if avg<800:
+            print(f"  ✅ PASSED <800ms (avg {avg:.0f}ms)")
+        else:
+            print(f"  ❌ avg {avg:.0f}ms")
     print("="*68)
 
 if __name__=="__main__":

@@ -1,0 +1,35 @@
+# Enforced in CI: `ruff check backend --config ruff.toml`, currently ZERO findings.
+# Keep it at zero rather than adding ignores — every rule here has already caught
+# something real (F821 `ttfs` in test_e2e_streaming.py would NameError, F811 shadowed
+# imports in qwen_harness, B904 swallowed causes in the adapter ladders, B905 zip without
+# strict, E722 bare excepts that also ate asyncio.CancelledError).
+line-length = 160
+target-version = "py312"
+
+[lint]
+# Enforced: pyflakes + syntax + bugbear + the pycodestyle families that were swept clean
+# on 2026-08-31 (autopep8 for E701/E702/E401, hand/scripted for E722/E741/E731/E402).
+# Keep it at zero. The bare `except:` removals matter beyond style: a bare except also
+# swallows asyncio.CancelledError, so an interrupted turn could keep synthesizing.
+select = ["E4", "E7", "E9", "F", "B"]
+ignore = [
+  "B008",   # function call in default arg — the FastAPI Query(...) pattern
+]
+
+# The adapter ladders (stt/, tts/, llm/, pipeline/) probe optional deps with
+# `try: import heavy_thing except ImportError: ...`. Those imports look unused to a
+# linter but ARE the check — removing them (ruff's "safe" fix) turns the ladder into a
+# silent pass. Keep them, keep them quiet.
+[lint.per-file-ignores]
+"backend/stt/*" = ["F401", "F402"]
+"backend/tts/*" = ["F401", "F402"]
+"backend/llm/*" = ["F401", "F402"]
+"backend/pipeline/*" = ["F401", "F402"]
+"backend/tests/*" = ["E501"]
+
+# E402 (import not at top) is disabled per-file where the ordering is structural, via a
+# `# ruff: noqa: E402` pragma in the file itself (agent/qwen_harness.py): qwen-agent
+# reads its iteration cap from the environment at import time.
+
+# Line length is advisory only (line-length above is ruff's own wrap budget, and
+# backend/tests/* ignores E501); the repo is not formatted to a column.

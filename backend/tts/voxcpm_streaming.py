@@ -38,7 +38,7 @@ class StreamingPrimeTTS:
             logger.error(f"VoxCPM2 load failed {e}, cannot fallback to mock (mock removed)")
             import traceback
             traceback.print_exc()
-            raise RuntimeError(f"VoxCPM2 required, mock removed: {e}")
+            raise RuntimeError(f"VoxCPM2 required, mock removed: {e}") from e
 
     def _mock_synth(self, text: str) -> np.ndarray:
         # Should never be called now, but keep for safety
@@ -85,7 +85,8 @@ class StreamingPrimeTTS:
             # For async streaming, we need to iterate in thread
             # Instead, we can run the whole streaming in a thread and queue chunks
             text = self._with_voice(text)
-            import queue, threading
+            import queue
+            import threading
             q = queue.Queue()
             def _run():
                 try:
@@ -105,7 +106,7 @@ class StreamingPrimeTTS:
                     if pcm is None:
                         break
                     yield pcm
-                except:
+                except Exception:
                     break
         except Exception as e:
             logger.error(f"VoxCPM2 streaming failed {e}, fallback to one-shot")

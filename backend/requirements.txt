@@ -1,43 +1,61 @@
-# Core
-fastapi==0.115.*
-uvicorn[standard]==0.34.*
-websockets==14.*
-python-multipart==0.0.9
-pydantic==2.11.*
+# Voice-chat backend requirements — regenerated from the environment the demo
+# actually runs in (python 3.13/3.14, CUDA 12.4), not from memory.
+#
+# The previous file pinned packages this repo never imports (torchaudio, accelerate,
+# datasets-as-core, silero-vad, webrtcvad, phonemizer, faster-whisper as primary) and
+# OMITTED the ones the stack cannot boot without (sherpa-onnx, qwen-agent, jieba,
+# lxml, faster-qwen3-tts, qwentts-cpp-python, …), so `docker compose up` produced a
+# backend whose STT/TTS/agent import ladders all fell through to mock.
+#
+# Verify your environment matches with:  python3 backend/check_env.py
+#
+# TTS runtime needs a CUDA-specific wheel index (see --find-links below).
+--find-links https://huggingface.co/datasets/andito/qwentts-cpp-python-wheels/tree/main/whl/cu124
 
-# ML — HF Speech-to-Speech stack
-torch==2.11.*
-torchaudio==2.11.*
-transformers==5.5.*
-accelerate==1.8.*
-huggingface_hub==1.27.*
-tokenizers==0.22.*
-safetensors==0.5.*
-numpy==1.26.*
-scipy==1.14.*
-librosa==0.11.*
-soundfile==0.13.*
+# --- core web / streaming ---
+fastapi==0.141.*
+uvicorn[standard]==0.52.*
+starlette==1.6.*
+websockets==16.*
+httpx==0.28.*
+pydantic==2.13.*
+aiohttp==3.14.*
+python-multipart==0.0.*
 
-# STT: streaming X-ASR — faster-whisper for real streaming, fallback to transformers
-faster-whisper==1.1.*
-openai-whisper==20250625 ; python_version < "3.13"
-
-# TTS: PrimeTTS ONNX + fallback
-onnxruntime-gpu==1.21.* ; sys_platform != "darwin"
-onnxruntime==1.21.* ; sys_platform == "darwin"
-onnx==1.18.*
-phonemizer==3.2.*
-espeakng-loader==0.1.*
-
-# Utils
-silero-vad==5.1.* ; python_version < "3.13"
-webrtcvad==2.0.*
+# --- utils ---
+numpy==2.4.*
+scipy==1.16.*
+soundfile==0.14.*
+lxml==6.1.*                 # web_search page scraping/enrichment
+jieba==0.42.*               # CJK tokenization: query reformulation + relevance scoring
 loguru==0.7.*
-psutil==6.*
-aiohttp==3.*
-uvicorn==0.34.*
+psutil==7.*                 # llm_manager port ownership + /health RSS
 
-# Agent harness (smolagents ToolCallingAgent + OpenAI-compatible llama-server)
-smolagents==1.26.*
+# --- ML base (shared by the fallback adapters) ---
+torch==2.11.*
+transformers==5.15.*
+huggingface_hub==1.27.*
+
+# --- STT: X-ASR (sherpa-onnx Zipformer transducer, 160ms streaming, int8) [default] ---
+sherpa-onnx==1.13.*
+# Fallback chain only (pipeline/speech_to_speech.py tries X-ASR -> Paraformer -> ARK):
+funasr==1.4.*
+faster-whisper==1.1.*
+
+# --- Agent harness: Qwen-Agent Assistant with native function calling [default] ---
+qwen-agent==0.0.34.*        # PyPI versions as 0.0.NN, not NN.0 — `==0.34.*` matches nothing and fails the build
 openai>=2.0
-importlib_resources ; python_version < "3.10"
+# Alternate harnesses (agent/harness.py, agent/pydantic_harness.py):
+smolagents==1.26.*
+pydantic-ai-slim==2.36.*
+
+# --- TTS: Qwen3-TTS 12Hz 0.6B CustomVoice via GGML/CUDA [default] ---
+faster-qwen3-tts==0.4.*
+qwentts-cpp-python==0.3.1+cu124
+# Fallback chain only (Kokoro ONNX / MOSS / VoxCPM):
+onnxruntime-gpu==1.29.* ; sys_platform != "darwin"
+onnxruntime==1.29.* ; sys_platform == "darwin"
+kokoro-onnx==0.4.*
+
+# --- web_search backends ---
+duckduckgo_search==8.1.*

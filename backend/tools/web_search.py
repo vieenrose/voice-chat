@@ -2,30 +2,74 @@
 Web search tool — self-hosted SearXNG compatible.
 
 Tries in order:
-  1. Local SearXNG at http://localhost:8888/search?format=json  (self-hosted)
+  1. Local SearXNG at `$SEARXNG_URL/search?format=json` (self-hosted)
   2. DuckDuckGo via duckduckgo_search.DDGS (pip)
   3. Lite DuckDuckGo scrape via httpx + lxml
-  4. Mock curated results (works offline, deterministic)
+  4. Generic offline placeholder (only when everything above is unreachable)
 
 API matches SearXNG json: /search?q=...&format=json&categories=general
 Also exposes `web_search(query, count=5)` async function for tool calling.
 
-Uses caching (5 min TTL) to keep latency low.
+Uses caching (5 min TTL, LRU-bounded) to keep latency low.
 """
 import asyncio
+import os
 import time
 import re
 import hashlib
+import threading
 import urllib.parse
+from collections import OrderedDict
 import httpx
 from typing import List, Dict
 from loguru import logger
 
-# Simple in-memory cache
-_CACHE: Dict[str, dict] = {}
+# SearXNG base URL: resolved lazily through _searxng_base() so the Docker/compose
+# value (SEARXNG_URL=http://searxng:8080) is actually honored by the search path
+# itself. It used to be hard-coded to http://localhost:8888 here, which meant that
+# in compose /health reported SearXNG "ok" (app.py read the env var) while every
+# real search silently missed it and fell through to scraping.
+SEARXNG_URL = os.getenv("SEARXNG_URL", "http://localhost:8888")
+
+
+def _searxng_base() -> str:
+    return (os.getenv("SEARXNG_URL") or SEARXNG_URL or "http://localhost:8888").rstrip("/")
+
+
+# In-memory cache: LRU-bounded so a long-running demo can't grow it without limit
+# (it was a plain dict keyed by query hash, evicted only by TTL, i.e. unbounded for
+# a stream of unique queries). TTL checked on read; size checked on write.
+_CACHE: "OrderedDict[str, dict]" = OrderedDict()
 CACHE_TTL = 300  # 5 min
+CACHE_MAX = 256
+_CACHE_LOCK = threading.Lock()
 
 # No curated mock DB — honest search only; generic mock below is only for truly offline case
+
+def _cache_get(key: str) -> dict | None:
+    with _CACHE_LOCK:
+        entry = _CACHE.get(key)
+        if not entry:
+            return None
+        if time.time() - entry["t"] >= CACHE_TTL:
+            _CACHE.pop(key, None)
+            return None
+        _CACHE.move_to_end(key)
+        return entry["data"]
+
+
+def _cache_put(key: str, data: dict) -> None:
+    with _CACHE_LOCK:
+        _CACHE[key] = {"t": time.time(), "data": data}
+        _CACHE.move_to_end(key)
+        while len(_CACHE) > CACHE_MAX:
+            _CACHE.popitem(last=False)
+
+
+def _cache_clear() -> None:
+    with _CACHE_LOCK:
+        _CACHE.clear()
+
 
 def _cache_key(query: str, count: int) -> str:
     return hashlib.md5(f"{query.lower().strip()}::{count}".encode()).hexdigest()
@@ -182,7 +226,7 @@ async def _try_searxng(query: str, count: int, engine: str | None = None) -> Lis
                       "language": _lang, "safesearch": 1}
             if engine:
                 params["engines"] = engine
-            resp = await client.get("http://localhost:8888/search", params=params)
+            resp = await client.get(f"{_searxng_base()}/search", params=params)
             if resp.status_code == 200:
                 data = resp.json()
                 results = data.get("results") or data.get("answers") or []
@@ -292,13 +336,15 @@ async def _try_lite_scrape(query: str, count: int) -> List[Dict] | None:
             for row in tree.xpath('//table//tr[td]')[:count*2]:
                 title_el = row.xpath('.//a[contains(@href,"://")]')
                 snippet_el = row.xpath('.//td[@class="result-snippet"]//text()')
-                if not title_el: continue
+                if not title_el:
+                    continue
                 title = title_el[0].text_content().strip()[:120]
                 url = title_el[0].get("href","")
                 snippet = " ".join(snippet_el).strip()[:300] if snippet_el else ""
                 if title and url:
                     out.append({"title": title, "url": url, "content": snippet})
-                if len(out) >= count: break
+                if len(out) >= count:
+                    break
             if out:
                 logger.info(f"web_search via lite scrape: {query} -> {len(out)}")
                 return out
@@ -322,7 +368,8 @@ async def _try_bing(query: str, count: int) -> List[Dict] | None:
             out = []
             for li in tree.xpath('//li[contains(@class,"b_algo")]')[:count*2]:
                 a = li.xpath('.//h2/a')
-                if not a: continue
+                if not a:
+                    continue
                 title = a[0].text_content().strip()[:140]
                 url = a[0].get("href","")
                 snippet = " ".join(li.xpath('.//p//text()')).strip()[:320]
@@ -330,7 +377,8 @@ async def _try_bing(query: str, count: int) -> List[Dict] | None:
                     snippet = " ".join(li.xpath('.//div[contains(@class,"b_caption")]//p//text()')).strip()[:320]
                 if title and url and url.startswith("http"):
                     out.append({"title": title, "url": url, "content": snippet})
-                if len(out) >= count: break
+                if len(out) >= count:
+                    break
             if out:
                 logger.info(f"web_search via bing scrape: {q} -> {len(out)}")
                 return out
@@ -360,10 +408,19 @@ def _tokenize_query(q: str) -> List[str]:
     return tokens
 
 def _relevance_score(query: str, results: List[Dict]) -> float:
-    """Score 0..1 how relevant results are to query. Low = bad search, should fallback."""
-    tokens = _tokenize_query(query)
-    if not results or not tokens:
+    """Score 0..1 how relevant results are to query. Low = bad search, should fallback.
+
+    A query that yields NO scorable tokens (pure digits, emoji, a 1-2 char CJK
+    bigram that the >=2-char filter drops, stopwords-only) is scored 1.0 = neutral,
+    NOT 0. "No tokens" means "I cannot judge this", which is not evidence of a bad
+    search — scoring it 0 made every such query permanently "irrelevant", so its
+    cache entry was always rejected and the whole multi-second fallback chain re-ran
+    on every single request with no possibility of ever improving the score."""
+    if not results:
         return 0
+    tokens = _tokenize_query(query)
+    if not tokens:
+        return 1.0
     # Require majority of tokens to appear for relevance (not just any one)
     hits = 0
     for r in results[:3]:
@@ -380,7 +437,6 @@ def _relevance_score(query: str, results: List[Dict]) -> float:
     score = hits / min(3, len(results))
     return score
 
-import os
 EMBED_URL = os.getenv("EMBED_API_BASE", "http://127.0.0.1:11434/v1/embeddings")
 if not EMBED_URL.endswith("/embeddings"):
     EMBED_URL = EMBED_URL.rstrip("/") + "/embeddings"
@@ -403,7 +459,7 @@ async def _embed_batch(texts: List[str]) -> List[List[float]]:
 
 def _cosine(a: List[float], b: List[float]) -> float:
     import math
-    dot = sum(x*y for x, y in zip(a, b))
+    dot = sum(x*y for x, y in zip(a, b, strict=False))
     na = math.sqrt(sum(x*x for x in a)) or 1e-9
     nb = math.sqrt(sum(y*y for y in b)) or 1e-9
     return dot / (na * nb)
@@ -419,7 +475,7 @@ async def _rerank_with_embeddings(query: str, results: List[Dict]) -> tuple[List
             return results, _relevance_score(query, results)
         q_emb = embs[0]
         scored = []
-        for r, e in zip(results, embs[1:]):
+        for r, e in zip(results, embs[1:], strict=False):
             s = _cosine(q_emb, e)
             # map cosine -1..1 to 0..1, granite typical 0.4..0.9 for relevant
             norm = (s + 1) / 2
@@ -462,16 +518,14 @@ async def web_search(query: str, count: int = 5) -> Dict:
     if not query:
         return {"query": query, "results": [], "source": "none", "latency_ms": 0}
     ck = _cache_key(query, count)
-    if ck in _CACHE:
-        entry = _CACHE[ck]
-        if time.time() - entry["t"] < CACHE_TTL:
-            cached = entry["data"]
-            # Check relevance even for cache - if cached is bad, don't use it
-            if _relevance_score(query, cached.get("results", [])) < 0.34 and not cached.get("source", "").startswith("mock"):
-                logger.info(f"web_search CACHE hit but irrelevant for '{query}' (score {_relevance_score(query, cached.get('results',[])):.2f}), ignoring cache")
-            else:
-                logger.info(f"web_search CACHE hit: {query}")
-                return {**cached, "latency_ms": 2, "cached": True}
+    cached = _cache_get(ck)
+    if cached is not None:
+        # Check relevance even for cache - if cached is bad, don't use it
+        if _relevance_score(query, cached.get("results", [])) < 0.34 and not cached.get("source", "").startswith("mock"):
+            logger.info(f"web_search CACHE hit but irrelevant for '{query}' (score {_relevance_score(query, cached.get('results',[])):.2f}), ignoring cache")
+        else:
+            logger.info(f"web_search CACHE hit: {query}")
+            return {**cached, "latency_ms": 2, "cached": True}
 
     t0 = time.time()
     def _score(rs):
@@ -489,16 +543,16 @@ async def web_search(query: str, count: int = 5) -> Dict:
     wttr = await _wttr_weather(query)
     if wttr:
         results = await _try_searxng(query, count)
-        src_extra = source_was = "searxng"
         if results:
             results.insert(0, wttr)
         else:
             results = [wttr]
-        source = "wttr.in"
+        # Honest label of what is actually in the payload (was a dead `src_extra`/`source_was` pair).
+        source = "wttr.in+searxng" if len(results) > 1 else "wttr.in"
         best_score = 1.0
         payload = {"query": query, "results": results[:count], "source": source,
                    "latency_ms": int((time.time()-t0)*1000), "cached": False}
-        _CACHE[ck] = {"t": time.time(), "data": payload}
+        _cache_put(ck, payload)
         logger.info(f"web_search '{query}' source={source} (wttr+searxng) {len(results)} results")
         return payload
     # 1) aggregate SearXNG (auto language)
@@ -543,7 +597,7 @@ async def web_search(query: str, count: int = 5) -> Dict:
         candidates = [] if _is_chinese(query) else [("duckduckgo", _try_ddgs(query, count))]
         candidates += [("lite_scrape", _try_lite_scrape(query, count)), ("bing_scrape", _try_bing(query, count))]
         gathered = await asyncio.gather(*(c[1] for c in candidates), return_exceptions=True)
-        for (name, _), r in zip(candidates, gathered):
+        for (name, _), r in zip(candidates, gathered, strict=False):
             if isinstance(r, Exception) or not r:
                 continue
             s = _score(r)
@@ -552,7 +606,7 @@ async def web_search(query: str, count: int = 5) -> Dict:
     if not results:
         latency = int((time.time()-t0)*1000)
         payload = {"query": query, "results": [], "source": "no_results", "latency_ms": latency, "cached": False}
-        _CACHE[ck] = {"t": time.time(), "data": payload}
+        _cache_put(ck, payload)
         logger.info(f"web_search '{query}' source=no_results 0 results in {latency}ms — no mock")
         return payload
 
@@ -570,13 +624,32 @@ async def web_search(query: str, count: int = 5) -> Dict:
 
     latency = int((time.time()-t0)*1000)
     payload = {"query": query, "results": results[:count], "source": source, "latency_ms": latency, "cached": False}
-    _CACHE[ck] = {"t": time.time(), "data": payload}
+    _cache_put(ck, payload)
     logger.info(f"web_search '{query}' source={source} {len(results)} results in {latency}ms")
     return payload
 
-# Sync wrapper for non-async callers
+# Sync wrapper for non-async callers (the agent harnesses run their loop in a worker
+# thread and call tools synchronously).
+_SYNC_LOOP: asyncio.AbstractEventLoop | None = None
+_SYNC_THREAD = None
+
+
 def web_search_sync(query: str, count: int = 5) -> Dict:
-    return asyncio.run(web_search(query, count))
+    """Run web_search() from sync code.
+
+    Uses one persistent background event loop instead of asyncio.run() per call:
+    a fresh loop per tool call threw away the httpx connection pools (new TLS
+    handshake to every engine on every search) and, if this function were ever
+    called from a thread that already had a running loop, asyncio.run() would
+    raise instead of searching.
+    """
+    global _SYNC_LOOP, _SYNC_THREAD
+    if _SYNC_LOOP is None or _SYNC_THREAD is None or not _SYNC_THREAD.is_alive():
+        _SYNC_LOOP = asyncio.new_event_loop()
+        _SYNC_THREAD = threading.Thread(target=_SYNC_LOOP.run_forever, daemon=True, name="web-search-loop")
+        _SYNC_THREAD.start()
+    fut = asyncio.run_coroutine_threadsafe(web_search(query, count=count), _SYNC_LOOP)
+    return fut.result(timeout=45)
 
 if __name__ == "__main__":
     import sys

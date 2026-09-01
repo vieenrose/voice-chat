@@ -34,7 +34,7 @@ class StreamingPrimeTTS:
             logger.info(f"Audio8-TTS-0.1B server ready: {h.get('model')} 44.1k CPU")
         except Exception as e:
             raise RuntimeError(f"Audio8-TTS server unreachable on {SERVER}: {e} — start it first "
-                               f"(onnx_runtime_0_1b_int8: ARKTTS_MODEL_DIR=model python3 -m uvicorn arktts_runtime.service:app --port 8024)")
+                               f"(onnx_runtime_0_1b_int8: ARKTTS_MODEL_DIR=model python3 -m uvicorn arktts_runtime.service:app --port 8024)") from e
         self.VOICE_PRESETS = {
             "默认": "default",
             "中文女声": "default",
@@ -48,12 +48,13 @@ class StreamingPrimeTTS:
     def voice(self) -> str:
         return self._vv
 
+    @property
     def voices(self) -> list[str]:
         return list(self.VOICE_PRESETS.keys())
 
     def set_voice(self, name: str):
         if name not in self.VOICE_PRESETS:
-            raise KeyError(f"unknown voice {name}; available {self.voices()}")
+            raise KeyError(f"unknown voice {name}; available {self.voices}")
         self._vv = name
 
     async def synthesize_streaming(self, text: str, chunk_frames: int = 24) -> AsyncGenerator[np.ndarray, None]:
@@ -103,7 +104,9 @@ class StreamingPrimeTTS:
                 buf += token
                 token_count += 1
                 if SENTENCE_END.search(token) and buf.strip():
-                    txt = buf.strip(); buf = ""; token_count = 0
+                    txt = buf.strip()
+                    buf = ""
+                    token_count = 0
                     async for pcm_chunk in self.synthesize_streaming(txt):
                         yield {"type": "tts_chunk", "pcm": pcm_chunk, "text": txt,
                                "sampleRate": self.sample_rate, "latency_ms": 40}

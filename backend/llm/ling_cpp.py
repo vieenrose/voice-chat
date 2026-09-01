@@ -26,11 +26,13 @@ TOOL_EXCLUDE_PHRASES = ["my name", "my age", "my birthday", "remember it", "reca
 def should_search_heuristic(prompt: str):
     pl = prompt.lower()
     for excl in TOOL_EXCLUDE_PHRASES:
-        if excl in pl: return False,""
+        if excl in pl:
+            return False,""
     for trig in TOOL_TRIGGERS:
         if trig in pl:
             q = prompt.strip()[:80]
-            if len(q)>60: q=" ".join(q.split()[-8:])
+            if len(q)>60:
+                q=" ".join(q.split()[-8:])
             return True, q
     return False,""
 
@@ -97,7 +99,8 @@ class LingCpp:
         messages = []
         if not history or history[0].get("role") != "system":
             messages.append({"role": "system", "content": SYSTEM_PROMPT})
-            if history: messages.extend(history)
+            if history:
+                messages.extend(history)
         else:
             messages = list(history)
         if prompt is not None:
@@ -106,12 +109,16 @@ class LingCpp:
             async for ev in self.fallback.generate_chat(history, prompt, max_new_tokens):
                 yield ev
             return
-        text_so_far=""; t0=time.time(); first=True
+        text_so_far=""
+        t0=time.time()
+        first=True
         try:
             async for ev in self._stream_cpp(messages, tools=None, max_tokens=max_new_tokens):
                 if ev["type"]=="token":
-                    token=ev["token"]; text_so_far+=token
-                    latency=int((time.time()-t0)*1000) if first else 20; first=False
+                    token=ev["token"]
+                    text_so_far+=token
+                    latency=int((time.time()-t0)*1000) if first else 20
+                    first=False
                     yield {"type":"llm_token","token":token,"text_so_far":text_so_far,"latency_ms":latency}
                     await asyncio.sleep(0)
             yield {"type":"llm_done","text":text_so_far}
@@ -122,7 +129,7 @@ class LingCpp:
     async def generate_chat_with_tools(self, history: List[Dict], prompt: str, max_new_tokens: int = 256) -> AsyncGenerator[dict, None]:
         try:
             from tools.web_search import web_search, format_results
-        except:
+        except Exception:
             web_search=None
         should, query = should_search_heuristic(prompt) if "web search results" not in prompt.lower() else (False,"")
         if should and web_search is not None:
@@ -141,11 +148,15 @@ class LingCpp:
                 augmented.append({"role":"assistant","tool_calls":[{"id":"call_0","type":"function","function":{"name":"web_search","arguments":json.dumps({"query":query})}}]})
                 augmented.append({"role":"tool","tool_call_id":"call_0","content":formatted})
                 # Generate final answer
-                text_so_far=""; t0=time.time(); first=True
+                text_so_far=""
+                t0=time.time()
+                first=True
                 async for ev in self._stream_cpp(augmented, tools=None, max_tokens=max_new_tokens):
                     if ev["type"]=="token":
-                        token=ev["token"]; text_so_far+=token
-                        latency=int((time.time()-t0)*1000) if first else 20; first=False
+                        token=ev["token"]
+                        text_so_far+=token
+                        latency=int((time.time()-t0)*1000) if first else 20
+                        first=False
                         yield {"type":"llm_token","token":token,"text_so_far":text_so_far,"latency_ms":latency}
                 yield {"type":"llm_done","text":text_so_far}
                 return

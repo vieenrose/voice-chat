@@ -3,7 +3,12 @@
 Final report: peak RSS + E2E latency (with & without tool calling)
 Tests both direct pipeline and HTTP API (with SearXNG self-hosted)
 """
-import asyncio, time, statistics, sys, os, json, base64
+import asyncio
+import time
+import statistics
+import sys
+import os
+import json
 sys.path.insert(0, os.path.dirname(__file__))
 import psutil
 import numpy as np
@@ -12,14 +17,14 @@ def get_rss():
     proc = psutil.Process()
     rss = proc.memory_info().rss
     for c in proc.children(recursive=True):
-        try: rss += c.memory_info().rss
-        except: pass
+        try:
+            rss += c.memory_info().rss
+        except Exception:
+            pass
     return rss/1024/1024
 
 async def pipe_test():
     from pipeline.speech_to_speech import HFSpeechToSpeechPipeline
-    import torch
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     pipe = HFSpeechToSpeechPipeline(mock=True, device="cpu")
     print("=== PIPELINE (mock) TEST ===")
     print(f"STT={pipe.stt.backend} LLM mock={pipe.mock} TTS={pipe.tts.backend}")
@@ -29,7 +34,8 @@ async def pipe_test():
         nonlocal peak
         while True:
             cur=get_rss()
-            if cur>peak: peak=cur
+            if cur>peak:
+                peak=cur
             await asyncio.sleep(0.05)
     poll_t = asyncio.create_task(poll())
 
@@ -73,8 +79,10 @@ async def pipe_test():
         print(f"  '{txt[:35]:35}' tool={tool_called} (exp {expect_tool}) e2e={e2e:4d} ttft={first_tt:3d} tool_lat={tool_lat:3d} tts={tts_ms:3d} -> {llm_text[:55]}")
 
     poll_t.cancel()
-    try: await poll_t
-    except: pass
+    try:
+        await poll_t
+    except Exception:
+        pass
     print(f"\nPeak RSS (pipe): {peak:.1f} MB")
     e2es=[r["e2e"] for r in results]
     print(f"E2E avg {statistics.mean(e2es):.0f} p50 {statistics.median(e2es):.0f} p95 {float(np.percentile(e2es,95)):.0f} min {min(e2es)} max {max(e2es)}")
@@ -87,7 +95,7 @@ async def pipe_test():
     return peak, results
 
 async def http_test():
-    import httpx, json
+    import httpx
     url="http://localhost:8000"
     print("\n=== HTTP API TEST (self-hosted SearXNG) ===")
     # health
@@ -119,9 +127,10 @@ async def http_test():
             has_tool=len(tool_calls)>0
             # also check rss
             cur=j.get("rss_mb",0)
-            if cur>peak: peak=cur
+            if cur>peak:
+                peak=cur
             llm=j["llm_text"][:70]
-            print(f"  POST /api/chat '{q[:30]:30}' tool={has_tool} (exp {exp_tool}) e2e={e2e:4d} ttft={j['latencies']['llm_ttft_ms']:3d} rss={cur} -> {llm}")
+            print(f"  POST /api/chat '{q[:30]:30}' tool={has_tool} (exp {exp_tool}) e2e={e2e:4d} wall={int((time.time()-t0)*1000):4d} ttft={j['latencies']['llm_ttft_ms']:3d} rss={cur} -> {llm}")
             lat.append(e2e)
         # also test /api/search directly
         r=await client.get(f"{url}/api/search", params={"q":"Python 3.14"})
@@ -138,7 +147,8 @@ async def http_test():
 async def ws_test():
     print("\n=== WEBSOCKET TOOL CALLING TEST ===")
     try:
-        import websockets, json
+        import websockets
+        import json
         uri="ws://localhost:8000/ws/chat?session_id=final"
         peak=get_rss()
         lat=[]
@@ -159,6 +169,8 @@ async def ws_test():
                         print(f"  WS '{q[:30]}' -> tool_call {msg.get('query')}")
                     if msg.get("type")=="tool_result":
                         print(f"    tool_result {msg.get('source')} {msg.get('latency_ms')}ms")
+                    if msg.get("type")=="tts_chunk":
+                        got_tts=True
                     if msg.get("type")=="tts_chunk" and first_tts is None:
                         first_tts=time.time()
                         e2e=int((first_tts-t0)*1000)
@@ -166,14 +178,15 @@ async def ws_test():
                         print(f"    first tts_chunk in {e2e}ms")
                     if msg.get("type")=="tts_end":
                         break
-                print(f"  WS '{q[:30]}' tool={got_tool} e2e~{lat[-1] if lat else 0}ms")
+                print(f"  WS '{q[:30]}' tool={got_tool} tts={got_tts} e2e~{lat[-1] if lat else 0}ms")
         print(f"WS peak RSS {peak:.1f} (approx)")
         if lat:
             print(f"WS E2E avg {statistics.mean(lat):.0f}")
         return peak, lat
     except Exception as e:
         print(f"WS test skipped {e}")
-        import traceback; traceback.print_exc()
+        import traceback
+        traceback.print_exc()
         return get_rss(), []
 
 async def main():
@@ -190,7 +203,8 @@ async def main():
             print(f"CUDA available: {torch.cuda.get_device_name(0)} VRAM {torch.cuda.memory_allocated()/1024/1024:.0f} MB")
         else:
             print("CUDA not available, CPU mode")
-    except: pass
+    except Exception:
+        pass
 
     p_peak, p_res = await pipe_test()
     h_peak, h_lat = await http_test()
@@ -219,7 +233,8 @@ async def main():
         print(f"  VMS         : {proc.memory_info().vms/1024/1024:.1f} MB")
         if 'torch' in sys.modules and torch.cuda.is_available():
             print(f"  CUDA peak alloc: {torch.cuda.max_memory_allocated()/1024/1024:.1f} MB")
-    except: pass
+    except Exception:
+        pass
 
     if all_e2e:
         print(f"\n  E2E latency (all): n={len(all_e2e)} avg={statistics.mean(all_e2e):.0f} p50={statistics.median(all_e2e):.0f} p95={float(np.percentile(all_e2e,95)):.0f} min={min(all_e2e)} max={max(all_e2e)}")
@@ -235,14 +250,14 @@ async def main():
     print(f"\n  Total benchmark time: {took}ms")
     verdict = "✅ PASSED" if statistics.mean(all_e2e)<800 else "⚠️ borderline" if statistics.mean(all_e2e)<1200 else "❌ too high"
     print(f"  Verdict E2E <800ms: {verdict} (avg {statistics.mean(all_e2e):.0f}ms)")
-    print(f"  SearXNG self-hosted: http://localhost:8888 (real instance via conda, pid 244532) + minimal fallback")
-    print(f"  Tool calling: MiniCPM5 web_search → SearXNG → LLM → PrimeTTS streaming")
+    print("  SearXNG self-hosted: http://localhost:8888 (real instance via conda, pid 244532) + minimal fallback")
+    print("  Tool calling: MiniCPM5 web_search → SearXNG → LLM → PrimeTTS streaming")
     print("="*78)
     # write report
-    import pathlib, json
+    import pathlib
     report={"peak_rss_mb": round(overall_peak,1), "cur_rss_mb": round(cur,1), "e2e_avg": float(statistics.mean(all_e2e)) if all_e2e else 0, "e2e_p50": float(statistics.median(all_e2e)) if all_e2e else 0, "e2e_p95": float(np.percentile(all_e2e,95)) if len(all_e2e)>=4 else 0, "init_rss": init_rss, "took_ms": took, "searxng_ok": True}
     pathlib.Path("benchmark_report.json").write_text(json.dumps(report, indent=2))
-    print(f"\nReport written to backend/benchmark_report.json and printed above.")
+    print("\nReport written to backend/benchmark_report.json and printed above.")
 
 if __name__=="__main__":
     asyncio.run(main())

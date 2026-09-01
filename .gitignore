@@ -12,12 +12,23 @@ backend/benchmark_report.json
 G2PWModel/
 model_quant.onnx
 am.mvn
-asr_example.wav
 *.wav
+# NOTE: asr_example.wav is the ground-truth fixture for the e2e STT accuracy test
+# (backend/test_e2e_report.py) — it must be committed, the *.wav rule above was
+# excluding it, so a fresh clone could not run its own accuracy suite.
+!asr_example.wav
 /tmp/kokoro/
 /tmp/qwen3_tts/
 /tmp/XASR/
 /tmp/llms/
+
+# Local scratch / agent tooling dirs (never part of the demo)
+.claude/
+workspace/
+
+# Secrets — a token file must never be committed
+.env
+*.token
 
 # OS / editor
 .DS_Store

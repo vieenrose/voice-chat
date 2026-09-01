@@ -75,6 +75,12 @@ services:
       - LLM_API_BASE=http://llm:8080/v1
       - EMBED_API_BASE=http://granite-embedding:8080/v1
       - SEARXNG_URL=http://searxng:8080
+      # Set VOICE_CHAT_TOKEN in the environment (or a .env file) before publishing this
+      # port anywhere. Without it every route except model-switching is open to anyone
+      # who can reach it; with it, clients pass ?token=… or X-Auth-Token.
+      - VOICE_CHAT_TOKEN=${VOICE_CHAT_TOKEN:-}
+      # Compose serves the SPA from the same origin, so same-site dev origins only.
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     volumes:

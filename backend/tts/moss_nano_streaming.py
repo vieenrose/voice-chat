@@ -9,7 +9,8 @@ Voices via built-in presets (voice_clone): default 'Junhao' (zh_1), '台湾腔 Y
 import asyncio
 import time
 import re
-import sys, os
+import sys
+import os
 from pathlib import Path
 from typing import AsyncGenerator, Iterator
 import numpy as np
@@ -62,17 +63,18 @@ class StreamingPrimeTTS:
                     if isinstance(name, str) and os.path.isdir(name):
                         if os.path.isfile(os.path.join(name, "modeling_moss_tts_nano.py")):
                             from modeling_moss_tts_nano import MossTTSNanoForCausalLM
-                            kw["local_files_only"] = True; kw.pop("trust_remote_code", None)
+                            kw["local_files_only"] = True
+                            kw.pop("trust_remote_code", None)
                             return MossTTSNanoForCausalLM.from_pretrained(name, **kw)
                         if os.path.isfile(os.path.join(name, "modeling_moss_audio_tokenizer.py")):
                             from modeling_moss_audio_tokenizer import MossAudioTokenizerModel
-                            kw["local_files_only"] = True; kw.pop("trust_remote_code", None)
+                            kw["local_files_only"] = True
+                            kw.pop("trust_remote_code", None)
                             return MossAudioTokenizerModel.from_pretrained(name, **kw)
                     return _oam(name, *a, **kw)
                 AutoModel.from_pretrained = classmethod(_local_am)
             except Exception as _e:
                 logger.warning(f"MOSS loader patch failed {_e}")
-            from moss_tts_nano_runtime import NanoTTSService
             logger.info(f"MOSS runtime: checkpoint=44502-local(direct import) device={device}")
             self.runtime = NanoTTSService(
                 checkpoint_path=ckpt,
@@ -84,12 +86,15 @@ class StreamingPrimeTTS:
             # SURGICAL: replace lazy loaders with direct-import instances (bypass dynamic-module loader
             # that pulls the NaN-buggy hub revision 8ae621). Imported classes + local weights verified.
             import torch as _torch
-            import types as _types, importlib as _il
+            import types as _types
+            import importlib as _il
             # register checkpoint dirs as importable packages so their 'from .x import' work
-            _pkg_t = "moss_nano_model"; _pkg_c = "moss_codec_model"
+            _pkg_t = "moss_nano_model"
+            _pkg_c = "moss_codec_model"
             for _pk, _d in ((_pkg_t, ckpt), (_pkg_c, atok)):
                 if _pk not in sys.modules:
-                    _m = _types.ModuleType(_pk); _m.__path__ = [_d]
+                    _m = _types.ModuleType(_pk)
+                    _m.__path__ = [_d]
                     sys.modules[_pk] = _m
                 elif _pk in sys.modules and not hasattr(sys.modules[_pk], "__path__"):
                     sys.modules[_pk].__path__ = [_d]
@@ -102,20 +107,24 @@ class StreamingPrimeTTS:
             def _has(name, f): return isinstance(name, str) and os.path.isdir(name) and os.path.isfile(os.path.join(name, f))
             def _am(cls, name, *a, **kw):
                 if _has(name, "modeling_moss_audio_tokenizer.py"):
-                    kw["local_files_only"]=True; kw["trust_remote_code"]=True
+                    kw["local_files_only"]=True
+                    kw["trust_remote_code"]=True
                     return MossAudioTokenizerModel.from_pretrained(name, **kw)
                 return _oam(name, *a, **kw)
             def _amc(cls, name, *a, **kw):
                 if _has(name, "modeling_moss_tts_nano.py"):
-                    kw["local_files_only"]=True; kw["trust_remote_code"]=True
+                    kw["local_files_only"]=True
+                    kw["trust_remote_code"]=True
                     return MossTTSNanoForCausalLM.from_pretrained(name, **kw)
                 return _oamc(name, *a, **kw)
             def _ac(cls, name, *a, **kw):
                 if _has(name, "configuration_moss_tts_nano.py"):
-                    kw["local_files_only"]=True; kw["trust_remote_code"]=True
+                    kw["local_files_only"]=True
+                    kw["trust_remote_code"]=True
                     return MossTTSNanoConfig.from_pretrained(name, **kw)
                 if _has(name, "configuration_moss_audio_tokenizer.py"):
-                    kw["local_files_only"]=True; kw["trust_remote_code"]=True
+                    kw["local_files_only"]=True
+                    kw["trust_remote_code"]=True
                     return MossAudioTokenizerConfig.from_pretrained(name, **kw)
                 return _oac(name, *a, **kw)
             _AM.from_pretrained = classmethod(_am)
@@ -125,8 +134,9 @@ class StreamingPrimeTTS:
             logger.info(f"MOSS-TTS-Nano TRUE-STREAMING loaded ✓ (44502 local code, direct import) sr={self.sample_rate}")
         except Exception as e:
             logger.error(f"MOSS streaming load failed {e}")
-            import traceback; traceback.print_exc()
-            raise RuntimeError(f"MOSS-Nano required: {e}")
+            import traceback
+            traceback.print_exc()
+            raise RuntimeError(f"MOSS-Nano required: {e}") from e
 
     @property
     def voice(self): return self._vv
@@ -170,13 +180,16 @@ class StreamingPrimeTTS:
         q: asyncio.Queue = asyncio.Queue(maxsize=16)
         loop = asyncio.get_running_loop()
         def _run():
-            t0 = time.time(); emitted=0.0; first=True
+            t0 = time.time()
+            emitted=0.0
+            first=True
             try:
                 for ev in self._stream_events(text, voice):
                     et = ev.get("type")
                     if et == "audio":
                         w = ev.get("waveform_numpy")
-                        if w is None: continue
+                        if w is None:
+                            continue
                         arr = np.asarray(w, dtype=np.float32)
                         # MOSS outputs stereo (48k 2ch) -> downmix to mono, else playback garbles
                         if arr.ndim == 2:
@@ -201,8 +214,10 @@ class StreamingPrimeTTS:
         threading.Thread(target=_run, daemon=True).start()
         while True:
             kind, payload = await q.get()
-            if kind == "done": break
-            if kind == "err": raise payload
+            if kind == "done":
+                break
+            if kind == "err":
+                raise payload
             yield payload
 
     async def synthesize(self, text: str, reference_audio: str = None) -> np.ndarray:
@@ -214,22 +229,29 @@ class StreamingPrimeTTS:
         return np.concatenate(chunks)
 
     async def stream_tts(self, token_stream):
-        buf=""; cnt=0
+        buf=""
+        cnt=0
         async for ev in token_stream:
             if ev["type"]=="llm_token":
-                buf+=ev["token"]; cnt+=1
+                buf+=ev["token"]
+                cnt+=1
                 fl=False
-                if SENTENCE_END.search(ev["token"]): fl=True
-                elif cnt>=FLUSH_TOKENS and buf and buf[-1] in " ,": fl=True
+                if SENTENCE_END.search(ev["token"]):
+                    fl=True
+                elif cnt>=FLUSH_TOKENS and buf and buf[-1] in " ,":
+                    fl=True
                 if fl and buf.strip():
-                    txt=buf.strip(); buf=""; cnt=0
+                    txt=buf.strip()
+                    buf=""
+                    cnt=0
                     async for c in self.synthesize_streaming(txt):
                         yield {"type":"tts_chunk","pcm":c,"text":txt,"sampleRate":self.sample_rate,"latency_ms":20}
             elif ev["type"]=="llm_done":
                 if buf.strip():
                     async for c in self.synthesize_streaming(buf.strip()):
                         yield {"type":"tts_chunk","pcm":c,"text":buf.strip(),"sampleRate":self.sample_rate,"latency_ms":20}
-                yield {"type":"tts_end"}; return
+                yield {"type":"tts_end"}
+                return
         if buf.strip():
             async for c in self.synthesize_streaming(buf.strip()):
                 yield {"type":"tts_chunk","pcm":c,"text":buf.strip(),"sampleRate":self.sample_rate,"latency_ms":20}
@@ -239,7 +261,8 @@ class StreamingPrimeTTS:
         sents = re.split(r'([.!?。！？]+)', text)
         for i in range(0, len(sents), 2):
             s=(sents[i]+(sents[i+1] if i+1<len(sents) else "")).strip()
-            if not s: continue
+            if not s:
+                continue
             async for c in self.synthesize_streaming(s):
                 yield {"type":"tts_chunk","pcm":c,"text":s,"sampleRate":self.sample_rate,"latency_ms":20}
         yield {"type":"tts_end"}

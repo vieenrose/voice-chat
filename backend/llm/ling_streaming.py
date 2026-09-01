@@ -26,22 +26,66 @@ def _strip_tool_xml(t: str) -> str:
     t = re.sub(r"<[^>]+>", " ", t)
     return t.strip(" \n,;")
 
+_THINK_RE = re.compile(r"<\|im_start\|>think.*?(?:\*/?<\|im_end\|>|\*/|</think>|$)|<think\b[^>]*>.*?(?:</think>|$)", re.S)
+
+
+def _strip_thinking(text: str) -> str:
+    """Remove the model's deliberation from text that is about to be SPOKEN.
+
+    With enable_thinking on (which the tool-routing measurement above says we need), the
+    agent path gets the thinking pass back inline in `content` rather than in
+    reasoning_content — `llama-server` puts it in the message body for the qwen chat
+    template. Observed in the benchmark answer previews, spoken to the user:
+
+        "，但根据规则，必须调用工具。所以步骤应该是先调用 get_current_datetime…"
+        "，然後再執行工具。但這裡用戶似乎直接給出了指令，可能是在測試我的指令遵循能力…"
+
+    The template emits an unterminated `...*/` when the thinking pass runs out of budget,
+    so the pattern must accept a thinking block with no closing marker, and must not
+    require balanced delimiters: whatever follows an opened block on that turn IS the
+    scratchpad. Shape-based only — no per-question rules (see
+    test_live_paths_hold_no_benchmark_query_literals)."""
+    if not text:
+        return text
+    if "<" not in text:
+        return text
+    out = _THINK_RE.sub(" ", text)
+    # A thinking block that never closed swallows the answer too; prefer the tail after the
+    # last marker if that leaves something speakable, else keep the pre-block prose.
+    return re.sub(r"\s{2,}", " ", out).strip()
+
+
 def _clean_leakage(text: str) -> str:
-    """Strip leaked raw search result format that LLM sometimes echoes verbatim."""
-    # Remove patterns like "[1] Title URL: https://... Date/Snippet: ..." that are raw tool output
-    # This is the exact format from format_results() that should never reach the user voice
+    """Strip leaked raw search-result format that the LLM sometimes echoes verbatim."""
+    # format_results() renders "[1] Title — src\nURL: https://…\nDate/Snippet: …"; the
+    # model occasionally pastes that straight into its answer, where TTS would read the
+    # URLs aloud. Generic shape match only.
     text = re.sub(r"\[\d+\]\s*[^\[]*?URL:\s*https?://\S+\s*Date/Snippet:\s*", "", text)
-    text = re.sub(r"\[\d+\]\s*President of France[^\[]*", "", text)  # fallback for truncated
-    # Remove "More at Wikipedia" thin result leakage
+    # A dangling numbered echo with no prose around it ("[2] …" lines to end of text).
+    text = re.sub(r"(?:^|\n)\s*\[\d+\][^\n]*", "\n", text)
+    # Remove "More at Wikipedia" thin-result leakage
     text = re.sub(r"More at Wikipedia\s*", "", text)
-    # Collapse multiple spaces/newlines
     text = re.sub(r"\s{2,}", " ", text).strip()
-    # If after cleaning we have leading "President of France" fragment without context, keep only the actual answer part
-    # Look for the real answer start (usually "The current president...")
-    m = re.search(r"(The current president of France is.*)", text, re.I | re.S)
-    if m:
-        text = m.group(1).strip()
     return text
+
+
+def _speakable(text: str) -> str:
+    """Final shaping of text about to be synthesized.
+
+    Markdown emphasis and links are the model answering in a format the caller cannot
+    see (observed live: 法國總統是**愛德華·馬克龍**), so TTS used to read the asterisks'
+    worth of silence or, worse, some backends spell them. `[text](url)` collapses to
+    `text`; unpaired `*`/`_` emphasis markers are dropped. Tool XML and leaked result
+    rows are handled upstream by _strip_tool_xml / _clean_leakage.
+    """
+    if not text:
+        return text
+    text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)      # [text](url) -> text
+    text = re.sub(r"(\*\*|__)(.+?)\1", r"\2", text, flags=re.S)  # **b** / __b__
+    text = re.sub(r"(?<![\w\u4e00-\u9fff])[*_]{1,3}(?=\S)|(?<=\S)[*_]{1,3}(?![\w\u4e00-\u9fff])", "", text)
+    text = text.replace("`", "")
+    return re.sub(r"[ \t]{2,}", " ", text).strip()
+
 
 
 def _intent_wants_search(prompt: str) -> bool:
@@ -97,13 +141,41 @@ LANG_HINT = "\n（請一律使用繁體中文（台灣用語）簡潔回答；�
 # Heuristic for fast tool trigger — bilingual (en/zh) - includes Chinese triggers for Taiwan/news
 # (heuristic removed — tool calls are model-driven/native only)
 
+def _history_digest(history: List[Dict]) -> str:
+    """Text fallback for harnesses that only accept a single task string."""
+    return "\n".join(f"{m.get('role')}: {str(m.get('content',''))[:400]}" for m in (history or [])[-6:])
+
+
+def _clean_history(history: List[Dict]) -> List[Dict]:
+    """Strip the system message (harnesses supply their own) and anything unusable,
+    keeping real role/content turns so multi-turn referents survive."""
+    out: List[Dict] = []
+    for m in (history or []):
+        role = m.get("role")
+        content = m.get("content")
+        if role not in ("user", "assistant") or not isinstance(content, str) or not content.strip():
+            continue
+        out.append({"role": role, "content": content})
+    return out[-8:]
+
+
 class LingStreaming:
-    def __init__(self, model_id: str = "Qwen/Qwen3.5-2B-MTP-GGUF", api_base: str = "http://127.0.0.1:11436/v1", mock: bool = False, device: str = "cuda", model_name: str = "qwen3.5-2b", **kwargs):
+    def __init__(self, model_id: str = "Qwen/Qwen3.5-2B-MTP-GGUF", api_base: str = "http://127.0.0.1:11436/v1", mock: bool = False, device: str = "cuda", model_name: str = "qwen3.5-2b", degraded_mode: str = "error", **kwargs):
         self.model_id = model_id
         self.api_base = api_base.rstrip("/")
         self.model_name = model_name
         self.backend = f"llm-gguf:{model_name}"
         self.mock = mock
+        # "mock" = serve canned replies when the endpoint is gone (--mock opted into
+        # simulation); "error" = tell the caller which endpoint is missing, because in a
+        # real deployment a friendly non-answer about the weather is a worse failure than
+        # an honest one.
+        self.degraded_mode = degraded_mode
+        self._degraded_warned = ""
+        # (checked_at, ok, detail) — PER INSTANCE on purpose: llm_manager builds a new
+        # adapter on a model switch, and a class-level cache would hand that new
+        # api_base the previous endpoint's optimistic verdict for a whole second.
+        self._last_probe = (0.0, True, "")
         # Check if server is up, if not, fallback to mock
         if mock:
             logger.info("Ling: MOCK mode (requested)")
@@ -124,6 +196,60 @@ class LingStreaming:
             logger.warning(f"Ling server not reachable {e}, fallback to mock (will retry per request)")
             # Don't set mock True permanently, will retry
             pass
+
+    _PROBE_TTL = 1.0          # seconds; a turn probes the LLM at most once per second
+
+    async def _reachable(self) -> tuple[bool, str]:
+        """Pre-flight: is the model server actually there?
+
+        The constructor already probes once and sets self.mock when nothing answers, but
+        it deliberately stays optimistic ("will retry per request") so a llama-server that
+        starts later is picked up. The gap was in *where* the retry happened: the request
+        itself raised httpx.ConnectError out of _chat_stream, which turned POST /api/chat
+        into a 500 with a traceback (observed in the container, where LLM_API_BASE points
+        at a compose service name that does not exist outside `docker compose up`). A
+        mid-run crash is still possible; this closes the "server was never there" case,
+        which is the one that used to look like a broken API rather than a missing model.
+        """
+        now = time.time()
+        if now - self._last_probe[0] < self._PROBE_TTL:
+            return self._last_probe[1], self._last_probe[2]
+        ok, detail = True, ""
+        try:
+            async with httpx.AsyncClient(timeout=1.5) as c:
+                r = await c.get(f"{self.api_base}/models")
+                if r.status_code != 200:
+                    ok, detail = False, f"HTTP {r.status_code} from {self.api_base}/models"
+        except Exception as e:
+            ok, detail = False, f"{type(e).__name__}: {e} ({self.api_base})"
+        self._last_probe = (now, ok, detail)
+        if not ok:
+            logger.warning(f"LLM server pre-flight failed: {detail}")
+        return ok, detail
+
+    async def _degraded(self, prompt: str, why: str) -> AsyncGenerator[dict, None]:
+        """What the user hears instead of a stack trace."""
+        if self.degraded_mode == "mock":
+            if why != self._degraded_warned:
+                logger.warning(f"--mock: model server unreachable ({why}) — serving canned mock replies. "
+                               "/health reports the pipeline's mock state; this is not a real answer.")
+                self._degraded_warned = why
+            async for ev in self._mock_stream(prompt):
+                yield ev
+            return
+        host = self.api_base.split("//")[-1].rstrip("/")
+        if self._is_chinese(prompt):
+            text = (f"模型伺服器 {host} 目前連不上，我無法生成回應。"
+                    f"請確認 llama-server 已啟動後再問一次。（原因：{why.splitlines()[0][:80]}）")
+        else:
+            text = (f"The model server at {host} is not reachable, so I cannot answer. "
+                    f"Start llama-server and ask again. (reason: {why.splitlines()[0][:80]})")
+        text_so_far = ""
+        for tok in re.findall(r"\S\S*|\s+", text):
+            text_so_far += tok
+            yield {"type": "llm_token", "token": tok, "text_so_far": text_so_far, "latency_ms": 30}
+            await asyncio.sleep(0.01)
+        yield {"type": "llm_done", "text": text_so_far}
 
     async def _chat_stream(self, messages: List[Dict], tools: List[Dict] = None, max_tokens: int = 256) -> AsyncGenerator[dict, None]:
         # Call llama-server OpenAI API with streaming - Ling 3.0 needs enable_thinking false for low-latency voice (no reasoning_content)
@@ -170,7 +296,7 @@ class LingStreaming:
                         # Finish reason
                         if choice.get("finish_reason"):
                             yield {"type": "finish", "reason": choice["finish_reason"]}
-                    except Exception as e:
+                    except Exception:
                         continue
 
     async def generate_chat(self, history: List[Dict], prompt: str = None, max_new_tokens: int = 256) -> AsyncGenerator[dict, None]:
@@ -214,29 +340,36 @@ class LingStreaming:
     def _is_chinese(self, text: str) -> bool:
         return any('\u4e00' <= ch <= '\u9fff' for ch in text)
 
+    async def _mock_stream(self, prompt: str) -> AsyncGenerator[dict, None]:
+        """Canned bilingual replies. Split out of generate_stream so the degraded path can
+        reuse it: --mock asks for simulated answers, and reaching a dead endpoint in that
+        mode should still sound like the demo, not like an outage."""
+        t0 = time.time()
+        is_zh = self._is_chinese(prompt)
+        if is_zh:
+            mock_resp = "您好！我是 Ling 3.0 tiny，通过 SearXNG 搜索来帮助您。有什么可以帮您的？"
+            if "天气" in prompt or "weather" in prompt.lower():
+                mock_resp = "我可以通过 SearXNG 搜索天气信息！"
+            elif "台湾" in prompt or "台灣" in prompt:
+                mock_resp = "我来帮您查询台湾今日的重大事件。"
+        else:
+            mock_resp = "That's interesting! I'm Ling 3.0 tiny, a MoE model via SearXNG tools. How can I help?"
+            if "weather" in prompt.lower():
+                mock_resp = "I don't have live weather, but I can search via SearXNG!"
+            elif "hello" in prompt.lower():
+                mock_resp = "Hey there! Ling 3.0 here — tiny but mighty MoE. What would you like to chat about?"
+        text_so_far = ""
+        for tok in mock_resp.split(" "):
+            await asyncio.sleep(0.018)
+            text_so_far += (" " if text_so_far else "") + tok
+            yield {"type": "llm_token", "token": " " + tok if text_so_far else tok, "text_so_far": text_so_far, "latency_ms": int((time.time()-t0)*1000)}
+        yield {"type": "llm_done", "text": text_so_far}
+
     async def generate_stream(self, prompt: str, max_new_tokens: int = 256) -> AsyncGenerator[dict, None]:
         t0 = time.time()
         if self.mock:
-            # Mock bilingual
-            is_zh = self._is_chinese(prompt)
-            if is_zh:
-                mock_resp = "您好！我是 Ling 3.0 tiny，通过 SearXNG 搜索来帮助您。有什么可以帮您的？"
-                if "天气" in prompt or "weather" in prompt.lower():
-                    mock_resp = "我可以通过 SearXNG 搜索天气信息！"
-                elif "台湾" in prompt or "台灣" in prompt:
-                    mock_resp = "我来帮您查询台湾今日的重大事件。"
-            else:
-                mock_resp = "That's interesting! I'm Ling 3.0 tiny, a MoE model via SearXNG tools. How can I help?"
-                if "weather" in prompt.lower():
-                    mock_resp = "I don't have live weather, but I can search via SearXNG!"
-                elif "hello" in prompt.lower():
-                    mock_resp = "Hey there! Ling 3.0 here — tiny but mighty MoE. What would you like to chat about?"
-            text_so_far = ""
-            for tok in mock_resp.split(" "):
-                await asyncio.sleep(0.018)
-                text_so_far += (" " if text_so_far else "") + tok
-                yield {"type": "llm_token", "token": " " + tok if text_so_far else tok, "text_so_far": text_so_far, "latency_ms": int((time.time()-t0)*1000)}
-            yield {"type": "llm_done", "text": text_so_far}
+            async for ev in self._mock_stream(prompt):
+                yield ev
             return
 
         # Real Ling via llama-server
@@ -270,6 +403,15 @@ class LingStreaming:
     async def generate_chat_with_tools(self, history: List[Dict], prompt: str, max_new_tokens: int = 256) -> AsyncGenerator[dict, None]:
         """SMOLAGENTS-driven agent loop: model plans + calls tools (web_search / get_current_datetime)
         for up to MAX_STEPS, then produces the final answer. Legacy inline loop kept as fallback."""
+        # Pre-flight FIRST — before the harness/legacy branch, not after it. The legacy
+        # loop is where a light install (no qwen-agent) actually ends up, so a check
+        # placed below that early return never ran there, and the container still 5xx'd.
+        if not self.mock:
+            _ok, _why = await self._reachable()
+            if not _ok:
+                async for ev in self._degraded(prompt, _why):
+                    yield ev
+                return
         try:
             try:
                 from agent.qwen_harness import run_agent_task
@@ -287,14 +429,26 @@ class LingStreaming:
                 yield ev
             return
 
-        if history:
-            _hist = "\n".join([f"{m.get('role')}: {m.get('content','')[:120]}" for m in history[-4:]])
-            task_str = f"Conversation history:\n{_hist}\n\nCurrent question: {prompt}"
-        else:
-            task_str = prompt
+        # Hand the agent the REAL conversation (role/content pairs) rather than a
+        # "role: content[:120]" digest — truncating history to 120 chars per turn is
+        # what made referential follow-ups ("BBC headlines", "and tomorrow?")
+        # unanswerable: the thing being referred to had usually been cut. Harnesses
+        # that can't take messages still get a digest (see _history_digest fallback).
+        _hist_msgs = _clean_history(history)
+        task_str = prompt
         q = asyncio.Queue()
-        task = asyncio.create_task(run_agent_task(task_str, q))
+        task = asyncio.create_task(run_agent_task(task_str, q, history=_hist_msgs))
         final_text = ""
+        streamed = ""          # text already emitted as it was generated
+        any_streamed = False
+        _t_stream0 = time.time()
+
+        def _speak(text: str, so_far: str):
+            """Build one llm_token event (kept as a helper so the streamed and the
+            replayed paths stay identical in shape)."""
+            return {"type": "llm_token", "token": text, "text_so_far": so_far,
+                    "latency_ms": int((time.time()-_t_stream0)*1000)}
+
         try:
             while True:
                 try:
@@ -310,6 +464,34 @@ class LingStreaming:
                     yield {"type": "tool_result", "name": ev["name"], "result": ev.get("result"),
                            "formatted": ev.get("formatted", ""), "latency_ms": ev.get("latency_ms", 0),
                            "source": ev.get("source", "")}
+                elif ev["type"] == "llm_delta" and ev.get("reset"):
+                    # The harness streamed text it then had to take back (an XML tool
+                    # call appeared, or a tool step followed). Tell the consumer to
+                    # discard what it buffered, then speak the authoritative final
+                    # answer in full.
+                    streamed = ""
+                    any_streamed = False
+                    yield {"type": "llm_reset"}
+                elif ev["type"] == "llm_delta":
+                    # True incremental answer text from the harness's own generation
+                    # stream. Before this existed the whole agent loop ran to completion
+                    # and the finished answer was replayed character by character, so a
+                    # tool turn produced no audio until everything was over (~18s
+                    # measured) and every llm_ttft_ms for a tool turn described the
+                    # replay, not the model.
+                    d = ev.get("text") or ""
+                    if not d:
+                        continue
+                    # Markdown emphasis markers are stream-safe to drop one character at
+                    # a time (a `**` pair can straddle a chunk boundary, so only the pair
+                    # regexes have to wait for the final text). Without this, an answer of
+                    # 法國總統是**愛德華·馬克龍** got its asterisks synthesized.
+                    d = d.replace("*", "").replace("`", "")
+                    if not d:
+                        continue
+                    any_streamed = True
+                    streamed += d
+                    yield _speak(d, streamed)
             final_text = await task
         finally:
             # If we're being cancelled (barge-in) mid-loop, `task` would otherwise be
@@ -319,16 +501,54 @@ class LingStreaming:
             # and don't leak an unretrieved exception).
             if not task.done():
                 task.cancel()
-            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+            def _drain(t):
+                # Retrieving the exception prevents "Task exception was never retrieved",
+                # but swallowing it silently is worse: an agent that died on
+                # ConnectError would look exactly like an agent that found nothing, and
+                # the user would hear "I couldn't find a clear answer" about a dead server.
+                if t.cancelled():
+                    return
+                exc = t.exception()
+                if exc is not None:
+                    logger.error(f"agent task died: {type(exc).__name__}: {exc} "
+                                 f"(answer so far: {len(streamed) + len(final_text)} chars)")
+            task.add_done_callback(_drain)
         if not isinstance(final_text, str):
             final_text = str(final_text)
         if "<tool_call>" in final_text or "<arg_" in final_text:
             final_text = _strip_tool_xml(final_text)
         final_text = re.sub(r"<[^>]+>", " ", final_text)
+        # _strip_thinking is a BACKSTOP, not the fix: with --reasoning-format deepseek (what
+        # llm_manager now requests) the deliberation never reaches `content` at all. It
+        # matters on builds without that flag, or with LLM_REASONING_FORMAT=none, where a
+        # completed thinking block still shows up in the answer text. Live deltas cannot be
+        # filtered this way (you cannot know a block is thinking until it ends, and by then
+        # it has been spoken), which is why the durable fix is server-side.
+        final_text = _speakable(_clean_leakage(_strip_thinking(final_text)))
         final_text = " ".join(final_text.split())
         if not final_text.strip():
             final_text = "抱歉，我找不到明確的答案。"
-        _t0 = time.time(); _sf = ""
+        # Speak only what the live stream has not already said. The streamed text and
+        # the authoritative final answer can differ (the stream is disabled the moment
+        # an XML tool-call appears, or a tool step interleaved), so compare on the
+        # common prefix rather than assuming they match.
+        if any_streamed:
+            common = 0
+            for a, b in zip(streamed, final_text, strict=False):
+                if a != b:
+                    break
+                common += 1
+            _tail = final_text[common:] if len(final_text) > common else ""
+            if _tail:
+                _sf = final_text[:common]
+                for tok in re.findall(r"\S\S*|\s+", _tail):
+                    _sf += tok
+                    yield _speak(tok, _sf)
+                    await asyncio.sleep(0)
+            yield {"type": "llm_done", "text": final_text}
+            return
+        _t0 = time.time()
+        _sf = ""
         for tok in final_text:
             _sf += tok
             yield {"type": "llm_token", "token": tok, "text_so_far": _sf,
@@ -341,9 +561,12 @@ class LingStreaming:
         Loop: model emits tool_call JSON -> we run web_search -> inject tool result -> model answers."""
         try:
             from tools.web_search import web_search, format_results
-        except:
+        except Exception:
             web_search = None
-            format_results = lambda x: str(x)
+            def format_results(x):
+                # fallback shim: tools.web_search is absent, so there is nothing to
+                # format — repr() is the honest degradation (E731: a def, not a lambda)
+                return str(x)
         messages = []
         if not history or history[0].get("role") != "system":
             messages.append({"role": "system", "content": SYSTEM_PROMPT})
@@ -401,8 +624,10 @@ class LingStreaming:
                             _now = _dt.now(ZoneInfo(_tz))
                         except Exception:
                             from datetime import datetime as _dt, timedelta as _td
-                            _now = _dt.utcnow(); _tz = "UTC"
-                        _tom = _now + _td(days=1); _yest = _now - _td(days=1)
+                            _now = _dt.utcnow()
+                            _tz = "UTC"
+                        _tom = _now + _td(days=1)
+                        _yest = _now - _td(days=1)
                         _fmt = (f"Current date and time: {_now.strftime('%A')}, {_now.strftime('%Y-%m-%d')} {_now.strftime('%H:%M:%S')} ({_tz}). "
                                 f"Today is {_now.strftime('%A')} ({_now.strftime('%Y-%m-%d')}). "
                                 f"Tomorrow is {_tom.strftime('%A')} ({_tom.strftime('%Y-%m-%d')}). "
@@ -495,7 +720,8 @@ class LingStreaming:
                 # if Ling already wrote a real sentence after the XML, speak it; otherwise do the answer pass
                 if text.strip() and len(text.split()) >= 4:
                     final_text = _clean_leakage(text)
-                    t0 = time.time(); _sf = ""
+                    t0 = time.time()
+                    _sf = ""
                     for tok in final_text:
                         _sf += tok
                         yield {"type": "llm_token", "token": tok, "text_so_far": _sf, "latency_ms": int((time.time()-t0)*1000) if len(_sf) == len(tok) else 20}
@@ -513,7 +739,8 @@ class LingStreaming:
             final_text = ""
             if text:
                 text = _clean_leakage(text)
-                t0 = time.time(); first = True
+                t0 = time.time()
+                first = True
                 for tok in text:
                     final_text += tok
                     yield {"type": "llm_token", "token": tok, "text_so_far": final_text,
@@ -543,7 +770,8 @@ class LingStreaming:
         final_text = _clean_leakage(final_text)
         if not final_text.strip():
             final_text = "抱歉，我找不到明確的答案。"
-        t0 = time.time(); _sf = ""
+        t0 = time.time()
+        _sf = ""
         for tok in final_text:
             _sf += tok
             yield {"type": "llm_token", "token": tok, "text_so_far": _sf, "latency_ms": int((time.time()-t0)*1000) if len(_sf) == len(tok) else 20}

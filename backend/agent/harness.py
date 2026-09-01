@@ -8,13 +8,9 @@ executions emit {tool_call, tool_result} events back to the async caller.
 """
 import asyncio
 import importlib  # noqa: F401  (py3.14: makes importlib.resources visible)
-import importlib.resources
-import json
-import re
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from typing import List
 
 from loguru import logger
 from smolagents import Tool, ToolCallingAgent, OpenAIServerModel
@@ -93,7 +89,8 @@ class WebSearchTool(Tool):
                 parsed = _json.loads(_q)
                 if isinstance(parsed, list):
                     queries = parsed
-            except: pass
+            except Exception:
+                pass
         if isinstance(queries, list):
             # Parallel multi-query (Apodex harness style) — dedup by URL
             all_results = []
@@ -196,21 +193,23 @@ class _Agent:
                                   chat_template_kwargs={"enable_thinking": False})
         self.agent = ToolCallingAgent(tools=[WebSearchTool(), GetWeatherTool(), DateTimeTool()], model=self.model, max_steps=MAX_STEPS, verbosity_level=0, add_base_tools=False, instructions="CRITICAL: For weather use get_weather(location, date) — never web_search. For general search use web_search. For date/time use get_current_datetime. Always default to Traditional Chinese (Taiwan usage, 繁體中文) regardless of what language the question was asked in — only keep English for proper nouns, technical terms, or vocabulary that doesn't translate well; never answer a whole sentence in Simplified Chinese or English. When user says 'Search ...' call web_search. For greetings respond directly.")
 
-    def run(self, task: str) -> str:
-        # Fast path for plain greetings - check only the current question, not the full history-wrapped task
-        import re
-        m = re.search(r"Current question:\s*(.*)", task, re.S)
-        _cur = m.group(1).strip() if m else task.strip()
-        _tl = _cur.lower()
-        # Greeting fast path: handle zh-TW fillers like 餵/喂/欸/嘿/哈囉 + 你好, and en hi/hello
-        if len(_tl) < 30 and re.search(r'(hi|hello|hey|hola|bonjour|你好|您好|哈囉|嗨|餵|喂|欸|嘿)', _tl, re.I) and not re.search(r'(weather|news|search|find|what is|who is|how|can you|please|today|tomorrow|星期|几号|幾號|几点|幾點|天气|天氣|新聞|頭條|分機|電話)', _tl, re.I):
-            # Ensure it's primarily a greeting, not a full sentence with greeting + question
-            # If query is short (<15) and contains greeting, treat as greeting
-            if len(_tl) < 15 or re.match(r'^\s*[\w\s]*(你好|您好|哈囉|嗨|餵|喂|hi|hello|hey)\b', _tl, re.I):
-                # zh-TW default: greet in Traditional Chinese even for an English "hello".
-                return "你好！有什麼可以幫你的？"
+    def run(self, task: str, history: list | None = None) -> str:
+        # No greeting fast-path (see the identical note in qwen_harness.py): the
+        # canned reply short-circuited the model and skewed every benchmark.
+        hist = [{"role": m["role"], "content": m["content"]} for m in (history or [])
+                if isinstance(m, dict) and m.get("role") in ("user", "assistant") and m.get("content")]
         with agent_call_lock:
-            out = self.agent.run(task, reset=True)
+            if hist:
+                # Real multi-turn messages where the pinned smolagents supports them,
+                # else a digest — either way better than dropping history entirely.
+                try:
+                    out = self.agent.run(messages=hist + [{"role": "user", "content": task}], reset=True)
+                except (TypeError, ValueError) as e:
+                    logger.debug(f"smolagents messages= unsupported ({e}); digest fallback")
+                    digest = "\n".join(f"{m['role']}: {m['content'][:400]}" for m in hist[-6:])
+                    out = self.agent.run(f"Conversation history:\n{digest}\n\nCurrent question: {task}", reset=True)
+            else:
+                out = self.agent.run(task, reset=True)
         return out if isinstance(out, str) else (out.final_answer if hasattr(out, "final_answer") else str(out))
 
 
@@ -240,15 +239,22 @@ def agent_alive() -> bool:
         return False
 
 
-async def run_agent_task(task: str, event_q: asyncio.Queue | None = None) -> str:
-    """Run the smolagents loop for one user prompt; may emit tool events into event_q."""
+async def run_agent_task(task: str, event_q: asyncio.Queue | None = None, history: list | None = None) -> str:
+    """Run the smolagents loop for one user prompt; may emit tool events into event_q.
+
+    `history` (real role/content turns) is forwarded to _Agent.run; see the note in
+    agent/qwen_harness.py. Tool-call events are emitted by the Tool.forward()
+    methods; final-answer streaming (llm_delta) is not available here because
+    smolagents' thread-run has no incremental hook — the consumer replays the final
+    text in that case, exactly as before.
+    """
     loop = asyncio.get_running_loop()
     set_emit_target(loop, event_q)
 
     def _worker():
         agent = _get_agent()
         try:
-            return agent.run(task)
+            return agent.run(task, history=history)
         except Exception as e:
             # Spoken via TTS with no filtering for an "error"-looking string (see the
             # identical note in qwen_harness.py) — log the real detail, return a clean

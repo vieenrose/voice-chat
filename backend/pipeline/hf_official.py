@@ -45,7 +45,9 @@ class HFOfficialSTT:
         # pcm_f32: float32 -1..1, 16k
         def _infer():
             # funasr expects 16k mono
-            import tempfile, soundfile as sf, os
+            import tempfile
+            import soundfile as sf
+            import os
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
                 sf.write(tf.name, pcm_f32, 16000)
                 tf.flush()
@@ -58,7 +60,7 @@ class HFOfficialSTT:
                 return ""
         return await asyncio.to_thread(_infer)
 
-    async def transcribe_stream(self, pcm_queue: asyncio.Queue, stop_event: asyncio.Event):
+    async def transcribe_stream(self, pcm_queue: asyncio.Queue, stop_event: asyncio.Event, session_id: str | None = None):
         # Simple non-streaming: accumulate until flush, then transcribe_once
         buf = []
         while not stop_event.is_set():
@@ -75,12 +77,10 @@ class HFOfficialSTT:
                     continue
                 # item is pcm int16
                 buf.append(item)
-                # Yield partial every 1s
-                if len(buf) > 5:
-                    pcm = np.concatenate(buf)
-                    pcm_f32 = pcm.astype(np.float32) / 32768.0
-                    # partial not supported, just yield empty
-                    yield {"type": "stt_partial", "text": "", "latency_ms": 0}
+                # Paraformer-through-this-path has no incremental decoding, so there is
+                # deliberately NO empty stt_partial filler here: the WS contract (and the
+                # barge-in detector) treats a partial as "the user is saying something",
+                # and the frontend paints it as live caption text.
             except asyncio.TimeoutError:
                 continue
 
@@ -165,7 +165,7 @@ class HFOfficialTTS:
             # Try to get sample_rate from model
             try:
                 self.sample_rate = getattr(self.pipe.model.config, "sampling_rate", 24000)
-            except:
+            except Exception:
                 pass
             logger.info(f"Qwen3-TTS loaded ✓ {model_id} sr {self.sample_rate}")
         except Exception as e:
@@ -193,15 +193,15 @@ class HFOfficialTTS:
                 # Convert to int16
                 pcm = (wav * 32767).astype(np.int16)
                 return pcm
-            except Exception as e:
+            except Exception:
                 # Try with speaker param
                 try:
                     out = self.pipe(text, forward_params={"speaker": "Chelsie"})
                     wav = out["audio"] if isinstance(out, dict) else out
                     wav = np.array(wav).squeeze()
                     return (wav * 32767).astype(np.int16)
-                except:
-                    raise e
+                except Exception:
+                    raise
         try:
             pcm = await asyncio.to_thread(_infer)
             return pcm
@@ -223,28 +223,36 @@ class HFOfficialTTS:
         sents = re.split(r'([.!?]+)', text)
         for i in range(0, len(sents), 2):
             sent = (sents[i] + (sents[i+1] if i+1 < len(sents) else "")).strip()
-            if not sent: continue
+            if not sent:
+                continue
             async for c in self.synthesize_streaming(sent):
                 yield {"type": "tts_chunk", "pcm": c, "text": sent, "sampleRate": self.sample_rate, "latency_ms": 40}
         yield {"type": "tts_end"}
 
     async def stream_tts(self, token_stream):
-        buf=""; cnt=0
+        buf=""
+        cnt=0
         async for ev in token_stream:
             if ev["type"]=="llm_token":
-                buf+=ev["token"]; cnt+=1
+                buf+=ev["token"]
+                cnt+=1
                 should=False
-                if re.search(r'[.!?。！？\n]', ev["token"]): should=True
-                elif cnt>=8 and buf and buf[-1] in " ,": should=True
+                if re.search(r'[.!?。！？\n]', ev["token"]):
+                    should=True
+                elif cnt>=8 and buf and buf[-1] in " ,":
+                    should=True
                 if should and buf.strip():
-                    txt=buf.strip(); buf=""; cnt=0
+                    txt=buf.strip()
+                    buf=""
+                    cnt=0
                     async for c in self.synthesize_streaming(txt):
                         yield {"type":"tts_chunk","pcm":c,"text":txt,"sampleRate":self.sample_rate,"latency_ms":40}
             elif ev["type"]=="llm_done":
                 if buf.strip():
                     async for c in self.synthesize_streaming(buf.strip()):
                         yield {"type":"tts_chunk","pcm":c,"text":buf.strip(),"sampleRate":self.sample_rate,"latency_ms":40}
-                yield {"type":"tts_end"}; return
+                yield {"type":"tts_end"}
+                return
         if buf.strip():
             async for c in self.synthesize_streaming(buf.strip()):
                 yield {"type":"tts_chunk","pcm":c,"text":buf.strip(),"sampleRate":self.sample_rate,"latency_ms":40}
@@ -284,53 +292,181 @@ class HFOfficialPipeline:
     def _get_history(self, sid): 
         return self.sessions.get(sid, [])
     def _trim_history(self, h, max_turns=10):
-        if len(h) <= 1+max_turns*2: return h
+        if len(h) <= 1+max_turns*2:
+            return h
         return [h[0]] + h[-(max_turns*2):]
 
-    async def stream_chat_interleaved(self, pcm_queue, stop_event, session_id="default", barge_in_event=None, barge_in_lock=None, on_new_voice_turn=None):
-        # NOTE: experimental/opt-in pipeline (HF_OFFICIAL flag, off by default) — accepts
-        # barge_in_event/barge_in_lock/on_new_voice_turn for interface parity with
-        # speech_to_speech.py's default pipeline (app.py's sender_loop always passes all
-        # three) but does not yet implement cancellation on any of them. Without accepting
-        # them here, enabling HF_OFFICIAL would TypeError on the very first WS message
-        # instead of merely lacking barge-in support.
-        # Reuse same logic as before but with HF components
-        import re, time
-        SENT_END = re.compile(r'[.!?。！？\n]')
-        history = self._trim_history(self._get_history(session_id))
-        e2e_start = time.time()
-        async for stt_ev in self.stt.transcribe_stream(pcm_queue, stop_event):
-            yield stt_ev
-            if stt_ev["type"]=="stt_final":
-                txt = stt_ev["text"]
-                if not txt.strip(): continue
-                stt_ms = stt_ev.get("latency_ms",0)
-                llm_start=time.time(); tts_buf=""; cnt=0; first_llm=None; first_tts=None; llm_so_far=""
-                llm_gen = self.llm.generate_chat_with_tools(history, txt)
-                async for ev in llm_gen:
-                    if ev["type"]=="llm_token":
-                        if first_llm is None: first_llm=time.time()
-                        yield ev
-                        llm_so_far=ev["text_so_far"]
-                        tts_buf+=ev["token"]; cnt+=1
-                        should=False
-                        if SENT_END.search(ev["token"]): should=True
-                        elif cnt>=8 and tts_buf and tts_buf[-1] in " ,": should=True
-                        if should and tts_buf.strip():
-                            s=tts_buf.strip(); tts_buf=""; cnt=0
-                            pcm=await self.tts.synthesize(s)
-                            if first_tts is None: first_tts=time.time()
-                            yield {"type":"tts_chunk","pcm":pcm,"text":s,"sampleRate":self.tts.sample_rate,"latency_ms":40}
-                    elif ev["type"]=="llm_done":
-                        if tts_buf.strip():
-                            pcm=await self.tts.synthesize(tts_buf.strip())
-                            yield {"type":"tts_chunk","pcm":pcm,"text":tts_buf.strip(),"sampleRate":self.tts.sample_rate,"latency_ms":40}
-                        # Update history
-                        hist=self._get_history(session_id)
-                        if not hist or hist[0].get("role")!="system":
-                            hist.insert(0, {"role":"system","content":"You are helpful."})
-                        hist.append({"role":"user","content":txt})
-                        hist.append({"role":"assistant","content":llm_so_far})
-                        self.sessions[session_id]=self._trim_history(hist)
-                        yield {"type":"tts_end"}
+    def next_turn_id(self, session_id: str = "default") -> int:
+        """Monotonic per-session turn id, same contract as the default pipeline's,
+        so app.py can tag/drop stale audio identically on either pipeline."""
+        self._turn_counters = getattr(self, "_turn_counters", {})
+        self._turn_counters[session_id] = self._turn_counters.get(session_id, 0) + 1
+        return self._turn_counters[session_id]
+
+    async def stream_chat_interleaved(self, pcm_queue, stop_event, session_id="default", barge_in_event=None,
+                                      barge_in_lock=None, on_new_voice_turn=None):
+        """
+        Barge-in / turn_id parity with the default pipeline (speech_to_speech.py).
+
+        STT runs in a background pump so speech keeps being recognized while a reply is
+        playing; each utterance gets its own response task, and every response event is
+        tagged with `turn_id`. A fresh non-empty `stt_partial` (or any `stt_final`) while
+        a reply is in flight cancels that task and yields
+        `{"type":"barge_in","reason":"voice","turn_id":…}`; `barge_in_event` (set by
+        app.py's `do_barge_in`) is checked before each synthesis and before each emitted
+        chunk, and breaking out of the TTS generator runs its `finally` -> stop_flag, so
+        an interrupted sentence is abandoned rather than synthesized to be thrown away.
+        `on_new_voice_turn` is awaited before each new voice turn to cancel a concurrent
+        text_input reply, exactly as the default pipeline does.
+        """
+        if barge_in_event is None:
+            barge_in_event = asyncio.Event()
+        if barge_in_lock is None:
+            barge_in_lock = asyncio.Lock()
+        out_q: asyncio.Queue = asyncio.Queue()
+
+        async def stt_pump():
+            try:
+                async for ev in self.stt.transcribe_stream(pcm_queue, stop_event, session_id):
+                    await out_q.put(("stt", ev))
+            except Exception as e:                       # pump death must not hang the loop
+                logger.warning(f"hf stt pump ended: {e!r}")
+            finally:
+                await out_q.put(("stt", {"type": "_pump_done"}))
+
+        async def run_turn(txt: str, stt_ms: int, turn_id: int):
+            e2e_start = time.time()
+            first_llm = None
+            first_tts = None
+            tts_buf = ""
+            cnt = 0
+            llm_so_far = ""
+            turn_history = self._trim_history(self._get_history(session_id))
+
+            async def emit(ev):
+                await out_q.put(("resp", turn_id, ev))
+
+            async def synth_and_emit(sentence: str):
+                nonlocal first_tts
+                t0 = time.time()
+                if barge_in_event.is_set():
+                    return
+                async for pcm in self.tts.synthesize_streaming(sentence):
+                    if barge_in_event.is_set():
+                        logger.info("hf run_turn: barge-in set, aborting TTS stream mid-sentence")
+                        break                             # generator finally -> stop_flag, no drain
+                    if len(pcm) == 0 or int(np.max(np.abs(pcm))) == 0:
+                        continue                          # silence placeholder guard
+                    if first_tts is None:
+                        first_tts = time.time()
+                        await emit({"type": "tts_start", "sampleRate": self.tts.sample_rate})
+                    await emit({"type": "tts_chunk", "pcm": pcm, "text": sentence,
+                                "sampleRate": self.tts.sample_rate,
+                                "latency_ms": int((time.time() - t0) * 1000)})
+
+            try:
+                gen = (self.llm.generate_chat_with_tools(turn_history, txt)
+                       if hasattr(self.llm, "generate_chat_with_tools")
+                       else self.llm.generate_stream(txt))
+                async for ev in gen:
+                    et = ev.get("type")
+                    if et == "llm_reset":
+                        # Harness withdrew text it had streamed (XML tool call appeared /
+                        # a tool step followed): drop the buffer so it never reaches TTS.
+                        tts_buf = ""
+                        cnt = 0
+                        llm_so_far = ""
+                        await emit({"type": "llm_reset"})
+                        continue
+                    if et in ("tool_call", "tool_result"):
+                        await emit(ev)
+                        continue
+                    if et != "llm_token":
+                        continue
+                    if first_llm is None:
+                        first_llm = time.time()
+                    await emit(ev)
+                    llm_so_far = ev.get("text_so_far", llm_so_far)
+                    tok = ev.get("token", "")
+                    if "<tool" in tok.lower() or ("<" in tok and ">" in tok):
+                        continue                          # tool markup is not speech
+                    tts_buf += tok
+                    cnt += 1
+                    if (SENTENCE_END.search(tok) or cnt >= 300) and tts_buf.strip():
+                        s = tts_buf.strip()
+                        tts_buf = ""
+                        cnt = 0
+                        await synth_and_emit(s)
+                        if barge_in_event.is_set():
+                            return
+                if tts_buf.strip():
+                    await synth_and_emit(tts_buf.strip())
+                hist = self._get_history(session_id)
+                if not hist or hist[0].get("role") != "system":
+                    hist.insert(0, {"role": "system", "content": "You are helpful."})
+                hist.append({"role": "user", "content": txt})
+                hist.append({"role": "assistant", "content": llm_so_far})
+                self.sessions[session_id] = self._trim_history(hist)
+                await emit({"type": "tts_end"})
+                await emit({"type": "latency", "stt_ms": stt_ms,
+                            "llm_ttft_ms": int((first_llm - e2e_start) * 1000) if first_llm else 0,
+                            "tts_ttfb_ms": int((first_tts - e2e_start) * 1000) if first_tts else 0,
+                            "e2e_ms": int((time.time() - e2e_start) * 1000)})
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.exception("hf_official turn failed")
+                await emit({"type": "error", "error": str(e)})
+
+        pump = asyncio.create_task(stt_pump())
+        response_task = None
+        current_turn_id = 0
+        try:
+            while True:
+                item = await out_q.get()
+                if item[0] == "stt":
+                    ev = item[1]
+                    if ev.get("type") == "_pump_done":
                         break
+                    if ev.get("type") == "stt_final":
+                        yield ev                                   # stt events stay untagged
+                        text = (ev.get("text") or "").strip()
+                        if not text:
+                            continue
+                        if on_new_voice_turn is not None:
+                            await on_new_voice_turn()               # cancel in-flight text reply
+                        if response_task is not None and not response_task.done():
+                            response_task.cancel()
+                        async with barge_in_lock:
+                            barge_in_event.clear()                  # fresh slate for the new turn
+                        current_turn_id = self.next_turn_id(session_id)
+                        response_task = asyncio.create_task(
+                            run_turn(text, int(ev.get("latency_ms", 0) or 0), current_turn_id))
+                    elif ev.get("type") == "stt_partial":
+                        yield ev
+                        # Speech over a reply that is still playing == voice barge-in.
+                        if (response_task is not None and not response_task.done()
+                                and (ev.get("text") or "").strip()):
+                            if on_new_voice_turn is not None:
+                                await on_new_voice_turn()
+                            response_task.cancel()
+                            response_task = None
+                            async with barge_in_lock:
+                                barge_in_event.set()
+                                barge_in_event.clear()
+                            yield {"type": "barge_in", "reason": "voice", "turn_id": current_turn_id}
+                    else:
+                        yield ev
+                else:                                    # ("resp", turn_id, ev)
+                    _, ev_turn_id, ev = item
+                    if ev_turn_id != current_turn_id:
+                        continue                                       # stale turn
+                    ev = {**ev, "turn_id": ev_turn_id}
+                    yield ev
+                    if ev.get("type") == "tts_end" and response_task is not None:
+                        response_task = None
+        finally:
+            if response_task is not None and not response_task.done():
+                response_task.cancel()
+            if not pump.done():
+                pump.cancel()

@@ -8,7 +8,8 @@ Voices via built-in presets (voice clone): Yuewen(台湾腔/zh_4), Ava(en_2), Ju
 import asyncio
 import time
 import re
-import os, sys
+import os
+import sys
 from pathlib import Path
 from typing import AsyncGenerator, Iterator
 import numpy as np
@@ -47,8 +48,9 @@ class StreamingPrimeTTS:
             logger.info(f"MOSS-ONNX TRUE-STREAMING loaded ✓ (EP={ep}) sr=48000 voices={len(self.voices)}")
         except Exception as e:
             logger.error(f"MOSS-ONNX load failed {e}")
-            import traceback; traceback.print_exc()
-            raise RuntimeError(f"MOSS-Nano-ONNX required: {e}")
+            import traceback
+            traceback.print_exc()
+            raise RuntimeError(f"MOSS-Nano-ONNX required: {e}") from e
 
     @property
     def voice(self): return self._vv
@@ -108,12 +110,14 @@ class StreamingPrimeTTS:
             if s.strip() in ".!?。！？":
                 cur += s
             else:
-                if cur: spans.append(cur.strip())
+                if cur:
+                    spans.append(cur.strip())
                 cur = s
-        if cur.strip(): spans.append(cur.strip())
-        if not spans: spans = [text.strip()]
+        if cur.strip():
+            spans.append(cur.strip())
+        if not spans:
+            spans = [text.strip()]
         chunks = []
-        loop = asyncio.get_running_loop()
         for i, span in enumerate(spans[:6]):
             t0 = time.time()
             w = await asyncio.to_thread(self._synth_one, span)
@@ -135,22 +139,29 @@ class StreamingPrimeTTS:
         return np.concatenate(parts)
 
     async def stream_tts(self, token_stream):
-        buf=""; cnt=0
+        buf=""
+        cnt=0
         async for ev in token_stream:
             if ev["type"]=="llm_token":
-                buf+=ev["token"]; cnt+=1
+                buf+=ev["token"]
+                cnt+=1
                 fl=False
-                if SENTENCE_END.search(ev["token"]): fl=True
-                elif cnt>=FLUSH_TOKENS and buf and buf[-1] in " ,": fl=True
+                if SENTENCE_END.search(ev["token"]):
+                    fl=True
+                elif cnt>=FLUSH_TOKENS and buf and buf[-1] in " ,":
+                    fl=True
                 if fl and buf.strip():
-                    txt=buf.strip(); buf=""; cnt=0
+                    txt=buf.strip()
+                    buf=""
+                    cnt=0
                     async for c in self.synthesize_streaming(txt):
                         yield {"type":"tts_chunk","pcm":c,"text":txt,"sampleRate":self.sample_rate,"latency_ms":20}
             elif ev["type"]=="llm_done":
                 if buf.strip():
                     async for c in self.synthesize_streaming(buf.strip()):
                         yield {"type":"tts_chunk","pcm":c,"text":buf.strip(),"sampleRate":self.sample_rate,"latency_ms":20}
-                yield {"type":"tts_end"}; return
+                yield {"type":"tts_end"}
+                return
         if buf.strip():
             async for c in self.synthesize_streaming(buf.strip()):
                 yield {"type":"tts_chunk","pcm":c,"text":buf.strip(),"sampleRate":self.sample_rate,"latency_ms":20}

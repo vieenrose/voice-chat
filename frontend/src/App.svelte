@@ -54,18 +54,31 @@
   let audioLevel = $state(0);
   let mode = $state('mock');
   let ws = null;
+  // Backend origin. Same-origin by default (the backend serves this SPA at /), with
+  // an explicit override for split-host dev: ?api=http://host:8000 (or ?api=... in
+  // localStorage) — previously the port was hard-coded to 8000, so any deploy that
+  // didn't match it silently broke every fetch and the WS.
+  const qpInit = new URLSearchParams(location.search);
+  const API_BASE = (qpInit.get('api') || localStorage.getItem('vc-api') || '').replace(/\/+$/, '')
+                   || (location.protocol === 'https:' ? '' : `${location.protocol}//${location.hostname}:8000`);
+  // Shared token (backend VOICE_CHAT_TOKEN). Read from the query string once and kept
+  // in memory only — putting it in localStorage would leave a credential on shared
+  // machines, and the app is a demo that normally runs without a token anyway.
+  const AUTH_TOKEN = qpInit.get('token') || '';
+  const authHeaders = () => AUTH_TOKEN ? {'X-Auth-Token': AUTH_TOKEN} : {};
+  const withAuth = (path) => { if(!AUTH_TOKEN) return path; const u = new URL(path, location.href); u.searchParams.set('token', AUTH_TOKEN); return u.pathname + u.search; };
   let audioCtx = null;
   let workletNode = null;
   let mediaStream = null;
   let analyser = null;
   let jitterQueue = [];
   let nextPlayTime = 0;
-  let wsUrl = $derived((location.protocol==='https:' ? `wss://${location.host}/ws/chat?session_id=${'demo-'+Math.random().toString(36).slice(2,7)}` : `ws://${location.hostname}:8000/ws/chat?session_id=${'demo-'+Math.random().toString(36).slice(2,7)}`));
+  let wsUrl = $derived(`${API_BASE ? API_BASE.replace(/^http/, 'ws') : (location.protocol==='https:' ? 'wss://'+location.host : 'ws://'+location.hostname+':8000')}/ws/chat?session_id=${'demo-'+Math.random().toString(36).slice(2,7)}${AUTH_TOKEN ? '&token='+encodeURIComponent(AUTH_TOKEN) : ''}`);
   let statsInterval = null;
   let canvasEl;
   let animId;
   function log(msg, obj) { console.log('[UI]', msg, obj||''); }
-  function apiUrl(path){ return location.protocol==='https:' ? path : `http://${location.hostname}:8000${path}`; }
+  function apiUrl(path){ return API_BASE ? `${API_BASE}${path}` : path; }
   // Live model info, sourced from /health's llm_manager block — replaces what used to be
   // three separately hardcoded copies of the model name (header subtitle, Stack card,
   // footer) that each went stale the last time the deployed model actually changed.
@@ -78,7 +91,7 @@
   let ttsBackend = $state('');
   async function fetchHealth(){
     try{
-      const r = await fetch(apiUrl('/health'));
+      const r = await fetch(apiUrl(withAuth('/health')), {headers: authHeaders()});
       const j = await r.json();
       rssMb = j.rss_mb;
       mode = j.mock ? 'mock' : 'real';
@@ -101,7 +114,7 @@
     if(modelSwitching || !selectedModelId || selectedModelId===currentModelId) return;
     modelSwitching = true; modelSwitchStatus = `載入中：${selectedModelId}…`;
     try{
-      const r = await fetch(apiUrl('/api/model'), {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({model_id: selectedModelId})});
+      const r = await fetch(apiUrl(withAuth('/api/model')), {method:'POST', headers:{'Content-Type':'application/json', ...authHeaders()}, body: JSON.stringify({model_id: selectedModelId})});
       const j = await r.json();
       if(!r.ok){ modelSwitchStatus = `載入失敗：${j.error||r.status}`; }
       else{ currentModelId = j.model_id; modelSwitchStatus = `已載入 ${j.label}（${j.took_s ?? '?'} 秒）`; }
@@ -166,6 +179,15 @@
     switch(msg.type){
       case 'stt_partial': sttPartial = toTraditional(msg.text); break;
       case 'stt_final': sttFinal = toTraditional(msg.text); sttPartial = ''; chatHistory = [...chatHistory, {role:'user', text: toTraditional(msg.text)}]; llmStreaming = ''; ttsText = ''; toolStatus = ''; if(msg.text && msg.text.trim()) turnActive = true; break;
+      case 'llm_reset': if(isStaleTurn(msg.turn_id)) break;
+        // The assistant streamed text it then withdrew (a tool call appeared mid
+        // stream). Nothing was ever spoken from it — clear the partial bubble rather
+        // than leaving a half-sentence on screen next to the real answer.
+        llmStreaming = '';
+        if(chatHistory.length && chatHistory[chatHistory.length-1].streaming){
+          chatHistory = chatHistory.slice(0, -1);
+        }
+        break;
       case 'llm_token': if(isStaleTurn(msg.turn_id)) break; llmStreaming = toTraditional(msg.text_so_far); break;
       case 'tool_call': {
           if(isStaleTurn(msg.turn_id)) break;

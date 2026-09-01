@@ -42,14 +42,15 @@ class StreamingXASR:
             logger.info(f"ARK-ASR loaded ✓ {model_id} on {device}")
         except Exception as e:
             logger.error(f"ARK-ASR load failed {e}, fallback to mock")
-            import traceback; traceback.print_exc()
+            import traceback
+            traceback.print_exc()
             self.backend = "mock"
             self.mock = True
 
     def _is_speech(self, pcm: np.ndarray) -> bool:
         return np.sqrt(np.mean(pcm.astype(np.float32)**2)) > 0.01
 
-    async def transcribe_stream(self, pcm_queue: asyncio.Queue, stop_event: asyncio.Event) -> AsyncGenerator[dict, None]:
+    async def transcribe_stream(self, pcm_queue: asyncio.Queue, stop_event: asyncio.Event, session_id: str | None = None) -> AsyncGenerator[dict, None]:
         if self.mock or self.backend == "mock":
             # Mock as before
             mock_words = ["hello","how","are","you","today","ark","asr","streaming","audio8","multilingual"]
@@ -149,7 +150,9 @@ class StreamingXASR:
             # For streaming, we use the processor's chat template
             def _infer():
                 # Save pcm to temp file for processor (it expects path)
-                import tempfile, soundfile as sf, os
+                import tempfile
+                import soundfile as sf
+                import os
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                     sf.write(f.name, pcm_f32, SAMPLE_RATE)
                     tmp_path = f.name
@@ -188,7 +191,7 @@ class StreamingXASR:
                         bad_ids = set(self.tokenizer.all_special_ids) - keep_ids
                         bad_ids.update(token_id for token, token_id in self.tokenizer.get_added_vocab().items() if token.startswith("<") and token.endswith(">") and token_id not in keep_ids)
                         bad_words_ids = [[tid] for tid in sorted(bad_ids)]
-                    except:
+                    except Exception:
                         pass
                     with torch.inference_mode():
                         outputs = self.model.generate(
@@ -210,13 +213,14 @@ class StreamingXASR:
                 finally:
                     try:
                         os.unlink(tmp_path)
-                    except:
+                    except Exception:
                         pass
             text = await asyncio.to_thread(_infer)
             return text.strip()
         except Exception as e:
             logger.warning(f"ARK-ASR transcribe failed {e}")
-            import traceback; traceback.print_exc()
+            import traceback
+            traceback.print_exc()
             return ""
 
     async def transcribe_once(self, pcm_f32: np.ndarray) -> str:

@@ -48,12 +48,13 @@ class StreamingPrimeTTS:
     def voice(self) -> str:
         return self._vv
 
+    @property
     def voices(self) -> list[str]:
         return list(self.VOICE_PRESETS.keys())
 
     def set_voice(self, name: str):
         if name not in self.VOICE_PRESETS:
-            raise KeyError(f"unknown voice {name}; available {self.voices()}")
+            raise KeyError(f"unknown voice {name}; available {self.voices}")
         self._vv = name
 
     def _preset(self, zh: bool) -> dict:
