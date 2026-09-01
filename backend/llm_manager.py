@@ -47,15 +47,29 @@ LLM_SEED = int(os.getenv("LLM_SEED", "-1"))
 # tool template, quoted the prompt back, or repeated itself — each needing another
 # filter. Unquantized f16 scored the same as q8, so this is capacity, not quantization.
 MODEL_REGISTRY: dict[str, dict] = {
+    # UD-Q4_K_XL with MTP layers, on both counts by measurement rather than preference.
+    #
+    # UD (Unsloth Dynamic) keeps the quantization-sensitive layers at higher precision
+    # instead of applying one bit-width everywhere, for ~5% more file. IQ4_XS was tried
+    # first and rejected: faster on paper (+8% on 4B, less VRAM) but it scored 2/8 on the
+    # four UI prompts against Q4_K_M's 4/8, and every failure was a repeated sentence —
+    # the signature of over-quantization, not of sampling noise.
+    #
+    # MTP adds NextN layers so the model drafts its own next tokens for the target model
+    # to verify. Accepted drafts are the tokens that would have been generated anyway, so
+    # it is throughput-only: at temperature 0 these weights emit byte-identical text with
+    # and without it. See _mtp_args().
     "qwen3.5-2b-q4": {
-        "label": "Qwen3.5 2B Q4_K_M",
-        "path": os.getenv("LLM_PATH_2B", "/tmp/llms/Qwen3.5-2B-Q4_K_M.gguf"),
+        "label": "Qwen3.5 2B UD-Q4_K_XL (MTP)",
+        "path": os.getenv("LLM_PATH_2B", "/home/user/llms/mtp/Qwen3.5-2B-UD-Q4_K_XL.gguf"),
         "alias": "qwen3.5-2b",
+        "mtp": True,
     },
     "qwen3.5-4b-q4": {
-        "label": "Qwen3.5 4B Q4_K_M",
-        "path": os.getenv("LLM_PATH_4B", "/tmp/llms/Qwen3.5-4B-Q4_K_M.gguf"),
+        "label": "Qwen3.5 4B UD-Q4_K_XL (MTP)",
+        "path": os.getenv("LLM_PATH_4B", "/home/user/llms/mtp/Qwen3.5-4B-UD-Q4_K_XL.gguf"),
         "alias": "qwen3.5-4b",
+        "mtp": True,
     },
 }
 # Ling 3.0 tiny (bailingmoe3 MoE) was evaluated here and dropped. At IQ4_XS it scored the
@@ -131,6 +145,29 @@ class LLMServerManager:
             return []
         return ["--reasoning-format", fmt]
 
+    def _mtp_args(self, info: dict) -> list[str]:
+        """Self-speculative decoding for weights that carry MTP (NextN) layers.
+
+        The model drafts its own next few tokens and the target model verifies them, so
+        accepted drafts are exactly the tokens that would have been produced anyway —
+        this is a throughput change, not a quality one. Confirmed rather than assumed:
+        at temperature 0 the same UD-Q4_K_XL weights emit byte-identical text with and
+        without MTP, while measuring 84.6 -> 101.9 tok/s on 4B (+20%) and 167 -> 174 on
+        2B. The bigger the model, the more the drafting pays for itself.
+
+        Probed like --reasoning-format above, because a build without it would reject
+        the argument and refuse to start at all. Set LLM_MTP=0 to opt out.
+        """
+        if not info.get("mtp"):
+            return []
+        if os.getenv("LLM_MTP", "1").strip() in ("0", "false", "no"):
+            return []
+        if not _supports_llama_flag(LLAMA_SERVER_BIN, "--spec-type"):
+            logger.warning("this llama-server build has no --spec-type; MTP weights will run without "
+                           "speculative decoding (correct, just slower)")
+            return []
+        return ["--spec-type", "draft-mtp", "--spec-draft-n-max", os.getenv("LLM_MTP_DRAFT_N", "3")]
+
     def _spawn(self, model_id: str) -> None:
         info = MODEL_REGISTRY[model_id]
         path = Path(info["path"])
@@ -143,6 +180,7 @@ class LLMServerManager:
             "--n-gpu-layers", "99", "--jinja",
         ]
         cmd += self._reasoning_args()
+        cmd += self._mtp_args(info)
         if LLM_SEED != -1:
             cmd += ["--seed", str(LLM_SEED)]
         logger.info(f"LLMServerManager: spawning {model_id} ({info['label']}): {' '.join(cmd)}")

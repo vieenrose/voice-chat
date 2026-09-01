@@ -1,6 +1,6 @@
 # Voice Chat — Streaming Speech-to-Speech with Tools
 
-**X-ASR-int8 → Qwen3.5-2B Q4 (Qwen-Agent) → Qwen3-TTS.** Real models, no mocks, low latency.
+**X-ASR-int8 → Qwen3.5-2B UD-Q4_K_XL+MTP (Qwen-Agent) → Qwen3-TTS.** Real models, no mocks, low latency.
 
 A full-duplex voice chat demo: speak, interrupt it mid-sentence by voice *or* text, search the
 web, and hear the answer. **Traditional Chinese (Taiwan) by default** — input and output are
@@ -19,7 +19,7 @@ Mic 16k ─► endpoint detect ─► STT (X-ASR int8, 160ms) ─► LLM (Qwen3.
 |---|---|---|
 | **Turn-taking** | sherpa-onnx rule-based endpointing | trailing-silence rules drive `stt_final`; no separate VAD |
 | **STT** | `GilgameshWind/X-ASR-zh-en` int8 | Zipformer, 160 ms streaming, 146 M encoder, zh+en 16 k, CUDA |
-| **LLM** | `Qwen/Qwen3.5-2B` Q4_K_M (default) | llama-server `:11435`, `-c 16384`, thinking on, 3 tools. Switchable at runtime — see below |
+| **LLM** | `Qwen/Qwen3.5-2B` UD-Q4_K_XL + MTP (default) | llama-server `:11435`, `-c 16384`, thinking on, 3 tools. Switchable at runtime — see below |
 | **Embedding** | `granite-embedding-97m-multilingual` Q8_0 | 384 d, zh-TW+en, `:11434`, semantic rerank for paraphrases |
 | **TTS** | `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` Q8_0 | GGML CUDA via `qwentts-cpp-python`, true streaming, 24 k, ~20 ms TTFA |
 | **Search** | SearXNG `:8888` + wttr.in + Bing scrape | 180 engines, real results only — no curated mocks |
@@ -65,8 +65,9 @@ llama-server -m granite-embedding-97M-multilingual-r2-Q8_0.gguf \
 
 # 2) LLM — optional: the backend spawns and owns this itself if :11435 is free,
 #    or adopts it if you start it first (backend/llm_manager.py)
-llama-server -m /tmp/llms/Qwen3.5-2B-Q4_K_M.gguf \
-  --host 127.0.0.1 --port 11435 -c 16384 --alias qwen3.5-2b --n-gpu-layers 99 --jinja
+llama-server -m /home/user/llms/mtp/Qwen3.5-2B-UD-Q4_K_XL.gguf \
+  --host 127.0.0.1 --port 11435 -c 16384 --alias qwen3.5-2b --n-gpu-layers 99 --jinja \
+  --reasoning-format deepseek --spec-type draft-mtp --spec-draft-n-max 3
 
 # 3) Search
 SEARXNG_SETTINGS_PATH=/tmp/searxng/settings.yml python3 -m searx.webapp   # :8888
@@ -81,7 +82,7 @@ cd frontend && npm install && npm run dev       # http://localhost:5173
 
 Model files (mount as volumes under Docker):
 
-- LLM `/tmp/llms/Qwen3.5-2B-Q4_K_M.gguf` · Embedding `/tmp/granite-emb-gguf/…Q8_0.gguf`
+- LLM `/home/user/llms/mtp/Qwen3.5-2B-UD-Q4_K_XL.gguf` · Embedding `/tmp/granite-emb-gguf/…Q8_0.gguf`
 - TTS `/tmp/qwen3_tts/talker_cv_q8.gguf` + `codec.gguf` · STT `/tmp/XASR/deployment/models/chunk-160ms-model/`
 - SearXNG `/tmp/searxng/settings.yml`
 
@@ -136,18 +137,29 @@ above is a spread. Fix `LLM_AGENT_SEED` to compare builds.
 | thinking off | 71 % | 56 ms | fast, clean, and invented: weather never looked up |
 | thinking + `--reasoning-format deepseek` | **83 %** | **53–576 ms** | answers only |
 
-**Decode throughput and quality** (220-token answer, median of 3; matrix = the four UI demo
-prompts, checked for tool routing, reasoning kept out of speech and transcript, no repeats,
-zh-TW):
+**Choosing the quantization.** Three builds of the same two models, measured rather than
+argued (matrix = the four UI demo prompts across both sizes, 8 runs, checked for tool routing,
+reasoning kept out of speech and transcript, no repeats, zh-TW):
 
-| Model | tok/s | wall | matrix |
-|---|---|---|---|
-| 0.8B q8 *(removed)* | 236 | 0.97 s | 1/4 |
-| **Qwen3.5 2B Q4_K_M** | **172** | **1.31 s** | **3/4** |
-| Qwen3.5 4B Q4_K_M | 87 | 2.60 s | 3/4 |
+| Build | 2B tok/s | 4B tok/s | matrix | |
+|---|---|---|---|---|
+| Q4_K_M | 172 | 87 | 4/8 | the previous default |
+| IQ4_XS | 175 | 94 | **2/8** | rejected |
+| **UD-Q4_K_XL + MTP** | **174** | **102** | **4/8** | current |
+
+IQ4_XS is the cautionary one: faster on paper and lighter on VRAM, but it halved the matrix
+score and *every* failure was a repeated sentence — the signature of over-quantization rather
+than sampling noise. UD (Unsloth Dynamic) instead spends ~5 % more file on keeping the
+quantization-sensitive layers precise, and holds the baseline score.
+
+MTP is free speed on top: the weights carry NextN layers, the model drafts its own next tokens
+and the target model verifies them, so accepted drafts are the tokens that would have been
+produced anyway. Verified, not assumed — at temperature 0 the same weights emit **byte-identical
+text** with and without it, while 4B goes 84.6 → 101.9 tok/s (+20 %). Bigger models gain more.
+`LLM_MTP=0` opts out; the `--spec-type` flag is probed, so a build without it still starts.
 
 2B and 4B score the same and fail the same way — a sentence repeated in the news answer. 2B is
-the default: same quality, twice the throughput.
+the default: same quality, ~1.7x the throughput.
 
 If you want a turn to feel faster, the thinking budget and the search round-trip are where the
 seconds are — not the model size. First audio is 1.0–3.6 s on a tool turn, of which decode is a
@@ -212,6 +224,7 @@ concurrently instead of each waiting out its own timeout.
 | `WS_ALLOW_ANY_ORIGIN` | off | opt out of the WebSocket Origin gate |
 | `SEARXNG_URL` | `http://localhost:8888` | search backend |
 | `LLM_API_BASE`, `LLM_PORT`, `LLM_CTX`, `LLM_DEFAULT_MODEL_ID`, `LLM_PATH_*` | see `llm_manager.py` | LLM subprocess |
+| `LLM_MTP` / `LLM_MTP_DRAFT_N` | `1` / `3` | self-speculative decoding on MTP weights; `0` disables |
 | `LLM_SEED` / `LLM_AGENT_SEED` | random / unset | reproducible runs |
 | `LLM_AGENT_TEMP`, `LLM_AGENT_TOP_P` | `0.7`, `0.9` | agent-turn sampling |
 | `LLM_AGENT_THINKING` | `1` | thinking pass on agent turns |
