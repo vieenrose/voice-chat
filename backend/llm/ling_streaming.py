@@ -61,6 +61,23 @@ def _norm_for_echo(t: str) -> str:
     return re.sub(r"[^\w一-鿿]+", "", (t or "").lower())
 
 
+def retract_span(text_so_far: str, span: str) -> str:
+    """Remove a span that turned out to be reasoning from the streamed transcript.
+
+    Tokens reach the client as they arrive, so by the time a full sentence can be
+    judged, its text is already in text_so_far. Trim it from the tail (the normal
+    case) and fall back to removing the last occurrence anywhere."""
+    if not span:
+        return text_so_far
+    stripped = text_so_far.rstrip()
+    if stripped.endswith(span):
+        return stripped[: -len(span)]
+    idx = text_so_far.rfind(span)
+    if idx >= 0:
+        return text_so_far[:idx] + text_so_far[idx + len(span):]
+    return text_so_far
+
+
 class SpokenGuard:
     """Tracks what has already been spoken within one turn so nothing is said twice.
 
@@ -145,13 +162,22 @@ def _is_own_prompt_echo(s: str) -> bool:
 # language:", "Tool Call Analysis:"). Shape-based: an English line that ends in a colon
 # and is about the machinery of answering rather than about anything the user asked.
 _META_NOUN = (r"tool|call|request|constraint|language|query|need|response|answer|output"
-              r"|prompt|instruction|analysis|reasoning|evaluation|step|plan|check")
+              r"|prompt|instruction|analysis|reasoning|evaluation|step|plan|check|input"
+              r"|context|task|goal|approach|strategy|conclusion|summary")
+_LIST_MARKER = r"(?:[*\-#\d.)]+\s*)*"
 _CHECKLIST_HEADER_RE = re.compile(
-    r"^\s*(?:[*\-#\d.]+\s*)*(?:\*\*)?\s*"
+    r"^\s*" + _LIST_MARKER + r"(?:\*\*)?\s*"
     r"(?:(?:evaluate|analyz[es]?|analyse|determine|identify|assess|consider|review|verify"
     r"|check|decide|formulate|construct)\b[^.?!\n]{0,60}?\b(?:" + _META_NOUN + r")s?\b"
     r"|(?:" + _META_NOUN + r")s?\b[^.?!\n]{0,40}?\b(?:" + _META_NOUN + r")s?\b)"
     r"[^.?!\n]{0,40}:\s*(?:\*\*)?\s*$",
+    re.I,
+)
+# A bare scaffolding header on its own line ("Plan:", "**Summary:**", "3. Context:").
+# Only ever English and only ever a lone meta noun — a Chinese "今天的重點新聞如下：" has CJK
+# and never reaches here.
+_BARE_HEADER_RE = re.compile(
+    r"^\s*" + _LIST_MARKER + r"(?:\*\*)?\s*(?:the\s+)?(?:" + _META_NOUN + r")s?\s*:\s*(?:\*\*)?\s*$",
     re.I,
 )
 
@@ -169,7 +195,7 @@ def _is_reasoning_text(text: str) -> bool:
     # Our own instructions replayed back at us are never an answer
     if _is_own_prompt_echo(s):
         return True
-    if _CHECKLIST_HEADER_RE.match(s):
+    if _CHECKLIST_HEADER_RE.match(s) or _BARE_HEADER_RE.match(s):
         return True
     # No CJK at all -> not an answer this app would give.
     #

@@ -41,6 +41,7 @@ from pipeline.speech_to_speech import HFSpeechToSpeechPipeline
 # the two 'this is not speech' rules are shared with the voice pipeline on purpose
 from pipeline.speech_to_speech import _is_tool_artifact, is_echo_of_prompt, prepare_tts_text
 from llm_manager import llm_manager, MODEL_REGISTRY as LLM_MODEL_REGISTRY
+from llm.ling_streaming import retract_span as _retract_span
 
 app = FastAPI(title="Voice Chat HF S2S + SearXNG Tools", version="1.1.0")
 
@@ -471,23 +472,6 @@ async def tts_chunks(text: str, voice: str | None = None):
     async for pcm in pipeline.tts.synthesize_streaming(text):
         yield pcm
 
-def _retract(text_so_far: str, spoken_candidate: str) -> str:
-    """Remove a span that turned out to be reasoning from the streamed transcript.
-
-    Tokens reach the client as they arrive, so by the time a full sentence can be
-    judged, its text is already in text_so_far. Trim it from the tail (the normal
-    case) and fall back to removing the last occurrence anywhere."""
-    if not spoken_candidate:
-        return text_so_far
-    stripped = text_so_far.rstrip()
-    if stripped.endswith(spoken_candidate):
-        return stripped[: -len(spoken_candidate)]
-    idx = text_so_far.rfind(spoken_candidate)
-    if idx >= 0:
-        return text_so_far[:idx] + text_so_far[idx + len(spoken_candidate):]
-    return text_so_far
-
-
 def _resolve_session_id(session_id: str) -> str:
     """Empty or the literal 'default' gets a unique id.
 
@@ -732,8 +716,14 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="")):
                                         continue
                                     if first_llm is None:
                                         first_llm = time.time()
-                                    await websocket.send_text(json.dumps({**ev, "turn_id": my_turn_id}, ensure_ascii=False))
-                                    llm_text_so_far = ev.get("text_so_far", llm_text_so_far + _tok)
+                                    # Accumulate locally rather than adopting the harness's
+                                    # cumulative text_so_far: tokens dropped here (tool XML,
+                                    # reasoning) and spans retracted below must STAY gone.
+                                    # Taking the harness's copy re-introduced them on the very
+                                    # next token, which is why retracting reasoning from the
+                                    # bubble appeared to do nothing.
+                                    llm_text_so_far += _tok
+                                    await websocket.send_text(json.dumps({**ev, "text_so_far": llm_text_so_far, "turn_id": my_turn_id}, ensure_ascii=False))
                                     # Also filter TTS buffer
                                     if "<tool" in _tok.lower() or ("<" in _tok and ">" in _tok):
                                         continue
@@ -763,7 +753,7 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="")):
                                                 # already in text_so_far. Speech was spared; the transcript
                                                 # has to be corrected explicitly or the UI shows thinking
                                                 # as the answer.
-                                                llm_text_so_far = _retract(llm_text_so_far, txt_s)
+                                                llm_text_so_far = _retract_span(llm_text_so_far, txt_s)
                                                 await websocket.send_text(json.dumps({"type": "llm_token", "token": "", "text_so_far": llm_text_so_far, "turn_id": my_turn_id}, ensure_ascii=False))
                                                 tts_buf=""
                                                 cnt=0

@@ -1,5 +1,6 @@
 """
-HF Speech-to-Speech orchestrator — glue for X-ASR → MiniCPM5 → PrimeTTS.
+HF Speech-to-Speech orchestrator — glue for X-ASR → Qwen3.5 (Qwen-Agent) → Qwen3-TTS.
+(The MiniCPM5/PrimeTTS names below are kept only as import-time fallbacks and aliases.)
 
 Implements low-latency streaming pipeline:
   audio Queue → STT → LLM tokens → TTS chunks
@@ -16,7 +17,7 @@ from loguru import logger
 import numpy as np
 
 from tts.spoken_text import normalize as _normalize_spoken_text   # stdlib-only, no engine deps
-from llm.ling_streaming import SpokenGuard
+from llm.ling_streaming import SpokenGuard, retract_span as _retract_span
 
 
 # Text that is tool plumbing rather than speech must never reach the speaker. One case is
@@ -426,8 +427,10 @@ class HFSpeechToSpeechPipeline:
                         if first_llm_t is None:
                             first_llm_t = time.time()
                             llm_ttft = int((first_llm_t - llm_start)*1000)
-                        await emit(llm_event)
-                        llm_text_so_far = llm_event["text_so_far"]
+                        # Accumulate locally, not from the harness's cumulative copy, so
+                        # tokens filtered out here stay out (see the same note in app.py).
+                        llm_text_so_far += _tok
+                        await emit({**llm_event, "text_so_far": llm_text_so_far})
                         tok = llm_event["token"]
                         if "<tool" in tok.lower() or ("<" in tok and ">" in tok):
                             continue
@@ -449,6 +452,12 @@ class HFSpeechToSpeechPipeline:
                                 from llm.ling_streaming import _is_reasoning_text as _is_reasoning
                                 if _is_reasoning(text_to_synth):
                                     await emit({"type": "reasoning", "text": text_to_synth, "delta": text_to_synth})
+                                    # Take it back out of the transcript too — a token is too
+                                    # small a unit to classify, so this is only recognisable
+                                    # once the sentence completed, by which point it has
+                                    # already streamed to the client (see app.py:_retract).
+                                    llm_text_so_far = _retract_span(llm_text_so_far, text_to_synth)
+                                    await emit({"type": "llm_token", "token": "", "text_so_far": llm_text_so_far})
                                     tts_buffer = ""
                                     tts_token_count = 0
                                     continue

@@ -168,6 +168,34 @@ class QwenDateTime(BaseTool):
 _TOOL_PLACEHOLDER_RE = re.compile(r"\[\s*(get_current_datetime|get_weather|web_search)\s*\]")
 
 
+NO_ANSWER_ZH = "抱歉，我找不到相關的答案。"
+
+
+def _answer_or_fallback(text: str) -> str:
+    """Drop an 'answer' that is only deliberation or its leftover scaffolding.
+
+    Smaller quantizations sometimes spend the whole turn narrating a plan and never
+    write an answer. Filtering the reasoning out then leaves either nothing or the
+    skeleton it hung on — "Plan:", "2.  Evaluate the Input:", bare list markers and
+    blank lines — which is what reached the chat bubble while TTS, correctly, refused
+    to speak any of it: the user saw scaffolding and heard silence. If nothing
+    survives the filter, say so instead."""
+    if not text or not text.strip():
+        return NO_ANSWER_ZH
+    try:
+        from llm.ling_streaming import _is_reasoning_text
+    except Exception:
+        return text
+    kept = [p for p in re.split(r"(?<=[.!?。！？\n])\s*", text) if p.strip() and not _is_reasoning_text(p)]
+    remainder = " ".join(kept).strip()
+    # Residue: what is left carries no CJK and no real word — only numbering, bullets
+    # and punctuation. That is not an answer in any language.
+    has_word = bool(re.search(r"[一-鿿]", remainder)) or bool(re.search(r"[A-Za-z]{3,}", remainder))
+    if not remainder or not has_word:
+        return NO_ANSWER_ZH
+    return text
+
+
 def _msg_field(m, key, default=None):
     """Read a field from a qwen_agent message, which may be a dict or a Message object."""
     if isinstance(m, dict):
@@ -219,6 +247,32 @@ _TIME_CLAIM_RE = re.compile(
     r"\d{4}-\d{1,2}-\d{1,2}|"
     r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
     r"january|february|march|april|may|june|july|august|september|october|november|december)", re.I)
+
+
+# A fabricated forecast is the weather-shaped version of the fabricated clock above, and
+# just as checkable: asked "台北今天天氣如何？", 2B answered "台北今天天氣晴朗，天空藍，適合外出
+# 活動！" with no tool call, on a day that was overcast with a 74-80% chance of rain.
+# Weather is deliberately not pre-flighted (get_weather is itself a reformulation over
+# web_search, so forcing it up front would have to label the call with a tool that did not
+# run), so the guard has to be here: the question has to ask for weather, AND the answer
+# has to state a forecast.
+_WEATHER_CLAIM_RE = re.compile(
+    r"(\d{1,2}\s*(?:°|度)\s*C?|攝氏|气温|氣溫|"
+    r"晴朗|晴天|多雲|多云|陰天|阴天|下雨|降雨|陣雨|阵雨|雷雨|雪|颱風|台风|"
+    r"降雨機率|降水概率|濕度|湿度|"
+    r"sunny|cloudy|overcast|rain(?:y|ing)?|showers?|thunder|snow|humidity|"
+    r"\d{1,3}\s*%)", re.I)
+
+
+def fabricates_weather_without_tool(task: str, text: str, tool_ran: bool = False) -> bool:
+    """True when the request asks for weather, the answer states a forecast, and no tool
+    ran to verify it. Same shape as fabricates_time_without_tool: a claim the user can
+    check against the sky, invented because the model would rather answer than call."""
+    if tool_ran or not task or not text:
+        return False
+    if not _WEATHER_REQUEST_RE.search(task):
+        return False
+    return bool(_WEATHER_CLAIM_RE.search(text))
 
 
 def fabricates_time_without_tool(task: str, text: str, tool_ran: bool = False) -> bool:
@@ -631,6 +685,7 @@ async def run_agent_task(task: str, event_q=None, history=None) -> str:
             # so the form-based check stays, and the duplicate is removed structurally by
             # running the turn on an agent whose web_search is already satisfied.
             _preflight_tool = required_tool_for_request(task) if _preflight_enabled() else None
+            preflight_ran = False
             if _preflight_tool:
                 # A real invocation of a real tool (its own tool_call/tool_result events
                 # fire inside .call, so the UI and the benchmark see it) placed in context
@@ -641,11 +696,25 @@ async def run_agent_task(task: str, event_q=None, history=None) -> str:
                 try:
                     forced = _run_named_tool(_preflight_tool, task[:80])
                     if forced:
+                        # Label the injected exchange with the tool that actually ran.
+                        # This said 'web_search' unconditionally, so a pre-flighted
+                        # get_current_datetime was presented to the model as a search —
+                        # the same "claiming one tool ran when another did" dishonesty
+                        # the note in required_tool_for_request warns about.
+                        _args = ({'query': task[:80]} if _preflight_tool == 'web_search'
+                                 else {'location': task[:80]} if _preflight_tool == 'get_weather'
+                                 else {})
                         messages = messages + [
                             {'role': 'assistant', 'content': '',
-                             'function_call': {'name': 'web_search', 'arguments': json.dumps({'query': task[:80]})}},
-                            {'role': 'function', 'name': 'web_search', 'content': forced[:3000]},
+                             'function_call': {'name': _preflight_tool, 'arguments': json.dumps(_args, ensure_ascii=False)}},
+                            {'role': 'function', 'name': _preflight_tool, 'content': forced[:3000]},
                         ]
+                        # A pre-flighted tool is a tool that ran. tool_ran is derived from
+                        # all_resps (what the agent yielded), which never sees this
+                        # injection — so without it the repair guards below concluded
+                        # nothing had run and called the tool a second time, appending a
+                        # redundant clock to an answer that was already correct.
+                        preflight_ran = True
                         # The tool it just satisfied is no longer offered for this turn.
                         # Not just this tool — ALL of them. Leaving get_weather visible
                         # made the model answer a news request with a weather report (it
@@ -749,8 +818,9 @@ async def run_agent_task(task: str, event_q=None, history=None) -> str:
                 # which fired the repair guards below on a correct answer: "法國現在的總統
                 # 是誰？" got an unrelated clock appended, because the question contains 現在
                 # and the answer contains years, and the guard believed no tool had run.
-                tool_ran = any(_msg_field(m, 'role') == 'function' or _msg_field(m, 'function_call')
-                               for resp in all_resps for m in (resp if isinstance(resp, list) else [resp]))
+                tool_ran = preflight_ran or any(
+                    _msg_field(m, 'role') == 'function' or _msg_field(m, 'function_call')
+                    for resp in all_resps for m in (resp if isinstance(resp, list) else [resp]))
                 missing = detect_unexecuted_tool(final_text, tool_ran)
                 must_regenerate = False
                 offered_lookup = False
@@ -770,6 +840,12 @@ async def run_agent_task(task: str, event_q=None, history=None) -> str:
                     # branch below hands the results back for a real answer.
                     logger.warning("answer promised a lookup that never ran — executing it")
                     missing, offered_lookup = "web_search", True
+                if missing is None and fabricates_weather_without_tool(task, final_text, tool_ran):
+                    # Unlike the clock there is no deterministic rewrite to splice: the fix
+                    # is to fetch the real forecast and let the model answer again with it
+                    # in context (the get_weather branch below does exactly that).
+                    logger.warning("answer states weather that no tool verified — forcing the lookup")
+                    missing = "get_weather"
                 if missing is None and fabricates_time_without_tool(task, final_text, tool_ran):
                     # Splicing the true clock into "現在是下午 3 點 25 分" would leave the
                     # wrong claim standing next to the right one, so let the model rewrite
@@ -822,7 +898,7 @@ async def run_agent_task(task: str, event_q=None, history=None) -> str:
                     final_text = repaired
                     _emit({"type": "llm_delta", "text": "", "reset": True})
                     _reset_guard(_gt)
-                return final_text
+                return _answer_or_fallback(final_text)
             # Fallback to memory (also filter empty)
             if hasattr(agent, 'memory') and agent.memory:
                 # NB: must NOT be named `hist` — that would make `hist` local to _run
