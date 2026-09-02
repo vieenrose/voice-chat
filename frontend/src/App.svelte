@@ -2,7 +2,7 @@
   import { onDestroy } from 'svelte'
   import { RealtimeClient } from './lib/realtime.js'
   import { MicCapture, Playback } from './lib/audio.js'
-  import { toTW, zhtwReady } from './lib/zhtw.js'
+  import { toTW, toTWP, zhtwReady } from './lib/zhtw.js'
   import { serverUrl as buildUrl } from './lib/endpoints.js'
 
   // What the pipeline card shows. The server leaves session.model null, so the
@@ -204,10 +204,13 @@
     if (!text) return
     const last = turns[turns.length - 1]
     if (last && last.role === 'assistant' && !last.done) {
-      last.text += text
+      // Convert the whole accumulated reply, not each chunk: twp substitutes
+      // multi-character phrases, which a chunk boundary can split.
+      last.raw = (last.raw || '') + text
+      last.text = toTWP(last.raw)
       turns = turns
     } else {
-      turns = [...turns, { role: 'assistant', text, done: false }]
+      turns = [...turns, { role: 'assistant', raw: text, text: toTWP(text), done: false }]
     }
     scroll()
   }
@@ -434,10 +437,9 @@
   zhtwReady.then(() => {
     let changed = false
     for (const t of turns) {
-      if (t.raw) {
-        const conv = toTW(t.raw)
-        if (conv !== t.text) { t.text = conv; changed = true }
-      }
+      if (!t.raw) continue
+      const conv = t.role === 'assistant' ? toTWP(t.raw) : toTW(t.raw)
+      if (conv !== t.text) { t.text = conv; changed = true }
     }
     if (changed) turns = turns
   })

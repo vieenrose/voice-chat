@@ -296,13 +296,22 @@ It implements the protocol details under [API](#api), plus three of its own:
 - **Audio rates are pinned.** Capture pins an `AudioContext` to 16 kHz so the browser does the
   resampling from whatever the device offers; playback requests 24 kHz, the rate Qwen3-TTS
   produces, which the server would otherwise downsample.
-- **The transcript is converted for display.** Paraformer emits Simplified, so `lib/zhtw.js`
-  applies OpenCC S2T at the **character** level (`to: 'tw'`), because a transcript must stay
-  invariant at the phonetic level — it is a record of what was said, and S2T character mappings
-  are homophonous (臺北/台北 both *tái-běi*). The `twp` preset is avoided: it substitutes
-  regional vocabulary and so changes pronunciation, turning 用鼠标点击 into 用滑鼠點選
-  (*shǔbiāo diǎnjī* → *huáshǔ diǎnxuǎn*), a sentence the user never said. The dictionaries load
-  lazily, so the main bundle stays ~53 kB and nothing on the audio path waits for them.
+- **Both sides are converted for display, by different rules.** The model still answers in
+  Simplified now and then despite the system prompt, and Paraformer always transcribes in it, so
+  `lib/zhtw.js` runs OpenCC on each — but not the same preset:
+
+  | | preset | why |
+  |---|---|---|
+  | user transcript | `tw` — characters only | a record of what was *said*, so it must stay invariant at the phonetic level; S2T character mappings are homophonous (臺北/台北 both *tái-běi*) |
+  | assistant reply | `twp` — characters + vocabulary | the assistant's own words, so Taiwanese usage (軟件→軟體, 鼠标点击→滑鼠點選) is a correction, not a falsification |
+
+  Applying `twp` to the transcript would put words in it the user never said —
+  用鼠标点击 becomes 用滑鼠點選 (*shǔbiāo diǎnjī* → *huáshǔ diǎnxuǎn*). The reply is converted
+  whole rather than per chunk, since `twp` substitutes multi-character phrases a chunk boundary
+  can split, and the raw text of both is kept in the debug export. Note the audio was synthesized
+  from what the model produced, so a converted phrase can differ in wording from what was spoken.
+  The dictionaries load lazily, so the main bundle stays ~62 kB and nothing on the audio path
+  waits for them.
 
 **⬇ 記錄** in the header exports the session as one `.json`: the protocol trace both ways, the
 transcript (with the raw STT text alongside the converted form), client-side events such as
