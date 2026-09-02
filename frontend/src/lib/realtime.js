@@ -9,7 +9,11 @@
  * Callbacks rather than an event emitter, because there is exactly one consumer.
  */
 
-const DEFAULT_URL = `ws://${location.hostname}:8765/v1/realtime`
+// Same host the page came from, so reaching the UI over Tailscale/LAN reaches the
+// server too -- provided it is bound past loopback (--ws_host 0.0.0.0). wss when the
+// page is https, because a browser blocks ws:// from an https page as mixed content.
+const defaultUrl = () =>
+  `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.hostname}:8765/v1/realtime`
 
 export class RealtimeClient {
   constructor(handlers = {}) {
@@ -18,7 +22,7 @@ export class RealtimeClient {
     this.ready = false
   }
 
-  connect(url = DEFAULT_URL, instructions = '') {
+  connect(url = defaultUrl(), instructions = '') {
     return new Promise((resolve, reject) => {
       let ws
       try {

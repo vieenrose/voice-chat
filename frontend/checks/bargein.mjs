@@ -2,7 +2,7 @@
 // speak over it, and check the UI would both stop receiving and stop playing.
 //
 //   node checks/bargein.mjs     (needs the pipeline up on :8765)
-globalThis.location = { hostname: '127.0.0.1' }
+globalThis.location = { hostname: process.env.RT_HOST || '127.0.0.1' }
 const { RealtimeClient } = await import(new URL('../src/lib/realtime.js', import.meta.url))
 import fs from 'node:fs'
 const wav = fs.readFileSync(new URL('../../asr_example.wav', import.meta.url))

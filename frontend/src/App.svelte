@@ -7,7 +7,9 @@
     '你是一個親切的語音助理。一律使用繁體中文（台灣用語）回答，' +
     '無論問題用什麼語言提出；只有專有名詞或無法翻譯的術語才保留英文。回答要口語、簡潔。'
 
-  let url = $state(`ws://${location.hostname}:8765/v1/realtime`)
+  const defaultUrl = () =>
+    `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.hostname}:8765/v1/realtime`
+  let url = $state(defaultUrl())
   let connected = $state(false)
   let connecting = $state(false)
   let listening = $state(false)
@@ -112,7 +114,14 @@
       await client.connect(url, INSTRUCTIONS)
       connected = true
     } catch (e) {
-      error = `連線失敗：${e.message}。伺服器是否在執行？(python3 -m s2s.serve --mode realtime)`
+      // The usual cause is not "not running" but "bound to loopback": the page is
+      // reachable over Tailscale/LAN while the server only listens on 127.0.0.1.
+      const remote = location.hostname !== 'localhost' && location.hostname !== '127.0.0.1'
+      error =
+        `連線失敗：${e.message}。` +
+        (remote
+          ? '伺服器可能只綁定在 127.0.0.1，從其他機器連不到。請以 --ws_host 0.0.0.0 啟動。'
+          : '伺服器是否在執行？python3 -m s2s.serve --mode realtime --ws_host 0.0.0.0')
     } finally {
       connecting = false
     }

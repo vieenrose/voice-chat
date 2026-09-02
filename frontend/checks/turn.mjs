@@ -2,7 +2,7 @@
 // UI's event handling is what gets tested and not merely the server's.
 //
 //   node checks/turn.mjs        (needs the pipeline up on :8765)
-globalThis.location = { hostname: '127.0.0.1' }
+globalThis.location = { hostname: process.env.RT_HOST || '127.0.0.1' }
 const { RealtimeClient } = await import(new URL('../src/lib/realtime.js', import.meta.url))
 
 import fs from 'node:fs'
