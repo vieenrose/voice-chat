@@ -89,22 +89,6 @@ MODEL_REGISTRY: dict[str, dict] = {
     # GGML_TYPE_Q2_0 id with a different block layout, so mainline refuses the file. Note
     # the HF repo also ships a plain *-Q2_0.gguf which is their LEGACY group-128 layout
     # and fails even on the fork; PQ2_0 is the current one.
-    # Bonsai 27B, binary (1-bit) weights in Q1_0. 26.9B parameters in 3.80 GB — half the
-    # size of the ternary build of the same model, and it fits alongside TTS and STT with
-    # real headroom (4.8 GB of VRAM against the ternary's 7.8, which left about 1 GB).
-    #
-    # Measured, so the trade is explicit: 36.7 tok/s and 1.1653 bits/byte, against the
-    # ternary's 34.9 and 1.0917. Halving the weights bought ~5% throughput rather than the
-    # ~2x a bandwidth-bound decoder would give, so the 1-bit dequantization kernels are the
-    # bottleneck, and the extra compression is paid for in quality. It is the largest model
-    # here by a wide margin; pick it when answer quality matters more than first-audio
-    # latency, which on the four UI prompts ran 9.9-15.7 s for the ternary build.
-    "bonsai-27b-1bit": {
-        "label": "Bonsai 27B · 1-bit",
-        "path": os.getenv("LLM_PATH_BONSAI_27B", "/home/user/llms/bonsai/Bonsai-27B-Q1_0.gguf"),
-        "alias": "bonsai-27b",
-        "bin": os.getenv("LLAMA_SERVER_BIN_PRISM", "/home/user/prism-llama/build/bin/llama-server"),
-    },
     "bonsai-8b-ternary": {
         "label": "Bonsai 8B · ternary",
         "path": os.getenv("LLM_PATH_BONSAI_8B", "/home/user/llms/bonsai/Ternary-Bonsai-8B-PQ2_0.gguf"),
