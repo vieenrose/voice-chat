@@ -77,9 +77,13 @@ MODEL_REGISTRY: dict[str, dict] = {
         "mtp": True,
     },
     # Bonsai 8B, ternary (1.58-bit) weights in Prism's PQ2_0 format. 8.2B parameters in
-    # 2.18 GB — and measured on the same zh corpus as the entries above, PPL 16.518
-    # against the 2B's 16.738 and the 4B's 13.027. So a ternary 8B lands roughly where a
-    # 2B Q8 does: the compression is real and so is the quality cost per parameter.
+    # 2.18 GB, which is less than the 2B at Q8 — real compression.
+    #
+    # Its PPL of 16.518 looks like it beats the 2B's 16.738, but perplexity is per-token
+    # and Bonsai's tokenizer is not Qwen's: it turns the eval corpus into 131k tokens
+    # against Qwen's 117k, so it is scoring an easier target. In bits per byte, which is
+    # tokenizer-independent, the 2B is clearly ahead (0.9652 vs 1.0786). Ternary pays for
+    # its compression in quality; it does not come out ahead.
     #
     # Needs Prism's llama.cpp fork ("bin" below). Their Q2_0 reuses upstream's
     # GGML_TYPE_Q2_0 id with a different block layout, so mainline refuses the file. Note

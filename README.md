@@ -35,12 +35,18 @@ Model card or `POST /api/model`. Only one is loaded at a time — VRAM on a 12 G
 with embedding + TTS + STT resident. **Bare-metal only**: the compose setup runs the LLM in a
 fixed sibling container.
 
-**Bonsai 8B is ternary (1.58-bit)** — 8.2 B parameters in a 2.18 GB file. Measured on the same
-zh corpus as the entries above it scores PPL 16.518, against the 2B Q8's 16.738 and the 4B's
-13.027, at 118 tok/s and 3/4 on the UI prompts with all four tools routed correctly. So a
-ternary 8B lands roughly where a 2 B Q8 does: the compression is real, and so is the quality
-cost per parameter. The file size also oversells the footprint — 2.18 GB of weights still took
-7.1 GB of VRAM at 16 k context.
+**Bonsai 8B is ternary (1.58-bit)** — 8.2 B parameters in a 2.18 GB file, 118 tok/s, 3/4 on the
+UI prompts with all four tools routed correctly. Its raw perplexity of 16.518 appears to beat
+the 2B Q8's 16.738, but that comparison is invalid: Bonsai uses a different tokenizer and turns
+this corpus into 131 k tokens against Qwen's 117 k. In bits per byte the 2B is clearly ahead
+(0.9652 vs 1.0786). So ternary buys real compression — 8 B parameters in less space than a 2 B
+at Q8 — and pays for it in quality, rather than coming out ahead. The file size also oversells
+the footprint: 2.18 GB of weights still took 7.1 GB of VRAM at 16 k context.
+
+Bonsai 27B was measured and not registered. Its raw PPL of 24.214 looks disastrous next to the
+8B's 16.518 and is mostly a tokenizer artifact — in bits per byte the two are near-tied (1.0917
+vs 1.0786). It is still the wrong fit here: 34.9 tok/s, 7.8 GB of VRAM, and an appetite for
+thinking tokens that a voice turn cannot afford.
 
 It needs Prism's llama.cpp fork, which is why registry entries may carry a `"bin"` of their own:
 their `Q2_0` reuses upstream's `GGML_TYPE_Q2_0` type id with a different block layout, so
@@ -155,7 +161,13 @@ above is a spread. Fix `LLM_AGENT_SEED` to compare builds.
 **Choosing the quantization.** Ranked by perplexity, not by the UI matrix (see below for why):
 
 Perplexity over 194 kB of non-repeating zh Wikipedia prose — a deterministic measure of how far
-each quantization moved the model, run with `llama-perplexity -c 2048`:
+each quantization moved the model, run with `llama-perplexity -c 2048`.
+
+**Compare perplexity only across models that share a tokenizer.** It is a per-token score, so a
+model whose tokenizer packs more text into each token is predicting a harder target and scores
+worse without being worse. Bonsai 8B turns this corpus into 131 k tokens where the Qwen models
+produce 117 k, which is enough to invert a ranking on its own. For cross-family comparisons use
+**bits per byte** — `tokens x ln(PPL) / (ln 2 x corpus_bytes)` — which is tokenizer-independent.
 
 | Build | 2B PPL | 4B PPL | 2B tok/s |
 |---|---|---|---|
@@ -163,6 +175,16 @@ each quantization moved the model, run with `llama-perplexity -c 2048`:
 | UD-Q4_K_XL | 17.080 | 13.173 | 168 |
 | Q4_K_M | 17.091 | — | 172 |
 | IQ4_XS | — | — | 175 |
+
+Those four share a tokenizer, so their perplexities rank directly. Across families, in bits per
+byte (lower is better):
+
+| Model | bits/byte | PPL | file |
+|---|---|---|---|
+| Qwen3.5 4B Q8_K_XL | **0.8793** | 13.027 | 6.07 GB |
+| Qwen3.5 2B Q8_K_XL | 0.9652 | 16.738 | 2.89 GB |
+| Bonsai 8B ternary | 1.0786 | 16.518 | 2.18 GB |
+| Bonsai 27B ternary | 1.0917 | 24.214 | 7.17 GB |
 
 Q8 is the most faithful at both sizes (~2 % lower), and UD-Q4_K_XL edges plain Q4_K_M — which
 is what Unsloth Dynamic claims: spend the extra bits on the quantization-sensitive layers
