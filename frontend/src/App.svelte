@@ -30,30 +30,15 @@
 
   let level = $state(0)            // mic peak, for the meter
   let vram = $state(null)          // {used_mib, total_mib, device} from the server
-  let llmCfg = $state(null)        // {provider, model, key_set, key_hint, providers}
-  let provider = $state('local')
-  let apiKey = $state('')
-  let cfgBusy = $state(false)
-  let cfgMsg = $state('')
+  let llmCfg = $state(null)        // {model, api_base} -- read-only, for the card
 
-  // What the pipeline card shows. The LLM row is derived from the live config, not
-  // hardcoded: the model is chosen at runtime now, and a fixed string went stale the
-  // moment the provider changed (it still read "Qwen3.5 9B · Q4_K_M · MTP" while the
-  // turn was being served by OpenRouter). The other rows are fixed stages of the
-  // framework's pipeline; keep them in step with s2s/serve.py's CLI.
   const PIPELINE = $derived([
     ['VAD', 'Silero v5 + Smart Turn v3.2'],
     ['STT', 'Paraformer（FunASR）'],
-    ['LLM', llmCfg
-      ? `${llmCfg.providers?.[llmCfg.provider]?.label ?? llmCfg.provider} · ${llmCfg.model}`
-      : '尚未連線'],
+    ['LLM', llmCfg ? llmCfg.model : '尚未連線'],
     ['Agent', 'Qwen-Agent · 原生工具呼叫（3 工具）'],
     ['TTS', 'Qwen3-TTS 12Hz · GGML 24k'],
   ])
-  let models = $state([])          // provider catalogue
-  let modelId = $state('')
-  let modelFilter = $state('')
-  let freeOnly = $state(false)
   let textInput = $state('')
   // Light by default. index.html carries class="light" so the pre-mount paint
   // matches and the page does not flash dark before Svelte takes over.
@@ -81,98 +66,18 @@
     try {
       const r = await fetch(target, { cache: 'no-store' })
       llmCfg = await r.json()
-      provider = llmCfg.provider
-      modelId = llmCfg.model
-      if (llmCfg.providers?.[provider]?.needs_key) await loadModels(provider)
+
+
     } catch {
       llmCfg = null
     }
   }
 
-  let modelsError = $state('')
 
-  let modelsLoading = false
 
-  async function loadModels(name) {
-    const target = serverUrl(`/v1/llm-models?provider=${encodeURIComponent(name)}`)
-    if (!target || modelsLoading) return
-    modelsLoading = true
-    models = []
-    modelsError = ''
-    try {
-      const r = await fetch(target, { cache: 'no-store' })
-      const d = await r.json().catch(() => ({}))
-      if (!r.ok) {
-        modelsError = d.detail || `HTTP ${r.status}`
-      } else {
-        models = d.models || []
-        if (!models.length) modelsError = '供應者沒有回傳任何模型'
-      }
-    } catch (e) {
-      modelsError = e.message
-    } finally {
-      modelsLoading = false
-    }
-  }
 
-  // Only providers with a catalogue offer a model list; 'local' takes its model
-  // from the server's own registry.
-  // Deliberately NOT an $effect. An effect that read models.length and called a
-  // loader which sets models = [] re-triggered itself: 3565 requests to
-  // /v1/llm-models in one page view, with the list never settling, which is what
-  // rendered 模型（0/0）. Loading is driven by the two events that can change it --
-  // the config arriving, and the user picking a provider.
-  async function selectProvider(name) {
-    provider = name
-    // A model id belongs to the provider it came from; carrying one across a switch
-    // would post e.g. "anthropic/claude-opus-5" to the local server.
-    modelId = name === llmCfg?.provider ? (llmCfg?.model ?? '') : ''
-    models = []
-    modelsError = ''
-    if (llmCfg?.providers?.[name]?.needs_key) await loadModels(name)
-  }
 
-  const shownModels = $derived(
-    models
-      .filter((m) => !freeOnly || m.free)
-      .filter((m) => {
-        const q = modelFilter.trim().toLowerCase()
-        return !q || m.id.toLowerCase().includes(q) || m.name.toLowerCase().includes(q)
-      })
-      .slice(0, 300),
-  )
 
-  async function applyLlmCfg() {
-    const target = serverUrl('/v1/llm-config')
-    if (!target) return
-    cfgBusy = true
-    cfgMsg = ''
-    try {
-      const r = await fetch(target, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider, api_key: apiKey, model: modelId }),
-      })
-      const d = await r.json()
-      if (!r.ok) {
-        cfgMsg = d.detail || `HTTP ${r.status}`
-      } else {
-        llmCfg = d
-        cfgMsg = `已切換：${d.model}`
-        // Remembered per browser so it need not be retyped. It is the user's own
-        // key on their own machine; it is never sent anywhere but this server.
-        if (apiKey) {
-          try { localStorage.setItem('openrouter_key', apiKey) } catch { /* private mode */ }
-        }
-        apiKey = ''
-        note('llm.provider_changed', { provider: d.provider, model: d.model })
-      }
-    } catch (e) {
-      cfgMsg = `切換失敗：${e.message}`
-    } finally {
-      cfgBusy = false
-    }
-  }
 
   async function pollVram() {
     const target = vramUrl()
@@ -285,9 +190,6 @@
       await client.connect(url, INSTRUCTIONS)
       connected = true
       loadLlmCfg()
-      try {
-        apiKey = apiKey || localStorage.getItem('openrouter_key') || ''
-      } catch { /* private mode */ }
     } catch (e) {
       // The usual cause is not "not running" but "bound to loopback": the page is
       // reachable over Tailscale/LAN while the server only listens on 127.0.0.1.
@@ -524,60 +426,6 @@
           <div class="lat"><b>{firstAudioMs || '—'}</b><span>首次出聲 ms</span></div>
           <div class="lat"><b>{audioSeconds.toFixed(1)}</b><span>已播秒數</span></div>
         </div>
-      </div>
-
-      <div class="card">
-        <h3>語言模型</h3>
-        {#if llmCfg}
-          <div style="font-size:12px; opacity:0.85; margin-bottom:8px">
-            目前：<b>{llmCfg.providers[llmCfg.provider]?.label ?? llmCfg.provider}</b>
-            · {llmCfg.model}
-            {#if llmCfg.key_set}<span class="subtle"> · 金鑰 {llmCfg.key_hint}</span>{/if}
-          </div>
-          <label for="llm-provider" class="subtle" style="display:block;margin-bottom:4px">供應者</label>
-          <select id="llm-provider" class="input" style="margin-bottom:8px" value={provider}
-                  onchange={(e) => selectProvider(e.currentTarget.value)}>
-            {#each Object.entries(llmCfg.providers) as [name, p]}
-              <option value={name}>{p.label}</option>
-            {/each}
-          </select>
-          {#if llmCfg.providers[provider]?.needs_key}
-            <label for="llm-key" class="subtle" style="display:block;margin-bottom:4px">
-              API 金鑰（openrouter.ai）
-            </label>
-            <input id="llm-key" class="input" type="password" autocomplete="off"
-                   placeholder={llmCfg.key_set ? '已設定，可留空以保留' : 'sk-or-v1-…'}
-                   bind:value={apiKey} style="margin-bottom:8px" />
-
-            <label for="llm-model" class="subtle" style="display:block;margin-bottom:4px">
-              模型（{shownModels.length}/{models.length}）
-            </label>
-            <input class="input" placeholder="搜尋模型…" bind:value={modelFilter}
-                   style="margin-bottom:6px" />
-            {#if modelsError}
-              <div class="status-banner status-err" style="margin:0 0 6px">⚠️ 模型清單載入失敗：{modelsError}</div>
-            {/if}
-            <select id="llm-model" class="input" bind:value={modelId} style="margin-bottom:6px">
-              <option value="">預設（openrouter/free 自動路由）</option>
-              <option value="openrouter/free">openrouter/free（自動路由）</option>
-              {#each shownModels as m}
-                <option value={m.id}>{m.free ? '🆓 ' : ''}{m.id}</option>
-              {/each}
-            </select>
-            <div style="display:flex; gap:12px; font-size:11px; margin-bottom:8px; align-items:center">
-              <label><input type="checkbox" bind:checked={freeOnly} /> 只顯示免費</label>
-              <span class="subtle">清單只含支援工具呼叫的文字模型</span>
-            </div>
-          {/if}
-          <button class="primary" onclick={applyLlmCfg} disabled={cfgBusy}
-                  style="width:100%">{cfgBusy ? '切換中…' : '套用'}</button>
-          {#if cfgMsg}<div class="status-banner status-speaking" style="margin-top:8px">{cfgMsg}</div>{/if}
-          <div class="subtle" style="font-size:11px; margin-top:8px">
-            金鑰只送到這台伺服器，不寫入磁碟，也不會回傳。切換到遠端供應者表示語音內容會離開本機。
-          </div>
-        {:else}
-          <div class="subtle" style="font-size:12px">連線後可切換模型供應者。</div>
-        {/if}
       </div>
 
       <div class="card">

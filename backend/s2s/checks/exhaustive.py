@@ -38,16 +38,6 @@ results: list[tuple[str, str, bool, str]] = []
 INITIAL: dict = {}
 
 
-def restore_provider(key: str | None) -> None:
-    """Put the provider back to whatever was configured before the suite ran."""
-    if not INITIAL:
-        return
-    body = {"provider": INITIAL.get("provider", "local")}
-    if body["provider"] != "local":
-        body["api_key"] = key or ""
-        body["model"] = INITIAL.get("model") or ""
-    http("/v1/llm-config", "POST", body)
-
 
 def check(group: str, name: str, ok: bool, detail: str = "") -> bool:
     results.append((group, name, bool(ok), detail))
@@ -87,77 +77,15 @@ def test_routes() -> None:
               "used must include other processes, e.g. llama-server")
 
     st, d = http("/v1/llm-config")
-    ok = st == 200 and {"provider", "model", "key_set", "providers"} <= set(d or {})
-    check("routes", "GET /v1/llm-config", ok, f"provider={d.get('provider')} model={d.get('model')}")
+    ok = st == 200 and {"model", "api_base"} <= set(d or {})
+    check("routes", "GET /v1/llm-config", ok, f"model={d.get('model')} base={d.get('api_base')}")
     if ok:
-        check("routes", "openrouter is offered first",
-              list(d["providers"])[0] == "openrouter", str(list(d["providers"])))
-        check("routes", "the key is never returned",
-              "api_key" not in json.dumps(d) and not re.search(r"sk-or-v1-[A-Za-z0-9]{20}", json.dumps(d)),
-              "only a masked hint may appear")
+        check("routes", "the endpoint is local",
+              "127.0.0.1" in str(d.get("api_base")) or "localhost" in str(d.get("api_base")),
+              str(d.get("api_base")))
 
 
-def test_catalogue() -> None:
-    print("\n[catalogue]")
-    st, d = http("/v1/llm-models?provider=openrouter", timeout=60)
-    ok = st == 200 and isinstance(d.get("models"), list) and d["count"] > 50
-    check("catalogue", "GET /v1/llm-models", ok, f"{d.get('count')} models" if ok else str(d)[:70])
-    if not ok:
-        return
-    ms = d["models"]
-    check("catalogue", "every model is tool-capable", all(m["tools"] for m in ms),
-          "a model that cannot call tools would fabricate")
-    check("catalogue", "free models sort first",
-          [m["free"] for m in ms] == sorted((m["free"] for m in ms), reverse=True))
-    check("catalogue", "some free models exist", sum(1 for m in ms if m["free"]) > 0,
-          f"{sum(1 for m in ms if m['free'])} free")
-    check("catalogue", "strong multimodal-input models are kept",
-          any("claude-opus" in m["id"] for m in ms),
-          "text-ONLY input would have dropped these")
-    check("catalogue", "fields are complete",
-          all({"id", "name", "context", "tools", "free"} <= set(m) for m in ms))
-    st, d = http("/v1/llm-models?provider=local")
-    check("catalogue", "a provider with no catalogue is refused", st == 400, str(d)[:60])
 
-
-def test_config_validation(key: str | None) -> None:
-    print("\n[config validation]")
-    st, d = http("/v1/llm-config", "POST", {"provider": "http://evil.example/v1"})
-    check("validation", "an arbitrary base URL is refused", st == 400,
-          "providers are a fixed map, so a caller cannot redirect the key")
-    st, d = http("/v1/llm-config", "POST", {"provider": "openrouter"})
-    check("validation", "a key-needing provider without a key is refused", st == 400, str(d)[:70])
-    st, d = http("/v1/llm-config", "POST", {"provider": "nope"})
-    check("validation", "an unknown provider is refused", st == 400)
-    if key:
-        st, d = http("/v1/llm-config", "POST", {"provider": "openrouter", "api_key": key})
-        check("validation", "no model given defaults to the free router",
-              st == 200 and d.get("model") == "openrouter/free", str(d.get("model")))
-        st, d = http("/v1/llm-config", "POST",
-                     {"provider": "openrouter", "api_key": key, "model": "openrouter/free"})
-        check("validation", "the key is stored masked, not echoed",
-              st == 200 and d.get("key_set") is True and d.get("key_hint", "").endswith(key[-4:])
-              and key not in json.dumps(d))
-
-
-def test_switching(key: str | None) -> None:
-    print("\n[provider switching]")
-    if not key:
-        check("switching", "openrouter round-trip", False, "no key available")
-        return
-    st, d = http("/v1/llm-config", "POST", {"provider": "local"})
-    check("switching", "switch to local", st == 200 and d.get("provider") == "local", str(d.get("model")))
-    st, d = http("/v1/llm-config", "POST", {"provider": "openrouter", "api_key": key})
-    check("switching", "switch back to openrouter",
-          st == 200 and d.get("provider") == "openrouter" and d.get("model") == "openrouter/free")
-    st, d = http("/v1/llm-config", "POST",
-                 {"provider": "openrouter", "api_key": key, "model": "anthropic/claude-opus-4.5"})
-    check("switching", "an explicit model is accepted",
-          st == 200 and d.get("model") == "anthropic/claude-opus-4.5")
-    # Deliberately does NOT leave the provider changed: the spoken turns run after
-    # this, and an earlier version of this file flipped them onto OpenRouter no matter
-    # what the operator had selected -- so a "local" run was silently not local.
-    restore_provider(key)
 
 
 def wait_for_slot(timeout: float = 45.0) -> bool:
@@ -368,19 +296,14 @@ def main() -> int:
 
     st, cfg = http("/v1/llm-config")
     if st == 200:
-        INITIAL.update({"provider": cfg.get("provider"), "model": cfg.get("model")})
-        print(f"provider under test: {INITIAL['provider']} / {INITIAL['model']}")
+        print(f"model under test: {cfg.get('model')} @ {cfg.get('api_base')}")
 
     test_routes()
-    test_catalogue()
-    test_config_validation(key)
-    test_switching(key)
     test_error_messages()
     if not args.quick:
         asyncio.run(test_turns())
         asyncio.run(test_bargein())
 
-    restore_provider(key)   # leave the deployment as it was found
     total = len(results)
     bad = [r for r in results if not r[2]]
     print("\n" + "=" * 66)
