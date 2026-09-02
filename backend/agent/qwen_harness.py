@@ -386,8 +386,13 @@ def _make_agent(function_list=None):
     # manages may override it. Without this check, pointing LLM_API_BASE at a hosted
     # provider still sent the local registry's alias (e.g. "qwen3.5-9b") as the model
     # field, which the provider rejects as unknown.
+    # An explicit LLM_MODEL_ID wins. llm_manager's alias is only right for a server
+    # it spawned itself; when the endpoint is an external engine on the same host --
+    # FreeToken serving Qwen3.6-35B-A3B, say -- adopting its alias would send the
+    # name of a model that is not loaded, or has been deleted.
+    _explicit = bool(os.getenv("LLM_MODEL_ID"))
     _local = bool(re.search(r"//(127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0)\b", _base))
-    if _local:
+    if _local and not _explicit:
         # Prefer the live alias llm_manager actually has loaded (kept in sync across
         # POST /api/model switches) over a static env var, so a freshly-reset agent
         # picks up whichever model is currently running.
