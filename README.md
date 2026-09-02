@@ -115,6 +115,42 @@ fabricate without it. What it costs on the 9B:
 | weather | 6.49 s | 8.19 s |
 | search | 8.55 s | 11.23 s |
 
+### Native audio input, and why STT stays
+
+Gemma 4 can take speech directly, and the framework supports dropping STT entirely
+(`--stt none`, which it enforces alongside `--llm_backend chat-completions`). HF ship a worked
+example of exactly this with the 12B. It was measured here on E4B rather than assumed, and it
+works: llama.cpp carries dedicated Gemma-4 audio preprocessors (`gemma4a` for the E2B/E4B
+encoder, `gemma4ua` for the 12B's encoder-free path), the projector loads from `mmproj-F16.gguf`,
+and on the zh test clip:
+
+| | |
+|---|---|
+| ASR accuracy | **exact** — `欢迎大家来体验达摩院推出的语音识别模型。` |
+| ASR latency, thinking off | **0.28 s** for 5.5 s of audio |
+| ASR latency, thinking on | 3.11 s (732 chars of deliberation) |
+| Tool calls with audio present | **work** — `get_weather` at 0.32 s, against 0.21 s text-only |
+| Audio input cost | ~35 prompt tokens per second of speech: 191 for 5.5 s, against 27 for the same words as text |
+
+So it is viable, and it would remove a real failure mode — in an exported session, X-ASR heard
+"huggingface" as "huninface" and the model then answered about Huawei. Audio input has no
+transcription step to corrupt.
+
+STT stays anyway, for four reasons:
+
+- **Audio is capped at 30 seconds** per Google's model card. Paraformer has no such limit.
+- **~7× the input tokens.** Prefill grows with every turn of retained audio history, and this is
+  a conversation, not one shot.
+- **There is no transcript.** The UI bubble, the OpenCC conversion and the debug export all key
+  off STT output; without it the model must be asked to transcribe *as well as* answer.
+- **Google's own audio evaluation for the 12B excludes Chinese** (the footnote on its CoVoST and
+  FLEURS numbers). E4B's figures — FLEURS 0.08, CoVoST 35.54 — carry no such exclusion, so the
+  smaller model is the better-evidenced choice for zh, which is the opposite of the usual order.
+
+Paraformer costs 0.03–0.14 s and hands back text the whole pipeline is built on, so the trade is
+not currently worth taking. `s2s/checks/` has no coverage for the audio path; anyone reviving it
+should start there.
+
 ### Barge-in
 
 The framework's `CancelScope` handles it structurally rather than per-call-site: a generation
