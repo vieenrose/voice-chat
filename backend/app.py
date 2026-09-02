@@ -534,18 +534,28 @@ async def ws_chat(websocket: WebSocket, session_id: str = Query(default="")):
             voice_task = pipeline._voice_response_tasks.get(session_id)
             if voice_task is not None and not voice_task.done():
                 tasks.append(voice_task)
-            if not tasks:
-                return
-            logger.info(f"barge_in ({reason}): cancelling {len(tasks)} in-flight task(s)")
-            barge_in_event.set()
-            for task in tasks:
-                task.cancel()
-            active_tts_tasks.clear()
-            _log_unexpected_cancel_results(await asyncio.gather(*tasks, return_exceptions=True))
-            pipeline._voice_response_tasks.pop(session_id, None)
-            barge_in_event.clear()
+            if tasks:
+                logger.info(f"barge_in ({reason}): cancelling {len(tasks)} in-flight task(s)")
+                barge_in_event.set()
+                for task in tasks:
+                    task.cancel()
+                active_tts_tasks.clear()
+                _log_unexpected_cancel_results(await asyncio.gather(*tasks, return_exceptions=True))
+                pipeline._voice_response_tasks.pop(session_id, None)
+                barge_in_event.clear()
+        # Acknowledge even when there was nothing server-side left to cancel. Generation
+        # finishing is not the same as playback finishing: the client can still be several
+        # seconds into audio it has already buffered, and this ack is what makes it run
+        # stopPlayback(). Returning early on `not tasks` meant pressing 中斷回覆 late in a
+        # long reply did nothing at all.
+        #
+        # The turn_id says WHICH turn was interrupted, so the client blacklists that one
+        # rather than falling back to whatever activeTurnId happens to hold.
         try:
-            await websocket.send_text(json.dumps({"type": "barge_in", "reason": reason}))
+            await websocket.send_text(json.dumps({
+                "type": "barge_in", "reason": reason,
+                "turn_id": pipeline._turn_counters.get(session_id),
+            }))
         except Exception:
             pass
 

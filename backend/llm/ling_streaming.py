@@ -812,6 +812,17 @@ class LingStreaming:
             # showed up on every model and quantization tested and was read as a
             # small-model repetition artifact; it was this.
             streamed_cmp = " ".join(streamed.split())
+            # If everything in the authoritative answer has already gone out, replay
+            # nothing. The prefix walk below only handles final_text *extending* what
+            # streamed; it cannot handle final_text being a filtered SUBSET of it, which
+            # is now the common case — _answer_or_fallback drops reasoning sentences, so
+            # a stream that opened with deliberation leaves final_text starting midway
+            # through what was already said. The prefix then collapses to ~0 and the whole
+            # answer is re-emitted: the very duplication the prefix walk exists to prevent.
+            _fin_n, _str_n = _norm_for_echo(final_text), _norm_for_echo(streamed_cmp)
+            if _fin_n and _fin_n in _str_n:
+                yield {"type": "llm_done", "text": final_text}
+                return
             common = 0
             for a, b in zip(streamed_cmp, final_text, strict=False):
                 if a != b:

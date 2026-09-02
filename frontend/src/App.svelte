@@ -184,9 +184,15 @@
         const delta = toTraditional(msg.text || msg.delta || '');
         if(!delta) break;
         reasoningStreaming += delta;
-        // Find the most recent reasoning bubble (may not be the last entry if tools interleaved)
+        // Find this turn's reasoning bubble — it may not be the last entry, since tool
+        // messages interleave. Stop at the most recent user message: a reasoning bubble
+        // older than that belongs to a previous turn, and appending to it piled every
+        // later turn's thinking into the first question's bubble.
         let rIdx = -1;
-        for(let i=chatHistory.length-1; i>=0; i--) if(chatHistory[i].role==='reasoning'){ rIdx=i; break; }
+        for(let i=chatHistory.length-1; i>=0; i--){
+          if(chatHistory[i].role==='user') break;
+          if(chatHistory[i].role==='reasoning'){ rIdx=i; break; }
+        }
         if(rIdx >= 0){
           // Append only the new delta to the existing bubble to avoid duplicating
           // the cumulative prefix when a new bubble would otherwise be created
