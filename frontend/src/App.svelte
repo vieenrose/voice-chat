@@ -3,6 +3,7 @@
   import { RealtimeClient } from './lib/realtime.js'
   import { MicCapture, Playback } from './lib/audio.js'
   import { toTW, zhtwReady } from './lib/zhtw.js'
+  import { serverUrl as buildUrl } from './lib/endpoints.js'
 
   // What the pipeline card shows. The server leaves session.model null, so the
   // client cannot learn the model from the protocol -- these are declared here, in
@@ -67,25 +68,9 @@
 
   // The Realtime server exposes GET /v1/vram (added in s2s/serve.py). Derive its URL
   // from the endpoint the user is already connected to, so it follows the TLS proxy.
-  function vramUrl() {
-    try {
-      const u = new URL(url.replace(/^ws/, 'http'))
-      u.pathname = '/v1/vram'
-      return u.toString()
-    } catch {
-      return null
-    }
-  }
+  const vramUrl = () => buildUrl(url, '/v1/vram')
 
-  function serverUrl(path) {
-    try {
-      const u = new URL(url.replace(/^ws/, 'http'))
-      u.pathname = path
-      return u.toString()
-    } catch {
-      return null
-    }
-  }
+  const serverUrl = (path) => buildUrl(url, path)
 
   async function loadLlmCfg() {
     const target = serverUrl('/v1/llm-config')
@@ -100,16 +85,24 @@
     }
   }
 
+  let modelsError = $state('')
+
   async function loadModels(name) {
     const target = serverUrl(`/v1/llm-models?provider=${encodeURIComponent(name)}`)
     if (!target) return
     models = []
+    modelsError = ''
     try {
       const r = await fetch(target, { cache: 'no-store' })
-      const d = await r.json()
-      models = r.ok ? d.models || [] : []
-    } catch {
-      models = []
+      const d = await r.json().catch(() => ({}))
+      if (!r.ok) {
+        modelsError = d.detail || `HTTP ${r.status}`
+      } else {
+        models = d.models || []
+        if (!models.length) modelsError = '供應者沒有回傳任何模型'
+      }
+    } catch (e) {
+      modelsError = e.message
     }
   }
 
@@ -550,6 +543,9 @@
             </label>
             <input class="input" placeholder="搜尋模型…" bind:value={modelFilter}
                    style="margin-bottom:6px" />
+            {#if modelsError}
+              <div class="status-banner status-err" style="margin:0 0 6px">⚠️ 模型清單載入失敗：{modelsError}</div>
+            {/if}
             <select id="llm-model" class="input" bind:value={modelId} style="margin-bottom:6px">
               <option value="">預設（openrouter/free 自動路由）</option>
               <option value="openrouter/free">openrouter/free（自動路由）</option>

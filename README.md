@@ -283,7 +283,8 @@ the two already on disk: LLM `/home/user/llms/mtp/Qwen3.5-4B-UD-Q8_K_XL.gguf`, T
 ### The frontend
 
 `frontend/` is a Realtime client and nothing else: `src/lib/realtime.js` (protocol),
-`src/lib/audio.js` (mic capture, playback queue), `src/App.svelte` (UI). It holds no session
+`src/lib/audio.js` (mic capture, playback queue), `src/lib/endpoints.js` (URL building),
+`src/lib/zhtw.js` (transcript conversion), `src/App.svelte` (UI). It holds no session
 state of its own and calls no HTTP API — the server owns turn-taking, so the UI only renders
 what the protocol reports.
 
@@ -476,6 +477,7 @@ cd frontend && node checks/turn.mjs             # a voice turn through the UI's 
 cd frontend && node checks/bargein.mjs
 cd frontend && node checks/log.mjs              # debug export; no server needed
 cd frontend && node checks/zhtw.mjs             # transcript conversion; no server needed
+cd frontend && node checks/endpoints.mjs        # URL building; no server needed
 ```
 
 `s2s/checks/exhaustive.py` covers the parts unit tests cannot: the added HTTP routes and their
