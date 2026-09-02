@@ -29,7 +29,9 @@
 
   let level = $state(0)            // mic peak, for the meter
   let textInput = $state('')
-  let theme = $state('dark')
+  // Light by default. index.html carries class="light" so the pre-mount paint
+  // matches and the page does not flash dark before Svelte takes over.
+  let theme = $state('light')
 
   // Latency: from the user's speech ending (or text send) to first audio out.
   let tSpeechEnd = 0
@@ -264,6 +266,11 @@
     theme = theme === 'dark' ? 'light' : 'dark'
     document.body.classList.toggle('light', theme === 'light')
   }
+
+  // Keep the DOM in step with the initial state, not just with later toggles.
+  $effect(() => {
+    document.body.classList.toggle('light', theme === 'light')
+  })
 
   // The converter arrives asynchronously, so any turn captured before it landed
   // is still Simplified. Re-render those from the raw STT text once it is live.
