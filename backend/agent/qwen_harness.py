@@ -43,6 +43,14 @@ _DEFAULT_TZ = os.getenv("VOICE_TZ", "Asia/Taipei")
 # tool calls are now native (see use_raw_api below); under prompt-based calling,
 # raising this made failures MORE likely, because the extra room went to thinking.
 LLM_AGENT_MAX_TOKENS = int(os.getenv("LLM_AGENT_MAX_TOKENS", "2048"))
+# Hard cap on one LLM round-trip. qwen-agent renames request_timeout -> the OpenAI
+# client's timeout, whose default is 600 s -- unusable here. Observed against
+# OpenRouter: the follow-up call after a get_current_datetime tool result simply
+# never returned, and because the framework serves one session at a time, that one
+# hung request held the only pipeline slot for two minutes and every later turn was
+# refused with "all session slots are in use". A voice turn that takes 45 s has
+# already failed; better to say so and free the slot.
+LLM_REQUEST_TIMEOUT = float(os.getenv("LLM_REQUEST_TIMEOUT", "45"))
 LLM_AGENT_TEMP = float(os.getenv("LLM_AGENT_TEMP", "0.7"))
 LLM_AGENT_TOP_P = float(os.getenv("LLM_AGENT_TOP_P", "0.9"))
 LLM_AGENT_SEED = os.getenv("LLM_AGENT_SEED", "").strip()
@@ -195,12 +203,17 @@ def _provider_failure_zh(exc: Exception) -> str:
     """
     code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
     if not isinstance(code, int):
-        m = re.search(r"\b(40[1234]|429|5\d\d)\b", str(exc))
+        # Anchor on the primary code. A bare 3-digit search over the whole message
+        # picked up a 404 nested in OpenRouter's `previous_errors` and reported
+        # "model not found" for what was really a 400 about tool_call_id.
+        m = re.search(r"Error code:\s*(\d{3})", str(exc)) or re.search(r"^\D{0,24}?\b(\d{3})\b", str(exc))
         code = int(m.group(1)) if m else None
     if code in _PROVIDER_FAILURE_ZH:
         return _PROVIDER_FAILURE_ZH[code]
     if isinstance(code, int) and 500 <= code < 600:
         return "抱歉，模型供應者暫時故障，請稍後再試。"
+    if re.search(r"timeout|timed out", str(exc), re.I) or "Timeout" in type(exc).__name__:
+        return "抱歉，模型回應逾時，請再試一次或換一個模型。"
     return "抱歉，這個問題我暫時無法回答，請再試一次。"
 
 
@@ -390,6 +403,7 @@ def _make_agent(function_list=None):
         'api_key': _key,
         'generate_cfg': {
             'max_tokens': LLM_AGENT_MAX_TOKENS,
+            'request_timeout': LLM_REQUEST_TIMEOUT,
             'temperature': LLM_AGENT_TEMP,
             'top_p': LLM_AGENT_TOP_P,
             # Thinking on. It costs first-token latency, but with --reasoning-format

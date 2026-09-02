@@ -227,6 +227,45 @@ def _provider_local() -> dict:
     return {"base": LLM_API_BASE, "model": LLM_MODEL_NAME}
 
 
+def _fix_tool_call_id() -> None:
+    """Work around a qwen-agent bug that breaks tool calling on strict providers.
+
+    Converting its internal messages to OpenAI form, qwen-agent labels a tool result
+    with `id` (llm/base.py:446):
+
+        new_msg['role'] = 'tool'
+        new_msg['id'] = msg.get('extra', {}).get('function_id', '1')
+
+    but the OpenAI schema requires `tool_call_id` on a tool message. llama-server
+    accepts either, so this is invisible locally; strict providers reject the whole
+    request. Observed through OpenRouter:
+
+        Cohere: invalid tool message at messages[3]: tool_call_id is a required field
+        Nvidia: missing field `tool_call_id`
+
+    Because the failure lands on the follow-up call -- after the tool has already
+    run -- a search or weather turn would call its tool, then die instead of
+    answering. Single-step turns were unaffected, which is why it looked like
+    flaky model quality rather than a protocol error.
+    """
+    try:
+        from qwen_agent.llm.base import BaseChatModel
+
+        original = BaseChatModel._conv_qwen_agent_messages_to_oai
+
+        def patched(messages):
+            out = original(messages)
+            for m in out:
+                if isinstance(m, dict) and m.get("role") == "tool" and "tool_call_id" not in m:
+                    m["tool_call_id"] = m.get("id") or "1"
+            return out
+
+        BaseChatModel._conv_qwen_agent_messages_to_oai = staticmethod(patched)
+        logger.info("patched qwen-agent tool messages to carry tool_call_id")
+    except Exception:
+        logger.exception("could not patch tool_call_id (tool turns may fail on strict providers)")
+
+
 def _install_vram_route() -> None:
     """Expose GPU memory on the Realtime server, for the UI's VRAM readout.
 
@@ -328,6 +367,7 @@ def _get_llm_handler(
 
 def main() -> None:
     _neutralize_mps_empty_cache()
+    _fix_tool_call_id()
     _install_vram_route()
     # A key in the environment means start on OpenRouter; without one the demo would
     # have no working model at all, so it falls back to the local server and the UI

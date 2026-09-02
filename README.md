@@ -466,6 +466,9 @@ and the GPU. So:
 python3 -m unittest discover -s backend/tests   # pure logic, no GPU or network
 ruff check backend --config ruff.toml           # gate: E4, E7, E9, F, B
 
+# the whole stack against a running pipeline -- 36 assertions, exits non-zero on failure
+cd backend && python3 -m s2s.checks.exhaustive          # add --quick to skip spoken turns
+
 # against a LIVE pipeline on :8765 (close the browser tab first -- one session slot)
 cd backend  && python3 -m s2s.checks.turn "台灣的首都是哪裡？"
 cd backend  && python3 -m s2s.checks.bargein
@@ -474,6 +477,17 @@ cd frontend && node checks/bargein.mjs
 cd frontend && node checks/log.mjs              # debug export; no server needed
 cd frontend && node checks/zhtw.mjs             # transcript conversion; no server needed
 ```
+
+`s2s/checks/exhaustive.py` covers the parts unit tests cannot: the added HTTP routes and their
+validation, provider switching in both directions, tool routing and fabrication across all five
+prompt shapes, error legibility, and barge-in. It restores whichever provider it found — an
+earlier version left every run on OpenRouter, so a "local" run was silently not local.
+
+Two of its assertions exist because a weaker version passed while the demo was broken: the clock
+check compares month and day, not just the year (a free-router model received
+`Wednesday 2026-09-02` from the tool and reported 2026年5月14日 週四); and barge-in asserts that no
+audio arrives *after* the cancellation, rather than counting chunks during the detection window,
+which measures Silero's latency instead of correctness.
 
 `backend/tests/` covers the pure functions where shipped bugs actually lived — CJK relevance
 scoring, tool-call JSON, short-answer filtering, stream reconciliation.

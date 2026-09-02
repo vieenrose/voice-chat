@@ -115,8 +115,16 @@
 
   // Only providers with a catalogue offer a model list; 'local' takes its model
   // from the server's own registry.
+  let lastProvider = null
   $effect(() => {
-    if (llmCfg?.providers?.[provider]?.needs_key) {
+    if (!llmCfg) return
+    if (provider !== lastProvider) {
+      // A model id belongs to the provider it came from. Carrying one across a
+      // switch would post e.g. "anthropic/claude-opus-5" to the local server.
+      if (lastProvider !== null) modelId = provider === llmCfg.provider ? llmCfg.model : ''
+      lastProvider = provider
+    }
+    if (llmCfg.providers?.[provider]?.needs_key) {
       if (!models.length) loadModels(provider)
     } else {
       models = []
@@ -543,6 +551,7 @@
             <input class="input" placeholder="搜尋模型…" bind:value={modelFilter}
                    style="margin-bottom:6px" />
             <select id="llm-model" class="input" bind:value={modelId} style="margin-bottom:6px">
+              <option value="">預設（openrouter/free 自動路由）</option>
               <option value="openrouter/free">openrouter/free（自動路由）</option>
               {#each shownModels as m}
                 <option value={m.id}>{m.free ? '🆓 ' : ''}{m.id}</option>

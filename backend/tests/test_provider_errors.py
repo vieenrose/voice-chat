@@ -43,6 +43,11 @@ class TestProviderFailureMessages(unittest.TestCase):
         for code in (500, 502, 503):
             self.assertIn("供應者", _provider_failure_zh(_Coded(code)))
 
+    def test_a_hung_request_says_so(self):
+        import httpx
+        self.assertIn("逾時", _provider_failure_zh(httpx.ReadTimeout("timed out")))
+        self.assertIn("逾時", _provider_failure_zh(Exception("Request timed out.")))
+
     def test_unknown_failures_stay_generic_and_never_leak_the_exception(self):
         exc = Exception("httpx.ConnectError: [Errno 111] to 10.1.2.3:8080")
         msg = _provider_failure_zh(exc)
