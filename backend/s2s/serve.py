@@ -293,9 +293,17 @@ def _install_vram_route() -> None:
 
             app.add_middleware(
                 CORSMiddleware,
-                allow_origins=["*"],      # read-only, no credentials, no secrets
-                allow_methods=["GET"],
+                allow_origins=["*"],
+                # POST and OPTIONS are required, not optional: /v1/llm-config is a
+                # POST carrying JSON, which makes it a non-simple request, so the
+                # browser sends a preflight first. With GET alone the preflight was
+                # rejected -- "OPTIONS /v1/llm-config 400" in the log -- and the page
+                # reported only "Failed to fetch".
+                allow_methods=["GET", "POST", "OPTIONS"],
                 allow_headers=["*"],
+                # No credentials: the page sends the API key in the body, never a
+                # cookie, so there is nothing for a third-party origin to ride on.
+                allow_credentials=False,
             )
 
             @app.get("/v1/vram")

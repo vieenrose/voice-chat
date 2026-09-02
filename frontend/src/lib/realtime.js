@@ -46,6 +46,7 @@ export class RealtimeClient {
     this.ready = false
     // Every frame both ways, for the export button. Bounded so a long session
     // cannot grow without limit; audio payloads are elided, not stored.
+    this.closing = false
     this.log = []
     this.logLimit = logLimit
     this.audioBytesIn = 0
@@ -99,7 +100,9 @@ export class RealtimeClient {
       }
       ws.onerror = () => {
         if (!this.ready) reject(new Error(`cannot reach ${url}`))
-        this.h.onError?.('WebSocket error')
+        // A deliberate close() fires onerror in some stacks; reporting it would
+        // flash a spurious warning in the UI right after the user disconnects.
+        else if (!this.closing) this.h.onError?.('WebSocket error')
       }
       ws.onclose = () => {
         this.ready = false
@@ -204,6 +207,7 @@ export class RealtimeClient {
   }
 
   close() {
+    this.closing = true
     try {
       this.ws?.close()
     } catch {
