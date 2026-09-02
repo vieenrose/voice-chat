@@ -47,25 +47,6 @@ this corpus into 131 k tokens against Qwen's 117 k. In bits per byte the 2B is c
 at Q8 — and pays for it in quality, rather than coming out ahead. The file size also oversells
 the footprint: 2.18 GB of weights still took 7.1 GB of VRAM at 16 k context.
 
-**The rest of the Bonsai range was measured and rejected**, so the same ground isn't retrodden.
-All on the same zh corpus, bits per byte (lower is better):
-
-| Build | file | VRAM | bits/byte | tok/s | why not |
-|---|---|---|---|---|---|
-| **8B ternary** | 2.18 GB | 6.5 GB | 1.0786 | 118 | *the default* |
-| 4B ternary | 1.07 GB | 2.0 GB | 1.1787 | **184** | fastest and lightest of anything tested, and the quality floor — its sample answer invented 積極管 and leaked Simplified (晶体, 沉积) |
-| 27B ternary | 7.17 GB | 7.8 GB | 1.0917 | 34.9 | answers well (3/4, same as the 8B) but first audio runs **9.9–15.7 s**, and 7.8 GB leaves ~1 GB once TTS and STT are resident |
-| 27B 1-bit | 3.80 GB | 4.8 GB | 1.1653 | 36.7 | 2/4; answered a tech-news request with 今天是星期三。 and emitted raw deliberation as the answer |
-
-Two results worth carrying forward. **Halving the weights bought ~5 % throughput** (27B ternary
-→ 1-bit, 7.17 GB → 3.80 GB, 34.9 → 36.7 tok/s), not the ~2× a bandwidth-bound decoder would
-give: the 1-bit dequantization kernels are the bottleneck, so shrinking the file mostly costs
-quality without buying speed. And the 27B's raw PPL of 24.214 looks disastrous beside the 8B's
-16.518 but is **mostly a tokenizer artifact** — in bits per byte the two are near-tied.
-
-Bonsai also inverts the usual size/footprint intuition: the 8B's 2.18 GB of weights still take
-7.1 GB of VRAM at 16 k context, while the 27B 1-bit takes only 4.8 GB.
-
 It needs Prism's llama.cpp fork, which is why registry entries may carry a `"bin"` of their own:
 their `Q2_0` reuses upstream's `GGML_TYPE_Q2_0` type id with a different block layout, so
 mainline refuses the file outright. Build the `prism` branch with `-DGGML_CUDA=ON` (their README
@@ -73,27 +54,6 @@ says CPU/Metal only — out of date, the CUDA kernels including `mmvq` are there
 `LLAMA_SERVER_BIN_PRISM` at it. Set `TMPDIR` to a real disk first: nvcc's intermediates hit the
 `/tmp` quota otherwise. Note the HF repo also ships a plain `*-Q2_0.gguf` in their *legacy*
 group-128 layout that fails even on the fork; `PQ2_0` is the current one.
-
-**Two models that were evaluated and dropped**, so the same ground isn't retrodden:
-
-*Ling 3.0 tiny* (`bailingmoe3` MoE, 128 experts / 8 active) works — it needed its own tool-call
-dialect, since Qwen-Agent expects a JSON call body while Ling's chat template asks for
-`<tool_call>name<arg_key>…</arg_key><arg_value>…</arg_value>`, and with that adapter it routed
-all three tools correctly. At IQ4_XS it scored the same 3/4 on the four UI prompts as 2B. It was
-still dropped: slower (148 tok/s vs 172), much heavier on VRAM (6.9 GB vs ~3.5), and it drifted
-into Simplified Chinese more than Qwen does (`湿度` for 濕度), which is the one thing this demo
-is specifically not supposed to do. Its adapter and tests were removed with it — recoverable
-from git if it's ever worth revisiting. One finding outlived it: **IQ4_XS beat MXFP4** on the
-same weights (148 vs 108 tok/s, 6.9 vs 7.9 GB VRAM, identical score), despite MXFP4 being the
-format designed for MoE experts. Measure the quant; don't reason about it.
-
-*0.8B.* Decode runs 236 tok/s at 0.8B against 172 tok/s at 2B — 0.97 s vs 1.31 s for a
-220-token answer. That 0.34 s falls inside a
-turn where the user already waits 1.0–3.6 s for first audio, which search and TTS dominate, so
-nobody can hear it. What it costs is reliability: every 0.8B build tested narrated its own
-planning aloud, echoed the agent framework's tool template, quoted the prompt back, or repeated
-itself — each failure needing another filter. Unquantized f16 scored the same as q8, so this is
-capacity rather than quantization, and no amount of filtering fixes it.
 
 ## Quick Start
 
@@ -104,9 +64,10 @@ llama-server -m granite-embedding-97M-multilingual-r2-Q8_0.gguf \
 
 # 2) LLM — optional: the backend spawns and owns this itself if :11435 is free,
 #    or adopts it if you start it first (backend/llm_manager.py)
-llama-server -m /home/user/llms/mtp/Qwen3.5-2B-UD-Q8_K_XL.gguf \
-  --host 127.0.0.1 --port 11435 -c 16384 --alias qwen3.5-2b --n-gpu-layers 99 --jinja \
-  --reasoning-format deepseek --spec-type draft-mtp --spec-draft-n-max 3
+# NOTE the binary: the default model is Bonsai, which mainline llama.cpp cannot read.
+/home/user/prism-llama/build/bin/llama-server -m /home/user/llms/bonsai/Ternary-Bonsai-8B-PQ2_0.gguf \
+  --host 127.0.0.1 --port 11435 -c 16384 --alias bonsai-8b --n-gpu-layers 99 --jinja \
+  --reasoning-format deepseek
 
 # 3) Search
 SEARXNG_SETTINGS_PATH=/tmp/searxng/settings.yml python3 -m searx.webapp   # :8888
@@ -121,7 +82,8 @@ cd frontend && npm install && npm run dev       # http://localhost:5173
 
 Model files (mount as volumes under Docker):
 
-- LLM `/home/user/llms/mtp/Qwen3.5-2B-UD-Q8_K_XL.gguf` · Embedding `/tmp/granite-emb-gguf/…Q8_0.gguf`
+- LLM `/home/user/llms/bonsai/Ternary-Bonsai-8B-PQ2_0.gguf` (default) and
+  `/home/user/llms/mtp/Qwen3.5-{2B,4B}-UD-Q8_K_XL.gguf` · Embedding `/tmp/granite-emb-gguf/…Q8_0.gguf`
 - TTS `/tmp/qwen3_tts/talker_cv_q8.gguf` + `codec.gguf` · STT `/tmp/XASR/deployment/models/chunk-160ms-model/`
 - SearXNG `/tmp/searxng/settings.yml`
 
@@ -189,35 +151,26 @@ worse without being worse. Bonsai 8B turns this corpus into 131 k tokens where t
 produce 117 k, which is enough to invert a ranking on its own. For cross-family comparisons use
 **bits per byte** — `tokens x ln(PPL) / (ln 2 x corpus_bytes)` — which is tokenizer-independent.
 
-| Build | 2B PPL | 4B PPL | 2B tok/s |
-|---|---|---|---|
-| **UD-Q8_K_XL + MTP** (current) | **16.738** | **13.027** | 122 |
-| UD-Q4_K_XL | 17.080 | 13.173 | 168 |
-| Q4_K_M | 17.091 | — | 172 |
-| IQ4_XS | — | — | 175 |
+The three registered models, on the same corpus:
 
-Those four share a tokenizer, so their perplexities rank directly. Across families, in bits per
-byte (lower is better):
+| Model | bits/byte | PPL | file | tok/s |
+|---|---|---|---|---|
+| Qwen3.5 4B Q8_K_XL | **0.8793** | 13.027 | 6.07 GB | ~60 |
+| Qwen3.5 2B Q8_K_XL | 0.9652 | 16.738 | 2.89 GB | 122 |
+| Bonsai 8B ternary *(default)* | 1.0786 | 16.518 | 2.18 GB | 118 |
 
-| Model | bits/byte | PPL | file |
-|---|---|---|---|
-| Qwen3.5 4B Q8_K_XL | **0.8793** | 13.027 | 6.07 GB |
-| Qwen3.5 2B Q8_K_XL | 0.9652 | 16.738 | 2.89 GB |
-| Bonsai 8B ternary | 1.0786 | 16.518 | 2.18 GB |
-| Bonsai 27B ternary | 1.0917 | 24.214 | 7.17 GB |
+The two Qwen builds share a tokenizer, so their perplexities rank directly against each other;
+Bonsai needs the bits-per-byte column. Both Qwen entries are UD-Q8_K_XL with MTP — Unsloth
+Dynamic spends its extra bits on the quantization-sensitive layers rather than lifting every
+layer uniformly, and Q8 measured most faithful of the quantizations tried. MTP recovers most of
+what Q8 costs in speed (100 → 122 tok/s on 2B) without touching precision.
 
-Q8 is the most faithful at both sizes (~2 % lower), and UD-Q4_K_XL edges plain Q4_K_M — which
-is what Unsloth Dynamic claims: spend the extra bits on the quantization-sensitive layers
-rather than lifting every layer uniformly. MTP recovers most of what Q8 costs in speed
-(100 → 122 tok/s on 2B) without touching the precision the quantization was chosen for.
-
-**The four-prompt matrix cannot rank these builds, and earlier revisions of this file wrongly
-treated it as if it could.** Two runs of the *same weights* differing only by MTP — a
-throughput feature that cannot change what the model writes — scored 6/8 and 4/8. Across four
-near-equivalent configurations the scores were 4, 5, 6 and 4 out of 8. At n=8 and temperature
-0.7 that spread is the noise floor. It is a smoke test for "does a turn work end to end", not
-a quality metric. Use perplexity to compare weights, and fix `LLM_AGENT_SEED` with several
-passes if you want the matrix to mean anything.
+**The four-prompt matrix cannot rank builds — use perplexity for that.** Two runs of the *same
+weights*, differing only by a throughput feature that cannot change what the model writes,
+scored 6/8 and 4/8; across four near-equivalent configurations the scores were 4, 5, 6 and 4
+out of 8. At n=8 and temperature 0.7 that spread is the noise floor. Treat the matrix as a
+smoke test for "does a turn work end to end", and fix `LLM_AGENT_SEED` across several passes
+if you want more from it.
 
 **MTP.** The registered weights carry NextN layers, so the model drafts its own next tokens and
 the target model verifies them; accepted drafts are the tokens that would have been generated
@@ -300,6 +253,7 @@ concurrently instead of each waiting out its own timeout.
 | `SEARXNG_URL` | `http://localhost:8888` | search backend |
 | `LLM_API_BASE`, `LLM_PORT`, `LLM_CTX`, `LLM_DEFAULT_MODEL_ID`, `LLM_PATH_*` | see `llm_manager.py` | LLM subprocess |
 | `LLM_MTP` / `LLM_MTP_DRAFT_N` | `1` / `3` | self-speculative decoding on MTP weights; `0` disables |
+| `LLAMA_SERVER_BIN_PRISM` | `/home/user/prism-llama/build/bin/llama-server` | the fork the Bonsai entry runs on — **required for the default model** |
 | `LLM_SEED` / `LLM_AGENT_SEED` | random / unset | reproducible runs |
 | `LLM_AGENT_TEMP`, `LLM_AGENT_TOP_P` | `0.7`, `0.9` | agent-turn sampling |
 | `LLM_AGENT_THINKING` | `1` | thinking pass on agent turns |
