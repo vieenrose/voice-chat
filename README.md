@@ -136,10 +136,24 @@ verbatim on the ASR probe, 0.28 s for 5.5 s of audio with thinking off), keeps w
 barge-in, and removes a real failure mode — in an exported session X-ASR heard "huggingface" as
 "huninface" and the model answered about Huawei.
 
-**It costs the tools, and that is why it is not the default.** `--stt none` delivers audio on
-`GenerateResponseRequest.audio`, which only the framework's own chat-completions stage reads; the
-Qwen-Agent stage is text-only. So the variant runs with no `web_search`, `get_weather` or
-`get_current_datetime` — like the upstream example — and the result is immediate:
+**The model can call tools from speech; this wiring cannot.** That distinction matters, so it is
+worth separating. Given audio as the whole prompt, no text hint, and the three tools declared,
+E4B routes them correctly:
+
+| spoken question | tool called | thinking off / on |
+|---|---|---|
+| 今天台北天氣如何？ | `get_weather` | 0.32 s / 0.45 s |
+| 今天有什麼新聞？ | `web_search` | 0.19 s / 0.55 s |
+| 請問現在是幾點鐘了呢？ | `get_current_datetime` | 0.22 s / 0.37 s |
+
+(One earlier failure here was a bad test clip, not the model: a TTS rendering of 現在幾點？ came out
+at 3.6 s for five characters and was heard as `当 dual 都流從處不錯`. Re-recorded, it routes.)
+
+What loses the tools is the *plumbing*, not the model. `--stt none` delivers audio on
+`GenerateResponseRequest.audio`, which only the framework's own chat-completions stage reads, and
+the Qwen-Agent stage that owns our tools is text-only. So this variant runs with no `web_search`,
+`get_weather` or `get_current_datetime` — like the upstream example — and the result is
+immediate:
 
 | | native-audio variant | default pipeline |
 |---|---|---|
@@ -159,8 +173,10 @@ bounds that. And Google's own audio evaluation for the **12B excludes Chinese** 
 its CoVoST and FLEURS figures) while E4B's — FLEURS 0.08, CoVoST 35.54 — carries no such
 exclusion, so for zh the smaller model is the better-evidenced one.
 
-The interesting middle path, untried: use Gemma for ASR only (0.28 s), then run the normal
-Qwen-Agent turn on that text. That would drop Paraformer and keep the tools.
+Since the model handles audio *and* tools in a single call, the way to get both is to teach our
+LLM stage to forward `request.audio` with the tool schemas and run the call→observe loop on the
+result — dropping Paraformer and keeping the tools, with no separate ASR step. Untried;
+`s2s/checks/` has no coverage for the audio path, so that is where it should start.
 
 ### Barge-in
 
