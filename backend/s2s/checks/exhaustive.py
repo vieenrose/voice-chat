@@ -141,7 +141,16 @@ async def one_turn(prompt: str, timeout: float = 120.0) -> dict:
     return out
 
 
-CLAIM = re.compile(r"\d+\s*(°C|度|%)|星期[一二三四五六日]|\d{4}\s*年|氣溫|降雨")
+# What "the tool actually ran" looks like, per shape. One regex for all three was
+# wrong: a news summary from web_search need not contain a temperature or a date,
+# so a real answer naming 沙德爾颱風 was failed for not matching a numeric pattern.
+FACT = {
+    "clock":   re.compile(r"星期[一二三四五六日]|\d{1,2}\s*[月日點時]|\d{4}\s*年"),
+    "weather": re.compile(r"\d+\s*(°C|度)|氣溫|降雨|濕度|溼度"),
+    # Tools run server-side, so the protocol never shows the call; what a real
+    # search answer has is substance rather than a refusal or a stub.
+    "search":  re.compile(r"^(?!.*(無法|抱歉|找不到)).{40,}", re.S),
+}
 
 TURNS = [
     ("chat",    "你好",                       False),
@@ -168,9 +177,10 @@ async def test_turns() -> None:
         ok = spoke and not refused
         detail = f"{r['total']}s first_audio={r['first_audio']} {r['text'][:44]!r}"
         check("turns", f"{label} answers with audio", ok, detail)
-        if needs_fact and ok:
-            check("turns", f"{label} states something only a tool knows",
-                  bool(CLAIM.search(r["text"])), r["text"][:50])
+        pat = FACT.get(label)
+        if needs_fact and ok and pat is not None:
+            check("turns", f"{label} shows the tool's result, not the model's memory",
+                  bool(pat.search(r["text"])), r["text"][:50].replace("\n", " "))
         if label == "clock" and ok:
             # The year alone is far too weak: a free-router model was seen to receive
             # "Wednesday 2026-09-02" from the tool and report 2026年5月14日 週四, which a

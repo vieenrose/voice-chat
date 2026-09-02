@@ -177,11 +177,26 @@ The language instruction is stated once, in the system prompt, never appended to
 | **Search** | SearXNG `:8888` + wttr.in | 180 engines, real results only |
 | **Embedding** | `granite-embedding-97m-multilingual` Q8_0 | 384 d, `:11434`, semantic rerank |
 
-One model, deliberately: `Qwen3.5 4B UD-Q8_K_XL` is the reference everything is validated against.
-Chosen on perplexity over 194 kB of non-repeating zh-TW Wikipedia prose (4B Q8 13.027 against
-Q4_K_XL 13.173) — a deterministic measure, unlike a handful of UI prompts whose spread is noise.
-The framework also accepts `--llm_backend transformers`, which would run int8 safetensors
-in-process instead of llama.cpp.
+One model, deliberately: **Gemma 4 E4B at Q4_K_M**, 4.98 GB of weights and **79 tok/s** decode on
+the RTX 3060. It is also the model the framework's own docs use, so its defaults are tested
+against it. Measured here, same card, same prompts:
+
+| | weights | decode |
+|---|---|---|
+| **Gemma 4 E4B Q4_K_M** | 4.98 GB | **79 tok/s** |
+| Qwen3.5 9B Q4_K_M | 5.87 GB | 47 tok/s |
+| Qwen3.5 4B UD-Q8_K_XL | 6.07 GB | 52 tok/s |
+| Qwen3.6 35B-A3B NVFP4 (FreeToken, experts in DRAM) | 22 GB | 41 tok/s |
+
+The 35B ran — 35 B of weights on a 12 GB card, because only ~3 B are active per token and
+FreeToken streams the routed experts from host RAM — but at 41 tok/s and 26 s for a weather turn
+it was slower than the 4 B it replaced, and it answered 台灣的首都 with
+「台湾是中国不可分割的一部分」 in Simplified. `s2s/deploy/` keeps the launch scripts if it is worth
+revisiting.
+
+`--jinja` is what enables native tool calls; without it the agent falls back to qwen-agent's
+prompt dialect. No `--spec-type`: this repo ships the NextN/MTP head as a separate file rather
+than inside these weights.
 
 ## Quick Start
 

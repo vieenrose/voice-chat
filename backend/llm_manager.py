@@ -47,24 +47,24 @@ LLM_SEED = int(os.getenv("LLM_SEED", "-1"))
 # tool template, quoted the prompt back, or repeated itself — each needing another
 # filter. Unquantized f16 scored the same as q8, so this is capacity, not quantization.
 MODEL_REGISTRY: dict[str, dict] = {
-    # The only model. 9B at Q4_K_M rather than the 4B at Q8: Q4 halves the bytes read
-    # per token, so doubling the parameters costs almost nothing in throughput --
-    # measured 47 tok/s against the 4B Q8's 52 -- while 5.87 GB still leaves ~3.1 GB of
-    # the 12 GB card for KV and activations once the speech stages have their ~3.5 GB.
+    # The only model. Gemma 4 E4B at Q4_K_M: 4.98 GB of weights and 79 tok/s decode on
+    # the RTX 3060, against 47 for Qwen3.5 9B Q4 and 41 for Qwen3.6 35B-A3B with its
+    # experts streaming from DRAM. It is also the model the speech-to-speech docs use,
+    # so the framework's own defaults are tested against it.
     #
-    # MTP is ON: the weights carry NextN layers, so the model drafts its own next tokens
-    # and verifies them. Accepted drafts are the tokens that would have been produced
-    # anyway, so this is throughput, not quality. See _mtp_args(); LLM_MTP=0 disables.
-    "qwen3.5-9b-q4": {
-        "label": "Qwen3.5 9B · Q4_K_M",
-        "path": os.getenv("LLM_PATH_9B", "/home/user/llms/mtp/Qwen3.5-9B-Q4_K_M.gguf"),
-        "alias": "qwen3.5-9b",
-        "mtp": True,
+    # E4B is a nested/effective-4B checkpoint, so llama.cpp serves it as one model with
+    # no extra flags; --jinja is what enables native tool calls, which this demo needs.
+    # MTP is off: the repo ships the NextN head separately (MTP/mtp-*.gguf) rather than
+    # inside these weights, so --spec-type draft-mtp has nothing to draft from here.
+    "gemma-4-e4b-q4": {
+        "label": "Gemma 4 E4B · Q4_K_M",
+        "path": os.getenv("LLM_PATH_GEMMA", "/home/user/llms/gemma/gemma-4-E4B-it-Q4_K_M.gguf"),
+        "alias": "gemma-4-e4b",
     },
 }
 
 
-DEFAULT_MODEL_ID = os.getenv("LLM_DEFAULT_MODEL_ID", "qwen3.5-9b-q4")
+DEFAULT_MODEL_ID = os.getenv("LLM_DEFAULT_MODEL_ID", "gemma-4-e4b-q4")
 
 
 def _alias_to_model_id(alias: str) -> Optional[str]:
