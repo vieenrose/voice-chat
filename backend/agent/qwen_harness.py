@@ -171,6 +171,19 @@ _TOOL_PLACEHOLDER_RE = re.compile(r"\[\s*(get_current_datetime|get_weather|web_s
 NO_ANSWER_ZH = "抱歉，我找不到相關的答案。"
 
 
+def _has_word(s: str) -> bool:
+    """Whether a string carries actual content, as opposed to punctuation or list marks.
+
+    This replaced a `len(s.strip()) > 2` test that was meant to drop junk but is
+    latin-centric: "台北" is a complete and correct answer to "台灣的首都是哪裡？"
+    in exactly two characters, and so are 是的 / 沒有 / 五. Measured on Bonsai 8B,
+    the model returned a bare "台北" on 3 of 6 runs, every candidate was dropped,
+    and the user was told 抱歉，我找不到相關的答案 — an apology for the right answer.
+    One ideograph, or a three-letter latin word, is content.
+    """
+    return bool(re.search(r"[一-鿿]", s)) or bool(re.search(r"[A-Za-z]{3,}", s))
+
+
 def _answer_or_fallback(text: str) -> str:
     """Return the answer with non-answer material removed, or say there isn't one.
 
@@ -206,8 +219,7 @@ def _answer_or_fallback(text: str) -> str:
     remainder = " ".join(kept).strip()
     # Residue: what is left carries no CJK and no real word — only numbering, bullets
     # and punctuation. That is not an answer in any language.
-    has_word = bool(re.search(r"[一-鿿]", remainder)) or bool(re.search(r"[A-Za-z]{3,}", remainder))
-    if not remainder or not has_word:
+    if not remainder or not _has_word(remainder):
         return NO_ANSWER_ZH
     return remainder if len(kept) != len(parts) else text
 
@@ -829,7 +841,7 @@ async def run_agent_task(task: str, event_q=None, history=None) -> str:
                     if _msg_field(m, 'role') == 'assistant':
                         c = _msg_field(m, 'content')
                         # Filter: content must be non-empty and not just reasoning (reasoning_content is separate)
-                        if isinstance(c, str) and c.strip() and len(c.strip()) > 2:
+                        if isinstance(c, str) and c.strip() and _has_word(c.strip()):
                             # Skip if it's just the reasoning dump (empty content with reasoning_content)
                             if not c.strip().startswith("["):
                                 candidates_all.append({"role": "assistant", "content": c})
@@ -937,9 +949,9 @@ async def run_agent_task(task: str, event_q=None, history=None) -> str:
                 for m in reversed(mem_hist):
                     if m.get('role') == 'assistant' and m.get('content'):
                         c = m['content']
-                        if isinstance(c, str) and c.strip() and len(c.strip()) > 2 and not c.strip().startswith("["):
+                        if isinstance(c, str) and c.strip() and _has_word(c.strip()) and not c.strip().startswith("["):
                             return c
-            return "抱歉，我找不到相關的答案。"
+            return NO_ANSWER_ZH
         except Exception as e:
             # This return value is spoken via TTS (generate_chat_with_tools tokenizes it
             # char-by-char with no filtering for an "error"-looking string) — a raw
