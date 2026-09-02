@@ -47,69 +47,41 @@ LLM_SEED = int(os.getenv("LLM_SEED", "-1"))
 # tool template, quoted the prompt back, or repeated itself — each needing another
 # filter. Unquantized f16 scored the same as q8, so this is capacity, not quantization.
 MODEL_REGISTRY: dict[str, dict] = {
-    # UD-Q8_K_XL with MTP. Chosen on perplexity over 194 kB of non-repeating zh-TW
-    # Wikipedia prose, which is a deterministic measure of how far quantization moved the
-    # model — unlike the four-prompt UI matrix, whose spread (4-6 out of 8 across builds
-    # that differ only in throughput) is pure noise and cannot rank anything:
+    # The only model. Chosen on perplexity over 194 kB of non-repeating zh-TW Wikipedia
+    # prose, a deterministic measure of how far quantization moved the model -- unlike the
+    # four-prompt UI matrix, whose spread (4-6 of 8 across builds differing only in
+    # throughput) is noise and cannot rank anything:
     #
     #   2B  UD-Q8_K_XL 16.738   UD-Q4_K_XL 17.080   Q4_K_M 17.091
     #   4B  UD-Q8_K_XL 13.027   UD-Q4_K_XL 13.173
     #
-    # Q8 is the most faithful at both sizes (~2% lower), and UD-Q4_K_XL edges plain
-    # Q4_K_M, which is what UD (Unsloth Dynamic) claims: spend the extra bits on the
-    # quantization-sensitive layers rather than raising every layer uniformly.
+    # Q8 is the most faithful at both sizes (~2% lower). The 4B is the reference the
+    # harness and the speech-to-speech pipeline are validated against.
     #
-    # MTP is ON here. The weights carry NextN layers, so the model drafts its own next
-    # tokens and the target model verifies them — accepted drafts are the tokens that
-    # would have been produced anyway, which is why it recovers throughput without
-    # touching the precision this quantization was chosen for. Measured +20% on 4B with
-    # byte-identical greedy output. See _mtp_args(); LLM_MTP=0 disables it.
-    "qwen3.5-2b-q4": {
-        "label": "Qwen3.5 2B · Q8_K_XL",
-        "path": os.getenv("LLM_PATH_2B", "/home/user/llms/mtp/Qwen3.5-2B-UD-Q8_K_XL.gguf"),
-        "alias": "qwen3.5-2b",
-        "mtp": True,
-    },
-    "qwen3.5-4b-q4": {
+    # MTP is ON: the weights carry NextN layers, so the model drafts its own next tokens
+    # and verifies them -- accepted drafts are the tokens that would have been produced
+    # anyway, which is why it recovers throughput without touching precision. Measured
+    # +20% on 4B with byte-identical greedy output. See _mtp_args(); LLM_MTP=0 disables.
+    #
+    # Dropped, all measured on this box:
+    #   Qwen3.5 2B Q8   -- 13.027 vs 16.738 perplexity; the 4B is simply better and the
+    #                      VRAM is available.
+    #   Bonsai 8B ternary -- 8.2B params in 2.18 GB is real compression, but in
+    #                      tokenizer-independent bits/byte it lost to the 2B (1.0786 vs
+    #                      0.9652). Ternary pays for its size in quality. It also needed
+    #                      Prism's llama.cpp fork, a second binary to keep working.
+    #   Ling 3.0 tiny   -- same score as 2B, slower (148 vs 172 tok/s), more VRAM, and
+    #                      drifted into Simplified Chinese, which this demo must not do.
+    "qwen3.5-4b-q8": {
         "label": "Qwen3.5 4B · Q8_K_XL",
         "path": os.getenv("LLM_PATH_4B", "/home/user/llms/mtp/Qwen3.5-4B-UD-Q8_K_XL.gguf"),
         "alias": "qwen3.5-4b",
         "mtp": True,
     },
-    # Bonsai 8B, ternary (1.58-bit) weights in Prism's PQ2_0 format. 8.2B parameters in
-    # 2.18 GB, which is less than the 2B at Q8 — real compression.
-    #
-    # Its PPL of 16.518 looks like it beats the 2B's 16.738, but perplexity is per-token
-    # and Bonsai's tokenizer is not Qwen's: it turns the eval corpus into 131k tokens
-    # against Qwen's 117k, so it is scoring an easier target. In bits per byte, which is
-    # tokenizer-independent, the 2B is clearly ahead (0.9652 vs 1.0786). Ternary pays for
-    # its compression in quality; it does not come out ahead.
-    #
-    # Needs Prism's llama.cpp fork ("bin" below). Their Q2_0 reuses upstream's
-    # GGML_TYPE_Q2_0 id with a different block layout, so mainline refuses the file. Note
-    # the HF repo also ships a plain *-Q2_0.gguf which is their LEGACY group-128 layout
-    # and fails even on the fork; PQ2_0 is the current one.
-    "bonsai-8b-ternary": {
-        "label": "Bonsai 8B · ternary",
-        "path": os.getenv("LLM_PATH_BONSAI_8B", "/home/user/llms/bonsai/Ternary-Bonsai-8B-PQ2_0.gguf"),
-        "alias": "bonsai-8b",
-        "bin": os.getenv("LLAMA_SERVER_BIN_PRISM", "/home/user/prism-llama/build/bin/llama-server"),
-    },
 }
-# Ling 3.0 tiny (bailingmoe3 MoE) was evaluated here and dropped. At IQ4_XS it scored the
-# same 3/4 on the four UI prompts as 2B, but ran slower (148 tok/s vs 172), used more VRAM
-# (6.9 GB vs ~3.5), and drifted into Simplified Chinese more often — which this demo is
-# specifically not supposed to do. Its tool-call dialect adapter went with it; see the
-# commit that removed it if Ling is ever worth revisiting.
-# NOT "LLM_MODEL_ID" — the agent harnesses (backend/agent/{qwen_harness,harness,
-# pydantic_harness}.py) already read that name expecting a raw llama-server alias
-# (e.g. "qwen3.5-2b"), whereas this expects a MODEL_REGISTRY key (e.g. "qwen3.5-2b-q4");
-# reusing the same name would silently send the wrong "model" field to llama-server for
-# every tool-calling turn whenever this env var is set to pick a non-default boot model.
-# Bonsai 8B is the default by choice, not by metric: Qwen3.5 2B Q8 scores better on the
-# tokenizer-independent measure (0.9652 vs 1.0786 bits/byte) and uses half the VRAM.
-# Booting this entry also means booting Prism's llama.cpp fork (see its "bin").
-DEFAULT_MODEL_ID = os.getenv("LLM_DEFAULT_MODEL_ID", "bonsai-8b-ternary")
+
+
+DEFAULT_MODEL_ID = os.getenv("LLM_DEFAULT_MODEL_ID", "qwen3.5-4b-q8")
 
 
 def _alias_to_model_id(alias: str) -> Optional[str]:

@@ -91,7 +91,6 @@ def _agent_config() -> dict:
     try:
         from agent import qwen_harness as _qh
         return {
-            "preflight_lookup": _qh._preflight_enabled(),
             "smalltalk_rule": _qh._smalltalk_rule() != "",
             "thinking": _qh._thinking_on(),
         }

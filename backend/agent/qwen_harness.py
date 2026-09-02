@@ -19,8 +19,7 @@ from qwen_agent.tools.base import BaseTool, register_tool
 import json
 import re
 
-from agent._shared import (set_emit_target, emit as _emit, agent_call_lock,
-                          guard as _guard, reset_guard_reason as _reset_guard)
+from agent._shared import set_emit_target, emit as _emit, agent_call_lock
 
 # Reasoning vs answer separation for TTS: thinking must never be spoken.
 # Single source of truth lives in llm.ling_streaming; this is a thin re-export so the
@@ -37,6 +36,7 @@ _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 # (2) an optional per-request seed (qwen-agent forwards `seed` into generate_cfg, and
 #     llama-server honours it) turns a benchmark run reproducible. Neither changes the
 #     defaults unless you set them.
+_DEFAULT_TZ = os.getenv("VOICE_TZ", "Asia/Taipei")
 LLM_AGENT_TEMP = float(os.getenv("LLM_AGENT_TEMP", "0.7"))
 LLM_AGENT_TOP_P = float(os.getenv("LLM_AGENT_TOP_P", "0.9"))
 LLM_AGENT_SEED = os.getenv("LLM_AGENT_SEED", "").strip()
@@ -128,11 +128,12 @@ class QwenGetWeather(BaseTool):
 @register_tool('get_current_datetime', allow_overwrite=True)
 class QwenDateTime(BaseTool):
     name = 'get_current_datetime'
-    description = 'Get current date and time (UTC). Use for today/weekday/time questions.'
+    description = "Get the current date and time. Use for today/weekday/time questions."
     parameters = {
         'type': 'object',
         'properties': {
-            'timezone': {'type': 'string', 'description': 'IANA timezone, default UTC'}
+            'timezone': {'type': 'string',
+                         'description': f'IANA timezone. Defaults to {_DEFAULT_TZ}, where the user is.'}
         },
         'required': []
     }
@@ -142,30 +143,25 @@ class QwenDateTime(BaseTool):
                 params = json.loads(params)
             except Exception:
                 params = {}
-        tz = params.get('timezone', 'UTC') if isinstance(params, dict) else 'UTC'
+        # Default to the user's timezone, not UTC. When the model calls this without
+        # arguments -- the common case -- a UTC default made it announce "早上 05:42
+        # (UTC)" to someone for whom it was 13:42 in Taipei: a correct tool call
+        # rendered into a wrong answer. VOICE_TZ is where this demo is deployed.
+        tz = params.get('timezone') if isinstance(params, dict) else None
+        tz = tz or _DEFAULT_TZ
         from datetime import datetime, timedelta
         from zoneinfo import ZoneInfo
         try:
             now = datetime.now(ZoneInfo(tz))
         except Exception:
-            now = datetime.utcnow()
-            tz = "UTC"
+            now = datetime.now(ZoneInfo(_DEFAULT_TZ))
+            tz = _DEFAULT_TZ
         tom = now + timedelta(days=1)
         fmt = f"Current: {now.strftime('%A %Y-%m-%d %H:%M:%S')} ({tz}). Today {now.strftime('%A')} {now.strftime('%Y-%m-%d')}, Tomorrow {tom.strftime('%A')} {tom.strftime('%Y-%m-%d')}."
         _emit({"type": "tool_call", "name": "get_current_datetime", "arguments": {"timezone": tz}})
         _emit({"type": "tool_result", "name": "get_current_datetime", "result": {"date": now.strftime("%Y-%m-%d")}, "formatted": fmt, "latency_ms": 1, "source": "datetime"})
         return fmt
 
-# --- repair: a tool the model only NAME-DROPPED -----------------------------------
-# A 2B model sometimes "calls" a tool by printing its name and then answering:
-#     現在的時間是 [get_current_datetime]。        (no tool call was made)
-# The user then literally hears "the current time is bracket get current datetime
-# bracket", which is worse than a refusal. Reproducing it needed a fixed seed
-# (LLM_AGENT_SEED=4711) — i.e. it is a sampling lottery, not a one-off. So: detect the
-# placeholder, execute the tool that was named, and either splice a short result in
-# place (datetime is speakable verbatim, and needs no extra LLM call) or hand the
-# result back to the model for one corrective continuation (search results are not).
-_TOOL_PLACEHOLDER_RE = re.compile(r"\[\s*(get_current_datetime|get_weather|web_search)\s*\]")
 
 
 NO_ANSWER_ZH = "抱歉，我找不到相關的答案。"
@@ -231,354 +227,50 @@ def _msg_field(m, key, default=None):
     return getattr(m, key, default)
 
 
-def detect_unexecuted_tool(text, tool_ran: bool = False):
-    """The bracketed tool name in `text`, or None if the answer is clean / a tool
-    already ran this turn (a real call that returned 'No results' can legitimately be
-    mentioned by name)."""
-    if tool_ran or not text:
-        return None
-    m = _TOOL_PLACEHOLDER_RE.search(text)
-    return m.group(1) if m else None
 
 
-def splice_tool_result(text: str, tool_name: str, result: str) -> str:
-    """Replace the placeholder with the speakable part of the tool result."""
-    if not result:
-        return _TOOL_PLACEHOLDER_RE.sub("", text)
-    if tool_name == "get_current_datetime":
-        seg = result.split(".")[0].strip()                    # "Current: Mon 2026-… 12:49:33 (Asia/Taipei)"
-        if seg.lower().startswith("current:"):
-            seg = seg[len("current:"):].strip()
-        repl = seg
-    else:
-        repl = result.strip().split("\n")[0][:200]
-    # lambda replacement: a result containing backslashes or `\1` must not be read as
-    # a regex replacement template.
-    out = _TOOL_PLACEHOLDER_RE.sub(lambda _m: repl, text, count=1)
-    return _TOOL_PLACEHOLDER_RE.sub("", out)                   # never leave a bracket behind
 
 
-# A fabricated clock is worse than a fabricated headline: it is checkable at a glance and
-# this assistant talks to someone's morning. On the voice path (which appends the language
-# hint, so it samples differently) the model answered "現在是下午 3 點 25 分" when it was
-# 13:25 — with no tool call at all, so the placeholder repair above never fires. These two
-# narrow regexes make the datetime tool non-optional *for date/time questions only*: the
-# question has to ask about now, AND the answer has to state a time/date.
-_TIME_QUESTION_RE = re.compile(
-    r"(現在|现在|此刻|幾點|什么时候|什麼時間|什么时间|星期幾|礼拜几|週幾|周幾|今天|今天|明日|後天|日期|"
-    r"what time|what's the (?:date|time)|what day|current (?:time|date)|today'?s date)", re.I)
-_TIME_CLAIM_RE = re.compile(
-    r"(\d{1,2}\s*[:：]\s*\d{2}|\d{1,2}\s*[點点]\s*\d{0,2}\s*分?|"
-    r"[上下]午\s*\d{1,2}|\d{1,2}\s*[上下]午|"
-    r"星期[一二三四五六日天]|礼拜[一二三四五六日天]|週[一二三四五六日天]|"
-    r"\d{1,2}\s*月\s*\d{1,2}\s*[日号號]|\d{4}\s*年\s*\d{1,2}\s*月|"
-    r"\d{4}-\d{1,2}-\d{1,2}|"
-    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
-    r"january|february|march|april|may|june|july|august|september|october|november|december)", re.I)
 
 
-# A fabricated forecast is the weather-shaped version of the fabricated clock above, and
-# just as checkable: asked "台北今天天氣如何？", 2B answered "台北今天天氣晴朗，天空藍，適合外出
-# 活動！" with no tool call, on a day that was overcast with a 74-80% chance of rain.
-# Weather is deliberately not pre-flighted (get_weather is itself a reformulation over
-# web_search, so forcing it up front would have to label the call with a tool that did not
-# run), so the guard has to be here: the question has to ask for weather, AND the answer
-# has to state a forecast.
-_WEATHER_CLAIM_RE = re.compile(
-    r"(\d{1,2}\s*(?:°|度)\s*C?|攝氏|气温|氣溫|"
-    r"晴朗|晴天|多雲|多云|陰天|阴天|下雨|降雨|陣雨|阵雨|雷雨|雪|颱風|台风|"
-    r"降雨機率|降水概率|濕度|湿度|"
-    r"sunny|cloudy|overcast|rain(?:y|ing)?|showers?|thunder|snow|humidity|"
-    r"\d{1,3}\s*%)", re.I)
 
 
-def fabricates_weather_without_tool(task: str, text: str, tool_ran: bool = False) -> bool:
-    """True when the request asks for weather, the answer states a forecast, and no tool
-    ran to verify it. Same shape as fabricates_time_without_tool: a claim the user can
-    check against the sky, invented because the model would rather answer than call."""
-    if tool_ran or not task or not text:
-        return False
-    if not _WEATHER_REQUEST_RE.search(task):
-        return False
-    return bool(_WEATHER_CLAIM_RE.search(text))
 
 
-# Stricter sibling of _TIME_QUESTION_RE, for deciding to CALL the clock rather than to
-# check an answer against it. The loose form is safe post-hoc because it is paired with
-# "and the answer states a time", but on its own it fires on any sentence containing 今天
-# — "你今天看起來不錯" is small talk, not a request for the date.
-_TIME_REQUEST_RE = re.compile(
-    r"(幾點|几点|幾號|几号|星期幾|星期几|禮拜幾|礼拜几|週幾|周几|哪一天|今天.*日期|日期.*今天|"
-    r"今天.*(?:是|幾|几)\s*(?:星期|禮拜|礼拜|週|周|號|号|日)|"
-    r"現在.*(?:時間|时间|幾點|几点)|(?:時間|时间).*(?:現在|现在)|"
-    r"what\s+(?:time|day|date)\b|what\s+is\s+the\s+(?:time|date|day)\b|what'?s\s+the\s+(?:time|date|day)\b|"
-    r"current\s+(?:time|date)\b|today'?s\s+date\b)", re.I)
 
 
-def fabricates_time_without_tool(task: str, text: str, tool_ran: bool = False) -> bool:
-    """True when the request asks for the current date/time, the answer states one, and
-    get_current_datetime never ran. Deliberately narrow: 'when is the meeting?' answered
-    'at 5 pm' does not trigger (the question is not about now), and neither does a date
-    mentioned in passing by a non-time question."""
-    if tool_ran or not task or not text:
-        return False
-    # Weather queries often contain "今天" (e.g. "台北今天天氣如何？") but are not time questions —
-    # treating them as such forced a spurious get_current_datetime and a spoken clock.
-    if re.search(r"(天氣|天气|氣溫|气温|weather|forecast)", task, re.I):
-        return False
-    if not _TIME_QUESTION_RE.search(task):
-        return False
-    return bool(_TIME_CLAIM_RE.search(text))
 
 
-def format_clock_zh(tool_result: str) -> str:
-    """Turn get_current_datetime's `Current: Monday 2026-08-31 21:18:33 (Asia/Taipei). …`
-    into one speakable Traditional-Chinese sentence.
-
-    Used when the model asserted a clock it never verified: rewriting the sentence by
-    hand is the point — asking the model to redo it (the first version of this repair)
-    came back with the *same* fabricated time, because qwen-agent reuses the agent's
-    memory and the wrong claim was already in the context. Truthful and flat beats
-    fluent and wrong when the subject is what time it is.
-    """
-    from datetime import datetime as _dt
-    m = re.search(r"Current:\s*([A-Za-z]+)\s+(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})", tool_result or "")
-    if not m:
-        return ""
-    _weekday = {"Monday": "星期一", "Tuesday": "星期二", "Wednesday": "星期三", "Thursday": "星期四",
-                "Friday": "星期五", "Saturday": "星期六", "Sunday": "星期日"}
-    year, month, day, hh, mm = (int(x) for x in m.groups()[1:])
-    tz = re.search(r"\(([^)]+)\)\s*\.?\s*$", (tool_result or "").split(".")[0])
-    tz_label = {"Asia/Taipei": "台北時間", "UTC": "UTC"}.get(tz.group(1) if tz else "", tz.group(1) if tz else "")
-    try:                                        # sanity: the tool's own weekday must match its date
-        _dt.strptime(f"{year}-{month:02d}-{day:02d}", "%Y-%m-%d")
-    except ValueError:
-        return ""
-    zh_wd = _weekday.get(m.group(1), m.group(1))
-    suffix = f"（{tz_label}）" if tz_label else ""
-    return f"現在是 {year} 年 {month} 月 {day} 日{zh_wd}，{hh} 點 {mm:02d} 分{suffix}。"
 
 
-# --- pre-flight forcing for "what is true RIGHT NOW" questions --------------------
-# The last routing miss on the benchmark set was "Who is the president of France?"
-# answered from memory (7/7 → 6/7). For incumbency questions memory is never
-# acceptable: the answer expires, and a 2 B router will not reliably notice that. The
-# clock guard above runs *after* the answer; here the question alone identifies the
-# class, so the tool is invoked BEFORE the model speaks — which also avoids the
-# memory-replay failure that made a post-hoc "please redo it" unreliable.
-# Narrow on purpose: an office/holder noun (or 現任/誰是, or "who won"), not merely a
-# question. "What is the weather in Tokyo?" and greetings must not pay for a search.
-_INCUMBENT_OFFICE_ZH = (
-    r"總統|总统|首相|總理|总理|主席|市長|市长|州長|州长|省長|省长|部長|部长|"
-    r"執行長|执行长|董事長|董事长|國王|国王|女王|皇帝|教宗|教皇|冠軍|冠军|得主|領導人|领导人|總裁|总裁"
-)
-
-_INCUMBENT_RE = re.compile(
-    r"(?:誰是|谁是|哪一位是|現任|现任|目前在任)"
-    # Chinese normally puts 誰 AFTER the office noun ("法國總統是誰？"), the mirror of the
-    # English "who is the …" branch below. Matching only the verb-first 誰是 form missed
-    # the ordinary phrasing — including this app's own demo chip, 法國現在的總統是誰？ —
-    # so the question was answered from the model's memory instead of from a search.
-    r"|(?:" + _INCUMBENT_OFFICE_ZH + r")[^。？?！!]{0,8}(?:是誰|是谁)"
-    r"|who\s+(?:is|are|was|will\s+be)\s+(?:the|a|an)?[\w'’ é\-]{0,40}?"
-    r"(?:president|prime minister|premier|\bpm\b|chancellor|mayor|governor|monarch|king|queen|emperor|"
-    r"ceo|chief executive|chairman|chairwoman|chairperson|minister|secretary|speaker|senator|"
-    r"cardinal|pope|head coach|headmaster)"
-    r"|who\s+(?:won|wins|leads|runs|heads|took)"
-    r"|(?:最新|最近)[^?？。]{0,8}(?:新聞|新闻|消息|結果|结果|價格|价格)"
-    r"|(?:as of|right now)[^.?？]{0,24}(?:president|leader|price|version|record|champion)", re.I)
 
 
-def requires_fresh_facts(task: str) -> bool:
-    """True when the request can only be answered by something that is currently true
-    (an office holder, a winner, a latest figure) — i.e. memory is not a source."""
-    return bool(task) and bool(_INCUMBENT_RE.search(task))
 
 
-_LOOKUP_REQUEST_RE = re.compile(
-    r"(幫我|幫忙|請|麻煩|能不能|可以)?\s*(找|查|搜|搜尋|搜索|查詢|查閱|看看|查)\s*(一下|下|過)?"
-    r"|(搜尋|搜索|查詢|查閱|找)\s*(一下|過)?\s*(今天|今日|最新|最近|這|那)?"
-    r"|(今天|今日|最新|最近)[^。？?！!]{0,10}(新聞|消息|頭條|头条|進展|进展|news)"
-    r"|\b(search|look\s?up|find\s+(?:out|me)|google|check\s+(?:the|for))\b"
-    r"|\b(what'?s|what is)\s+(the\s+)?(news|happening|new)\b"
-    r"|(any|some)\s+news\b", re.I)
-
-# A request, not a statement: "今天天氣不錯" (small talk) must not trigger a forecast call,
-# "東京今天天氣如何？" must.
-_WEATHER_REQUEST_RE = re.compile(
-    r"(天氣|天气|氣溫|气温|下雨|降雨|溫度|温度|forecast)"
-    r".{0,14}(如何|怎麼|怎么|怎样|怎樣|嗎|么|嗎？|\?|？|幾度|多少)|"
-    r"(如何|怎麼|怎么|怎樣|怎样).{0,10}(天氣|天气|氣溫|气温)|"
-    r"\b(weather|forecast|temperature|rain(ing)?|snow(ing)?)\b", re.I)
 
 
-def _preflight_enabled() -> bool:
-    """Turn the *steering* guards off to measure the model underneath them.
-
-    A pre-flight that invokes the tool the question already demands will, by
-    construction, make a benchmark that asks "did the tool run?" answer "yes". That makes
-    the routing number partly a measurement of this guard instead of the model, so it has
-    to be switchable and reported both ways: LLM_PREFLIGHT_TOOLS=0 answers with the real
-    router (and, measured, a third of news turns then answer from memory).
-    """
-    return os.getenv("LLM_PREFLIGHT_TOOLS", "1").strip().lower() not in ("0", "false", "no")
 
 
-def required_tool_for_request(task: str):
-    """The tool a request needs *by its own form*, independent of what the model feels like
-    doing. Returns a tool name or None.
-
-    This exists because the alternative is a coin flip: measured over 5 identical two-turn
-    voice sessions, "幫我找一下今天的新聞" produced a real web_search 4 times and, once,
-    the sentence "今天有新聞嗎？我來幫您搜尋一下。" — an announcement of a search that was
-    never performed, spoken to the user as the answer. A request that names the lookup in
-    its own wording does not need the model's permission.
-    """
-    if not task or not task.strip():
-        return None
-    t = task.strip()
-    # The current date/time is not in the weights, exactly like an office holder is not
-    # (see requires_fresh_facts): asking the model to recall it is asking it to invent it.
-    # fabricates_time_without_tool() only catches the case where it states a time anyway;
-    # measured here, 2B answered "今天是星期幾？" with the non-answer "今天是一週的幾號？"
-    # and called nothing at all, which that post-hoc check cannot see. Weather owns "今天"
-    # in "今天天氣" and must not be dragged into a clock lookup.
-    # Checked before the clock: "法國現在的總統是誰？" is an office-holder lookup that merely
-    # contains 現在 ("now"), not a question about the time.
-    if _LOOKUP_REQUEST_RE.search(t) or requires_fresh_facts(t):
-        return "web_search"
-    if _TIME_REQUEST_RE.search(t) and not _WEATHER_REQUEST_RE.search(t):
-        return "get_current_datetime"
-    return None
 
 
-_EMPTY_REFUSAL_RE = re.compile(
-    r"(無法|无法|没能|沒有|没有|未|未能)"
-    r"[^。！？!?\n]{0,12}(取得|獲取|获取|拿到|查到|搜到|讀到|读到|提供|回報|回报|找到| searched)?"
-    r"[^。！？!?\n]{0,10}(資料|资讯|資訊|結果|结果|新聞|新闻|內容|内容|報導|报道|答案|解答|answer|result)"
-    r"|(找不到|查不到|搜不到|搜不出|查不出|沒有找到|没有查到)"
-    r"|(i|we)\s+(could\s?n.?t|cannot|can\s?n.?t)\s+(find|get|retrieve|access)", re.I)
 
 
-def _last_tool_result(all_resps) -> str:
-    """The longest `role=function` payload this turn produced — what the tools really
-    returned, independent of what the model decided to say about it."""
-    best = ""
-    for resp in all_resps or []:
-        for m in (resp if isinstance(resp, list) else [resp]):
-            if isinstance(m, dict) and m.get("role") == "function" and isinstance(m.get("content"), str):
-                if len(m["content"]) > len(best):
-                    best = m["content"]
-    return best
 
 
-def refuses_results_it_has(text: str, result_text: str, max_len: int = 90) -> bool:
-    """True when the answer claims it could not get the information that is sitting in
-    `result_text`. Length-capped on purpose: a genuine "I could not find X, but Y and Z
-    happened" answer is long and informative, while the refusal is short and empty."""
-    if not (result_text or "").strip():
-        return False
-    t = (text or "").strip()
-    if not t or len(t) > max_len:
-        return False
-    if "http" in t or result_headlines(result_text, limit=1):
-        pass                      # results exist; that is the precondition, not a filter
-    return bool(_EMPTY_REFUSAL_RE.search(t))
 
 
-_OFFER_RE = re.compile(
-    r"(我來|我將|我會|讓我|我可以|我應該|我這邊|需要我|要不要我|馬上為您|馬上幫你|立即)"
-    r"[^。！？!?\n]{0,10}(搜尋|搜索|查詢|查閱|查一下|检索|檢索|找資料|找一下|搜一下)"
-    r"|(有|有没有|有沒有)[^。！？!?\n]{0,8}(嗎|呢)[^。！？!?\n]{0,14}(搜尋|查|找)", re.I)
-_OFFER_EN_RE = re.compile(
-    r"\b(let me|i'?ll|i will|i can|i should|shall i)\s+(search|look\s?(it|that|this|you)?\s*up|check|find out)\b", re.I)
 
 
-def offers_action_without_doing_it(task: str, text: str, tool_ran: bool = False) -> bool:
-    """True when the answer *promises* a lookup that never happened.
-
-    Narrow on purpose: it only fires when the request's own form requires a lookup
-    (required_tool_for_request) and no tool actually ran, so a legitimate
-    "我可以幫你查天氣，要嗎？" answer to a vague remark is left alone."""
-    if tool_ran or not text:
-        return False
-    # Weather promises are also empty promises, even though weather is not forced via
-    # required_tool_for_request (deliberately, to avoid duplicate pre-flight). A bare
-    # "讓我查一下天氣預報" without a call must still be repaired — otherwise it is spoken.
-    if _WEATHER_REQUEST_RE.search(task or ""):
-        if re.search(r"(讓我|我來|我會|幫您|查一下天氣|天氣預報|幫你查天氣)", text, re.I):
-            return True
-    if required_tool_for_request(task) is None:
-        return False
-    return bool(_OFFER_RE.search(text) or _OFFER_EN_RE.search(text))
 
 
-_RESULT_LINE_RE = re.compile(r"^\s*(?:\[\d+\]|\d+[\.\)、])\s*(.+?)\s*$")
 
 
-def result_headlines(result: str, limit: int = 3) -> list:
-    """Titles out of a format_results() block ("[1] Title — src\nURL: …"). Shape-based."""
-    out = []
-    for line in (result or "").splitlines():
-        m = _RESULT_LINE_RE.match(line)
-        if not m:
-            continue
-        title = re.split(r"\s+[—–]\s+", m.group(1))[0].strip()
-        title = re.sub(r"^URL:\s*", "", title)
-        if title and not title.lower().startswith("http") and title not in out:
-            out.append(title)
-        if len(out) >= limit:
-            break
-    return out
 
 
-def answer_from_results(text: str, result: str) -> str:
-    """Replace a promise to search with what the search actually found.
-
-    Used only when the model-with-results continuation also failed: saying nothing is the
-    failure being fixed, so a deterministic digest beats both an apology and silence. No
-    second LLM call — the same lesson the clock repair learned (qwen-agent reuses its
-    memory and reproduced the wrong answer)."""
-    keep = [seg for seg in re.split(r"(?<=[。！？!?\n])", text or "")
-            if seg.strip() and not (_OFFER_RE.search(seg) or _OFFER_EN_RE.search(seg))]
-    lead = "".join(keep).strip()
-    heads = result_headlines(result)
-    if not heads:
-        return lead or "我搜尋了，但沒有拿到可用的結果。"
-    cjk = any("\u4e00" <= c <= "\u9fff" for c in (text or ""))
-    body = "、".join(h[:44] for h in heads) if cjk else ", ".join(h[:44] for h in heads)
-    tail = f"查到的是：{body}。" if cjk else f"Here is what came up: {body}."
-    return (lead + " " if lead else "") + tail
 
 
-def _run_named_tool(name: str, task: str) -> str:
-    """Execute a registered tool by name, deriving params from the user's request.
-    The tools' own .call() emits the tool_call / tool_result events, so the UI sees
-    exactly what ran — the repair is not hidden."""
-    from qwen_agent.tools.base import TOOL_REGISTRY
-    inst = TOOL_REGISTRY.get(name)
-    if inst is None:
-        return ""
-    inst = inst()
-    try:
-        if name == "get_current_datetime":
-            return inst.call({"timezone": os.getenv("VOICE_TZ", "Asia/Taipei")})
-        # Both remaining branches MUST go through the registered tool's .call(), not
-        # straight to web_search_sync: .call() is what emits the tool_call / tool_result
-        # events. The first version of this helper called web_search_sync directly and
-        # the forced search was invisible to /api/chat and to the WS client — a repair
-        # the user cannot see is indistinguishable from one that never happened.
-        if name == "web_search":
-            return inst.call({"query": task[:80]})
-        if name == "get_weather":
-            # get_weather is itself a query reformulation over web_search_sync, and
-            # extracting a bare city out of a sentence is the unreliable part of it,
-            # so run the same backend through the search tool with the request verbatim.
-            ws = TOOL_REGISTRY.get("web_search")
-            return ws().call({"query": task[:80]}) if ws is not None else ""
-    except Exception as e:
-        logger.warning(f"repair: tool {name} failed: {e!r}")
-        return ""
+
+
 
 
 def _thinking_on() -> bool:
@@ -718,57 +410,12 @@ async def run_agent_task(task: str, event_q=None, history=None) -> str:
             # satisfied one of the tools, so the model cannot call that tool twice.
             _turn_agent = agent
             messages = hist + [{'role': 'user', 'content': task}]
-            # Measured both ways over 5 identical two-turn voice sessions:
-            #   incumbency-only  -> 2/5 news turns answered from memory (fabricated
-            #                       "news") and 1 said only "今天有幾則新聞報導。"
-            #   form-based       -> 5/5 searched, but the model searched again on top of
-            #                       the injected result (2-3 calls, 8-11 s first audio)
-            # so the form-based check stays, and the duplicate is removed structurally by
-            # running the turn on an agent whose web_search is already satisfied.
-            _preflight_tool = required_tool_for_request(task) if _preflight_enabled() else None
-            preflight_ran = False
-            if _preflight_tool:
-                # A real invocation of a real tool (its own tool_call/tool_result events
-                # fire inside .call, so the UI and the benchmark see it) placed in context
-                # ahead of the answer. Nothing is invented here: if the search fails the
-                # messages are untouched and the model answers as it likes.
-                _gt = _guard("preflight_lookup", _preflight_tool,
-                            "the question asks for a lookup; it was run before the answer")
-                try:
-                    forced = _run_named_tool(_preflight_tool, task[:80])
-                    if forced:
-                        # Label the injected exchange with the tool that actually ran.
-                        # This said 'web_search' unconditionally, so a pre-flighted
-                        # get_current_datetime was presented to the model as a search —
-                        # the same "claiming one tool ran when another did" dishonesty
-                        # the note in required_tool_for_request warns about.
-                        _args = ({'query': task[:80]} if _preflight_tool == 'web_search'
-                                 else {'location': task[:80]} if _preflight_tool == 'get_weather'
-                                 else {})
-                        messages = messages + [
-                            {'role': 'assistant', 'content': '',
-                             'function_call': {'name': _preflight_tool, 'arguments': json.dumps(_args, ensure_ascii=False)}},
-                            {'role': 'function', 'name': _preflight_tool, 'content': forced[:3000]},
-                        ]
-                        # A pre-flighted tool is a tool that ran. tool_ran is derived from
-                        # all_resps (what the agent yielded), which never sees this
-                        # injection — so without it the repair guards below concluded
-                        # nothing had run and called the tool a second time, appending a
-                        # redundant clock to an answer that was already correct.
-                        preflight_ran = True
-                        # The tool it just satisfied is no longer offered for this turn.
-                        # Not just this tool — ALL of them. Leaving get_weather visible
-                        # made the model answer a news request with a weather report (it
-                        # wanted a tool to call, so it called the one it had). With the
-                        # lookup already in context this turn's job is to answer.
-                        _turn_agent = _get_agent(exclude=_TOOLS_FULL)
-                        logger.info(f"pre-flight {_preflight_tool} forced: the request asks for a lookup "
-                                    "(incumbency/latest fact, or an explicit search/news request); "
-                                    f"this turn runs with no tools (the lookup it needs is already in context)")
-                except Exception as e:
-                    logger.warning(f"pre-flight search failed (answering without it): {e!r}")
-                finally:
-                    _reset_guard(_gt)
+            # No pre-flight. Deciding from the *form* of the question which tool must
+            # run, then injecting a synthetic assistant/function exchange before the
+            # model has said anything, is steering by regex: it made the routing metric
+            # measure the guard rather than the model, and on Qwen3.5 4B the injected
+            # turn is what the model then read aloud instead of answering. The tools are
+            # declared to the agent; it decides.
             all_resps = []
             # --- answer streaming (qwen-agent yields `response + partial_output` on
             # every LLM chunk, so the final step's content is available incrementally).
@@ -850,95 +497,15 @@ async def run_agent_task(task: str, event_q=None, history=None) -> str:
                             if txt.strip():
                                 candidates_all.append({"role": "assistant", "content": txt})
             if candidates_all:
+                # The answer is whatever the agent last said. Nothing here inspects it
+                # for what it 'should' have done: the guard layer that used to live at
+                # this point matched hand-written Chinese patterns against the answer and
+                # then re-ran tools, spliced results, or rewrote sentences. Measured on
+                # Qwen3.5 4B it made things worse, not better -- '現在幾點？' went from a
+                # correct 3.3 s reply to 28.9 s of the model reading its own deliberation
+                # aloud, because it was narrating the tool result the pre-flight had
+                # injected. The model calls its own tools; that is what tools are for.
                 final_text = candidates_all[-1].get('content', '')
-                # Did a tool actually run this turn? (a real call that came back empty
-                # may legitimately be referred to by name — that is not the bug below)
-                # qwen_agent yields either dicts or Message objects depending on the step
-                # (the streaming loop above has to normalize for the same reason). Testing
-                # only for dicts left tool_ran False on turns where tools really had run,
-                # which fired the repair guards below on a correct answer: "法國現在的總統
-                # 是誰？" got an unrelated clock appended, because the question contains 現在
-                # and the answer contains years, and the guard believed no tool had run.
-                tool_ran = preflight_ran or any(
-                    _msg_field(m, 'role') == 'function' or _msg_field(m, 'function_call')
-                    for resp in all_resps for m in (resp if isinstance(resp, list) else [resp]))
-                missing = detect_unexecuted_tool(final_text, tool_ran)
-                must_regenerate = False
-                offered_lookup = False
-                if missing is None and not tool_ran and refuses_results_it_has(final_text, _last_tool_result(all_resps)):
-                    # A search ran and returned, and the answer was "抱歉，我無法獲取即時新聞。"
-                    # — the worst possible combination: the work is done and the user is
-                    # told it could not be. Speak what the tool actually found instead.
-                    logger.warning("tool ran but the answer refused its results — speaking the results")
-                    _gt = _guard("refusal_repair", "web_search",
-                                 "a tool returned data and the answer claimed there was none")
-                    final_text = answer_from_results(final_text, _last_tool_result(all_resps))
-                    _reset_guard(_gt)
-                    _emit({"type": "llm_delta", "text": "", "reset": True})
-                if missing is None and offers_action_without_doing_it(task, final_text, tool_ran):
-                    # "今天有新聞嗎？我來幫您搜尋一下。" — the promise IS the answer, and no
-                    # search ran. Run the lookup the request already asked for; the search
-                    # branch below hands the results back for a real answer.
-                    logger.warning("answer promised a lookup that never ran — executing it")
-                    missing, offered_lookup = "web_search", True
-                if missing is None and fabricates_weather_without_tool(task, final_text, tool_ran):
-                    # Unlike the clock there is no deterministic rewrite to splice: the fix
-                    # is to fetch the real forecast and let the model answer again with it
-                    # in context (the get_weather branch below does exactly that).
-                    logger.warning("answer states weather that no tool verified — forcing the lookup")
-                    missing = "get_weather"
-                if missing is None and fabricates_time_without_tool(task, final_text, tool_ran):
-                    # Splicing the true clock into "現在是下午 3 點 25 分" would leave the
-                    # wrong claim standing next to the right one, so let the model rewrite
-                    # the sentence with the tool result in context.
-                    logger.warning("answer states a date/time that no tool verified — forcing the call")
-                    missing, must_regenerate = "get_current_datetime", True
-                if missing:
-                    logger.warning(f"answer named {missing} without calling it — executing the tool it referenced")
-                    _why = ("clock_repair" if must_regenerate
-                            else "empty_promise_repair" if offered_lookup else "named_tool_repair")
-                    _gt = _guard(_why, missing, "the answer referred to a lookup it never performed")
-                    result = _run_named_tool(missing, task)
-                    repaired = ""
-                    if result:
-                        if must_regenerate:
-                            repaired = format_clock_zh(result)      # deterministic; no LLM round-trip
-                        elif missing == 'get_current_datetime':
-                            repaired = splice_tool_result(final_text, missing, result)   # speakable verbatim, no extra LLM call
-                        else:
-                            # Search output is not speakable verbatim: hand it back with the
-                            # result in context and take the corrected answer (one extra call,
-                            # only on this failure path).
-                            cont = messages + [
-                                {"role": "assistant", "content": final_text},
-                                {"role": "function", "name": missing, "content": result[:3000]},
-                            ]
-                            with agent_call_lock:
-                                for resp in _turn_agent.run(messages=cont, **run_kwargs):
-                                    lst = resp if isinstance(resp, list) else [resp]
-                                    for m in lst:
-                                        _c = _msg_field(m, 'content')
-                                        if (_msg_field(m, 'role') == 'assistant'
-                                                and isinstance(_c, str) and _c.strip()):
-                                            repaired = _c
-                    if not repaired:
-                        if offered_lookup:
-                            # For the empty-promise case a digest of the real results is
-                            # strictly better than an apology: the user asked for news and
-                            # news is in hand.
-                            repaired = answer_from_results(final_text, result)
-                        elif missing in ("web_search", "get_weather"):
-                            # Continuing with the raw results did not produce a usable
-                            # answer; splicing a results blob into a spoken sentence would
-                            # be worse than admitting it.
-                            repaired = "我搜尋了網路資料，但摘要失敗了，請再問一次。"
-                        else:
-                            repaired = splice_tool_result(final_text, missing, result)
-                    # Withdraw the draft that was streamed (the pipeline also refuses to
-                    # speak tool-name artifacts); the consumer replays this repaired text.
-                    final_text = repaired
-                    _emit({"type": "llm_delta", "text": "", "reset": True})
-                    _reset_guard(_gt)
                 return _answer_or_fallback(final_text)
             # Fallback to memory (also filter empty)
             if hasattr(agent, 'memory') and agent.memory:

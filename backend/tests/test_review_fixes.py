@@ -154,11 +154,11 @@ class TestAuth(unittest.TestCase):
         appmod.MODEL_SWITCH_REQUIRE_TOKEN = False
         self._reset_switch_state()
         with self._switch_ok():
-            r = _client().post("/api/model", json={"model_id": "qwen3.5-2b-q4"})
+            r = _client().post("/api/model", json={"model_id": "qwen3.5-4b-q8"})
         self.assertEqual(r.status_code, 200, r.text)
         hist = appmod.stats["model_switches"]
         self.assertEqual(len(hist), 1, "the switch must be recorded")
-        self.assertTrue(hist[-1]["ok"] and hist[-1]["model"] == "qwen3.5-2b-q4")
+        self.assertTrue(hist[-1]["ok"] and hist[-1]["model"] == "qwen3.5-4b-q8")
         self.assertTrue(hist[-1]["peer"], "it must be attributable")
 
     def test_closed_mode_is_still_available_as_a_choice(self):
@@ -166,7 +166,7 @@ class TestAuth(unittest.TestCase):
         appmod.MODEL_SWITCH_REQUIRE_TOKEN = True
         self._reset_switch_state()
         try:
-            r = _client().post("/api/model", json={"model_id": "qwen3.5-2b-q4"})
+            r = _client().post("/api/model", json={"model_id": "qwen3.5-4b-q8"})
             self.assertEqual(r.status_code, 403)
             self.assertIn("remedy", r.json(), "a refusal must say what to do about it")
             self.assertEqual(len(appmod.stats["model_switches"]), 0, "refused switches are not performed")
@@ -181,8 +181,10 @@ class TestAuth(unittest.TestCase):
         self._reset_switch_state()
         with self._switch_ok():
             c = _client()
-            first = c.post("/api/model", json={"model_id": "qwen3.5-2b-q4"})
-            second = c.post("/api/model", json={"model_id": "qwen3.5-4b-q4"})
+            first = c.post("/api/model", json={"model_id": "qwen3.5-4b-q8"})
+            # The registry holds a single model, so the thrash to guard against is the
+            # same id twice in a row -- which still restarts llama-server for everyone.
+            second = c.post("/api/model", json={"model_id": "qwen3.5-4b-q8"})
         self.assertEqual(first.status_code, 200)
         self.assertEqual(second.status_code, 429, "immediate re-switch must not restart the server twice")
         j = second.json()
@@ -194,9 +196,9 @@ class TestAuth(unittest.TestCase):
         appmod.AUTH_TOKEN = "sekret"
         self._reset_switch_state()
         try:
-            self.assertEqual(_client().post("/api/model", json={"model_id": "qwen3.5-2b-q4"}).status_code, 401)
+            self.assertEqual(_client().post("/api/model", json={"model_id": "qwen3.5-4b-q8"}).status_code, 401)
             with self._switch_ok():
-                ok = _client().post("/api/model", json={"model_id": "qwen3.5-2b-q4"},
+                ok = _client().post("/api/model", json={"model_id": "qwen3.5-4b-q8"},
                                     headers={"X-Auth-Token": "sekret"})
             self.assertEqual(ok.status_code, 200, ok.text)
         finally:
@@ -1090,158 +1092,10 @@ class TestLlmSeedPassthrough(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--seed") + 1], "4711")
 
 
-class TestToolNamePlaceholderRepair(unittest.TestCase):
-    """Reproduced with LLM_AGENT_SEED=4711 on the live 2B model: for "What time is it
-    right now?" the agent called nothing and answered 現在的時間是 [get_current_datetime]。
-    — i.e. the user is spoken a tool name. Two layers fix it: repair the answer
-    (agent/qwen_harness), and refuse to speak the draft in the first place
-    (pipeline._is_tool_artifact)."""
-
-    def setUp(self):
-        import agent.qwen_harness as qh
-        from pipeline.speech_to_speech import _is_tool_artifact
-        self.qh, self.is_artifact = qh, _is_tool_artifact
-
-    def test_detects_only_unexecuted_known_tools(self):
-        self.assertEqual(self.qh.detect_unexecuted_tool("現在的時間是 [get_current_datetime]。"),
-                         "get_current_datetime")
-        self.assertIsNone(self.qh.detect_unexecuted_tool("現在的時間是 12:49。"))
-        self.assertIsNone(self.qh.detect_unexecuted_tool("[web_search] 沒找到", tool_ran=True),
-                          "a real call that returned nothing may be named in prose")
-        self.assertIsNone(self.qh.detect_unexecuted_tool("選項 [A] 比較好"),
-                          "ordinary bracketed text is not a tool reference")
-        self.assertIsNone(self.qh.detect_unexecuted_tool(""))
-
-    def test_splice_replaces_with_speakable_value(self):
-        fmt = ("Current: Monday 2026-08-31 12:49:33 (Asia/Taipei). "
-               "Today Monday 2026-08-31, Tomorrow Tuesday 2026-09-01.")
-        out = self.qh.splice_tool_result("現在的時間是 [get_current_datetime]。", "get_current_datetime", fmt)
-        self.assertEqual(out, "現在的時間是 Monday 2026-08-31 12:49:33 (Asia/Taipei)。")
-        self.assertNotIn("[", out)
-
-    def test_splice_when_the_tool_failed_leaves_no_brackets(self):
-        out = self.qh.splice_tool_result("答案是 [web_search]。", "web_search", "")
-        self.assertNotIn("web_search", out)
-        self.assertNotIn("[", out)
-
-    def test_splice_is_not_a_regex_template(self):
-        # A search result can contain `\1` or `\\` — must not be eaten as a group ref.
-        out = self.qh.splice_tool_result("x [web_search] y", "web_search", "C:\\path\\1")
-        self.assertIn("\\1", out)
-        self.assertNotIn("[web_search]", out)
-
-    def test_fabricated_clock_is_detected_only_for_now_questions(self):
-        f = self.qh.fabricates_time_without_tool
-        # the live failure: 現在是下午 3 點 25 分 spoken when it was 13:25
-        self.assertTrue(f("What time is it right now?", "現在是下午 3 點 25 分"))
-        self.assertTrue(f("現在幾點了？", "現在是 15:25。"))
-        self.assertTrue(f("今天是星期幾？", "今天是星期一。"))
-        self.assertTrue(f("what day is it today?", "It is Monday, 31 August."))
-        # not a "now" question -> the tool is not mandatory
-        self.assertFalse(f("When is the meeting?", "The meeting is at 5 pm."))
-        self.assertFalse(f("Who is the president of France?", "它是 2024 年選出來的。"))
-        self.assertFalse(f("Tell me about Monday Night Football", "週一晚上的比賽很精彩。"))
-        # a real call this turn -> nothing to repair
-        self.assertFalse(f("What time is it right now?", "現在是下午 3 點。", tool_ran=True))
-        # an answer with no time claim needs no tool either
-        self.assertFalse(f("What time is it right now?", "抱歉，我查不到。"))
-
-    def test_format_clock_zh_is_truthful_and_strict(self):
-        f = self.qh.format_clock_zh
-        self.assertEqual(
-            f("Current: Monday 2026-08-31 21:18:33 (Asia/Taipei). Today Monday 2026-08-31, "
-              "Tomorrow Tuesday 2026-09-01."),
-            "現在是 2026 年 8 月 31 日星期一，21 點 18 分（台北時間）。")
-        self.assertEqual(f("Current: Sunday 2026-01-04 00:05:09 (UTC). Today …"),
-                         "現在是 2026 年 1 月 4 日星期日，0 點 05 分（UTC）。")
-        self.assertEqual(f("No results"), "", "unparseable tool output must not be dressed up as a time")
-        self.assertEqual(f(""), "")
-
-    def test_pipeline_refuses_to_speak_artifacts(self):
-        self.assertTrue(self.is_artifact("現在的時間是 [get_current_datetime]。"))
-        self.assertTrue(self.is_artifact("<tool_call>"))
-        self.assertTrue(self.is_artifact("web_search"))
-        self.assertFalse(self.is_artifact("台北今天午後有陣雨，氣溫 31 度。"))
-        self.assertFalse(self.is_artifact("我可以用 web_search 幫你查最新的資料給自己聽"),
-                         "prose that merely mentions the tool by name is still speech")
 
 
-class TestFreshFactsGuard(unittest.TestCase):
-    """'Who is the president of France?' was answered from memory — the last routing miss
-    (7/7 → 6/7). Memory is not a source for an incumbency question, so the tool is
-    invoked before the model speaks. The narrowness is the point: everything else on the
-    benchmark set must keep paying zero extra latency."""
-
-    def setUp(self):
-        import agent.qwen_harness as qh
-        self.f = qh.requires_fresh_facts
-
-    def test_incumbency_and_winner_questions_are_forced_to_search(self):
-        for q in ["Who is the president of France?", "Who is the CEO of OpenAI?",
-                  "who is the prime minister of the uk", "誰是台北市長？",
-                  "現任美國副總統是誰", "Who won the World Series?",
-                  "最近有什麼新聞嗎"]:
-            self.assertTrue(self.f(q), q)
-
-    def test_everything_else_is_left_alone(self):
-        for q in ["Hello, how are you today?", "Hi there!",
-                  "What is the weather in Tokyo today?", "今天是星期幾？",
-                  "What time is it right now?", "Tell me a story about a robot",
-                  "Search for the latest news about artificial intelligence",
-                  "解釋一下量子計算", ""]:
-            self.assertFalse(self.f(q), q)
-
-    def test_greeting_set_is_exactly_the_benchmark_non_tool_queries(self):
-        # the two None-expected queries in TOOL_QUERIES must never trigger a search
-        self.assertFalse(self.f("Hello, how are you today?"))
-        self.assertFalse(self.f("Hi there!"))
 
 
-class TestRunNamedToolGoesThroughCall(unittest.TestCase):
-    """The forced/repair tools must execute via the registered tool's .call(), because
-    .call() is what emits tool_call/tool_result. The first version called web_search_sync
-    directly: the pre-flight search really ran, but /api/chat reported `tool_calls: []`
-    and the WS client saw nothing — an invisible repair is indistinguishable from a
-    missing one (and it made the benchmark score the turn as no-tool)."""
-
-    def test_every_branch_routes_through_the_tool_object(self):
-        import agent.qwen_harness as qh
-        from qwen_agent.tools.base import TOOL_REGISTRY
-        seen = []
-
-        class FakeSearch:
-            def call(self, params, **kw):
-                seen.append(("search", params))
-                return "SEARCH-RESULT"
-
-        class FakeDT:
-            def call(self, params, **kw):
-                seen.append(("dt", params))
-                return "Current: Monday 2026-08-31 10:00:00 (Asia/Taipei). Today Monday."
-
-        keys = ("web_search", "get_weather", "get_current_datetime")
-        saved = {k: TOOL_REGISTRY.get(k) for k in keys}
-        TOOL_REGISTRY.update({"web_search": FakeSearch, "get_weather": FakeSearch,
-                             "get_current_datetime": FakeDT})
-        try:
-            self.assertEqual(qh._run_named_tool("web_search", "Who is the president of France?"),
-                             "SEARCH-RESULT")
-            self.assertEqual(seen[-1][0], "search")
-            self.assertIn("query", seen[-1][1])
-            self.assertEqual(qh._run_named_tool("get_weather", "台北明天天氣如何？"), "SEARCH-RESULT")
-            self.assertEqual(seen[-1][0], "search", "weather repair must still go through a tool object")
-            out = qh._run_named_tool("get_current_datetime", "現在幾點")
-            self.assertTrue(out.startswith("Current:"))
-            self.assertEqual(seen[-1][0], "dt")
-            self.assertIn("timezone", seen[-1][1])
-        finally:
-            for k, v in saved.items():
-                if v is not None:
-                    TOOL_REGISTRY[k] = v
-
-    def test_unknown_tool_returns_empty_instead_of_raising(self):
-        import agent.qwen_harness as qh
-        self.assertEqual(qh._run_named_tool("defenestrate", "x"), "")
 
 
 class TestSpeechTextShaping(unittest.TestCase):
@@ -1648,117 +1502,6 @@ class TestShipFilesAreValid(unittest.TestCase):
         self.assertIn(host, doc["services"])
 
 
-class TestLookupRequestIsNotOptional(unittest.TestCase):
-    """Measured over 5 identical two-turn voice sessions: "幫我找一下今天的新聞" produced a
-    real web_search 4/5 times, and once produced "今天有新聞嗎？我來幫您搜尋一下。" — the
-    announcement of a search that was never performed, delivered as the answer. A request
-    that contains the lookup in its own wording should not depend on the model's mood."""
-
-    def _req(self, task):
-        from agent.qwen_harness import required_tool_for_request
-        return required_tool_for_request(task)
-
-    def test_explicit_lookup_requests_require_the_call(self):
-        for t in ("幫我找一下今天的新聞", "請幫我查一下台積電股價", "搜尋一下最新的AI進展",
-                  "Search for the latest news about artificial intelligence",
-                  "What's the news today?", "any news on the election?",
-                  "Who is the president of France?"):
-            self.assertEqual(self._req(t), "web_search", t)
-
-    def test_small_talk_and_statements_require_nothing(self):
-        for t in ("餵你好", "Hi there!", "Hello, how are you today?", "謝謝", "你今天看起來不錯",
-                  "今天天氣不錯", "我們聊一下吧", ""):
-            self.assertIsNone(self._req(t), t)
-
-    def test_a_date_question_routes_to_the_clock_not_a_web_search(self):
-        # A search here would replace the wrong answer with a different wrong answer.
-        # The date is not in the weights either, so it routes to the clock instead of
-        # being left to the model: 2B answered "今天是星期幾？" with the non-answer
-        # "今天是一週的幾號？" and called nothing at all.
-        for t in ("今天是星期幾？", "What time is it right now?", "現在幾點了"):
-            self.assertEqual(self._req(t), "get_current_datetime", t)
-
-    def test_weather_is_deliberately_out_of_scope(self):
-        # Forcing weather from here would report the wrong tool name (the pre-flight
-        # reaches weather through web_search), which makes the benchmark lie.
-        self.assertIsNone(self._req("What is the weather in Tokyo today?"))
-
-    def _offer(self, task, text, tool_ran=False):
-        from agent.qwen_harness import offers_action_without_doing_it
-        return offers_action_without_doing_it(task, text, tool_ran)
-
-    def test_the_promise_instead_of_the_search_is_detected(self):
-        task = "幫我找一下今天的新聞"
-        self.assertTrue(self._offer(task, "今天有新聞嗎？我來幫您搜尋一下。"))
-        self.assertTrue(self._offer(task, "好的，我可以幫你查詢最新的新聞內容。"))
-        self.assertTrue(self._offer("What's the news today?", "Let me search for that."))
-        self.assertTrue(self._offer("What's the news today?", "I will look it up for you."))
-
-    def test_a_real_search_or_a_vague_remark_is_left_alone(self):
-        self.assertFalse(self._offer("幫我找一下今天的新聞", "我來幫您搜尋一下。", tool_ran=True),
-                         "the bug is the promise without the call, not the wording")
-        self.assertFalse(self._offer("我們聊一下吧", "我可以幫你查天氣，要嗎？"),
-                         "no lookup was requested, so the offer is a legitimate reply")
-        self.assertFalse(self._offer("幫我找一下今天的新聞", "今日主要新聞如下：颱風沙德爾復活。"))
-
-    def test_digest_uses_real_headlines_and_drops_the_promise(self):
-        from agent.qwen_harness import answer_from_results, result_headlines
-        blob = ("[1] 沙德爾颱風復活 氣象署：2天恐影響台灣 — 自由時報\n"
-                "URL: https://www.freedom.example/a\nDate/Snippet: …\n"
-                "[2] 新學年幼兒入學面談進行 — 中央社\nURL: https://www.cna.example/b\n")
-        self.assertEqual(result_headlines(blob),
-                         ["沙德爾颱風復活 氣象署：2天恐影響台灣", "新學年幼兒入學面談進行"])
-        out = answer_from_results("今天有新聞嗎？我來幫您搜尋一下。", blob)
-        self.assertNotIn("我來幫您搜尋", out)
-        self.assertIn("沙德爾颱風復活", out)
-        self.assertNotIn("http", out, "a spoken answer must not contain URLs")
-
-    def test_digest_handles_an_empty_search_honestly(self):
-        from agent.qwen_harness import answer_from_results
-        out = answer_from_results("我來幫您搜尋一下。", "")
-        self.assertTrue(out.strip())
-        self.assertNotIn("我來幫您搜尋", out)
-        self.assertIn("沒有", out)
-
-    def test_the_three_repairs_are_wired_and_the_turn_agent_is_the_one_that_runs(self):
-        """Shape check on the control flow, because both halves of this have already been
-        broken once each: the repair defined but never called (the detector sat unused
-        while the promise went to the speaker), and the pre-flight re-binding `agent` in
-        an inner function so the turn still ran on the unrestricted tool set — the
-        duplicate search came right back."""
-        import ast
-        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            "agent", "qwen_harness.py")
-        with open(path, encoding="utf-8") as fh:
-            tree = ast.parse(fh.read())
-        run_fn = next(n for n in ast.walk(tree)
-                      if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == "_run")
-        called, run_receivers = set(), set()
-        for sub in ast.walk(run_fn):
-            if isinstance(sub, ast.Call):
-                called.add(getattr(sub.func, "attr", "") or getattr(sub.func, "id", ""))
-                if getattr(sub.func, "attr", "") == "run" and isinstance(sub.func.value, ast.Name):
-                    run_receivers.add(sub.func.value.id)
-        for needed in ("offers_action_without_doing_it", "refuses_results_it_has",
-                       "required_tool_for_request", "answer_from_results", "_get_agent"):
-            self.assertIn(needed, called, f"{needed} is not called from the turn loop")
-        self.assertIn("_turn_agent", run_receivers, "the turn must run on the possibly-restricted agent")
-        self.assertNotIn("agent", run_receivers,
-                         "agent.run() still uses the unrestricted instance — duplicate search returns")
-
-    def test_searched_then_refused_becomes_the_real_headlines(self):
-        from agent.qwen_harness import refuses_results_it_has
-        blob = ("[1] 沙德爾颱風復活 — 自由時報\nURL: https://a.example\n"
-                "[2] 護照排名出爐 — 中央社\nURL: https://b.example\n")
-        self.assertTrue(refuses_results_it_has("抱歉，我無法獲取即時新聞。抱歉！", blob))
-        self.assertTrue(refuses_results_it_has("我沒有查到相關的資料。", blob))
-        self.assertFalse(refuses_results_it_has("今日主要新聞：沙德爾颱風復活，氣象署示警。", blob),
-                         "a real answer must never be replaced by a digest")
-        self.assertFalse(refuses_results_it_has("抱歉，我無法獲取即時新聞。", ""),
-                         "nothing came back: there is nothing to speak, so leave the apology")
-        long_answer = ("無法提供完整報導，不過今天有三則新聞值得注意：" + "內容較長，" * 20)
-        self.assertFalse(refuses_results_it_has(long_answer, blob),
-                         "a long answer that hedges and still informs is not a refusal")
 
 
 class TestThinkingTextNeverGetsSpoken(unittest.TestCase):

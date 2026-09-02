@@ -38,8 +38,9 @@ from llm.ling_streaming import SpokenGuard, retract_span as _retract_span
 
 # Text that is tool plumbing rather than speech must never reach the speaker. One case is
 # not XML: a small model "calling" a tool by printing its name and then answering
-# (現在的時間是 [get_current_datetime]。). agent/qwen_harness.detect_unexecuted_tool repairs
-# the answer; this guard keeps the broken draft out of the audio while the repair runs.
+# (現在的時間是 [get_current_datetime]。). Nothing repairs the answer any more -- the harness
+# no longer rewrites what the model said -- but an unresolved placeholder is still not
+# speakable, so it stays out of the audio.
 _TOOL_NAME_RE = re.compile(r"\[\s*(get_current_datetime|get_weather|web_search)\s*\]")
 # CJK has no word separators, so `len(s.split()) < 4` is true for almost every Chinese
 # sentence — the pre-existing "short fragment mentioning web_search" junk filter used to
