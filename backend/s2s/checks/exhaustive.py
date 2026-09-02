@@ -145,7 +145,10 @@ async def one_turn(prompt: str, timeout: float = 120.0) -> dict:
 # wrong: a news summary from web_search need not contain a temperature or a date,
 # so a real answer naming 沙德爾颱風 was failed for not matching a numeric pattern.
 FACT = {
-    "clock":   re.compile(r"星期[一二三四五六日]|\d{1,2}\s*[月日點時]|\d{4}\s*年"),
+    # The prompt is 現在幾點？ -- "what time is it". A model that answers 現在是 10:11 PM
+    # has used the tool correctly; demanding a date failed it for answering the
+    # question asked. Either the right time or the right date proves the lookup.
+    "clock":   re.compile(r"\d{1,2}\s*[:點時]\s*\d{2}|星期[一二三四五六日]|\d{1,2}\s*月\s*\d{1,2}\s*日"),
     "weather": re.compile(r"\d+\s*(°C|度)|氣溫|降雨|濕度|溼度"),
     # Tools run server-side, so the protocol never shows the call; what a real
     # search answer has is substance rather than a refusal or a stub.
@@ -185,13 +188,23 @@ async def test_turns() -> None:
             # The year alone is far too weak: a free-router model was seen to receive
             # "Wednesday 2026-09-02" from the tool and report 2026年5月14日 週四, which a
             # year check passes. Month and day are what the tool actually supplies.
-            now = time.localtime()
-            want_md = (str(now.tm_mon), str(now.tm_mday))
-            got = bool(re.search(rf"{now.tm_mon}\s*月\s*{now.tm_mday}\s*日", r["text"])
-                       or re.search(rf"{now.tm_mon:02d}[-/]{now.tm_mday:02d}", r["text"])
-                       or re.search(rf"\b{now.tm_mday}\b.*\b{now.tm_mon}\b", r["text"]))
-            check("turns", "clock reports the tool's actual date, not an invented one",
-                  got, f"host={want_md[0]}/{want_md[1]}  said={r['text'][:46]!r}")
+            # In the tool's timezone, not the host's: get_current_datetime reports
+            # VOICE_TZ (Asia/Taipei), while this box runs UTC, so comparing against
+            # localtime() would judge a correct time-only answer as wrong.
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+            now = datetime.now(ZoneInfo(os.getenv("VOICE_TZ", "Asia/Taipei"))).timetuple()
+            # Whichever the model chose to report, it must match the host: a date, or
+            # the hour (12- or 24-hour). This is the assertion that caught a model
+            # receiving Wednesday 2026-09-02 from the tool and saying 2026年5月14日.
+            h24, h12 = now.tm_hour, (now.tm_hour % 12) or 12
+            ok_date = bool(re.search(rf"{now.tm_mon}\s*月\s*{now.tm_mday}\s*日", r["text"])
+                           or re.search(rf"{now.tm_mon:02d}[-/]{now.tm_mday:02d}", r["text"]))
+            ok_time = bool(re.search(rf"\b{h24}\s*[:點時]", r["text"])
+                           or re.search(rf"\b{h12}\s*[:點時]", r["text"]))
+            check("turns", "clock matches the host clock, by date or by hour",
+                  ok_date or ok_time,
+                  f"host={now.tm_mon}/{now.tm_mday} {h24:02d}h  said={r['text'][:46]!r}")
 
 
 async def test_bargein() -> None:

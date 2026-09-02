@@ -186,7 +186,17 @@ against it. Measured here, same card, same prompts:
 | **Gemma 4 E4B Q4_K_M** | 4.98 GB | **79 tok/s** |
 | Qwen3.5 9B Q4_K_M | 5.87 GB | 47 tok/s |
 | Qwen3.5 4B UD-Q8_K_XL | 6.07 GB | 52 tok/s |
+| Granite 4.2 3B Q8_0 | 3.89 GB | 78 tok/s |
+| Granite 4.2 3B Q4_K_M | 2.24 GB | 113 tok/s |
 | Qwen3.6 35B-A3B NVFP4 (FreeToken, experts in DRAM) | 22 GB | 41 tok/s |
+
+Granite 4.2 3B is the interesting near-miss. At Q4_K_M it is the fastest thing measured here by a
+wide margin — 113 tok/s from 2.24 GB — but its Chinese is visibly damaged: 很高养 for 很高興,
+Simplified vocabulary leaking through a zh-TW system prompt, and a news summary dated 2025-04-28
+on 2026-09-02. Q8_0 fixes the garbling (`以其活潑的文化、現代化的建築…而聞名` where Q4 produced
+`以美酒、街道文化和綠化空間而聞名`) and confirms quantization was the cause on a 3 B model — but at
+78 tok/s it gives up the entire speed advantage, still leaks Simplified characters into weather
+answers (多云, 湿度), and its search turns ran 39–84 s against Gemma's 25–31 s. So Gemma stays.
 
 The 35B ran — 35 B of weights on a 12 GB card, because only ~3 B are active per token and
 FreeToken streams the routed experts from host RAM — but at 41 tok/s and 26 s for a weather turn
