@@ -115,6 +115,37 @@ into Simplified Chinese, which this demo must not do).
 For integration convenience the framework also accepts `--llm_backend transformers`, which
 would run int8 safetensors in-process instead of llama.cpp.
 
+### Tool calls go through the server, not the prompt
+
+qwen-agent defaults to prompt-based function calling: it injects a
+`<tool_call>{json}</tool_call>` template into the system prompt and regex-parses the model's free
+text back out. That puts the tool call in competition with everything else being generated. On
+Qwen3.5 4B, a weather question failed **1 in 9** times with the model emitting no tool call and
+no answer at all, having spent the whole token budget thinking — the user heard
+「抱歉，我找不到相關的答案」, which claims a lookup found nothing when no lookup ran. It is also
+what made the truncated-JSON bug possible, since `extract_fn()` drops the last character of an
+unterminated block.
+
+`use_raw_api` passes `tools=` to the server instead, so llama-server (with `--jinja`) generates
+the call under the model's own chat template with grammar constraints: it cannot emit malformed
+JSON, and the call cannot be crowded out.
+
+| config | weather turns | all five prompt shapes |
+|---|---|---|
+| prompt dialect, 512 tokens | 8/9 | — |
+| **native tools, 2048 tokens** | **9/9** | **0 failures, 0 reasoning leaks** |
+| prompt dialect, 1024 tokens | 6/9 | — |
+| prompt dialect, server `--reasoning-budget 200` | 5/12 | — |
+
+The bottom two rows are why the fix is native tool calls rather than tuning. Under the prompt
+dialect, *more* headroom made failures more likely, because the extra room went to thinking; and
+capping thinking cuts off the tool-call decision along with it. `max_tokens` is 2048 only because
+native calls make headroom safe.
+
+`reasoning_budget_tokens` as a per-request field is ignored by llama-server — verified: a request
+with `reasoning_budget_tokens=30` still produced 512 completion tokens of reasoning. The server
+flag `--reasoning-budget` does work, and is deliberately not used, per the table.
+
 ### A minimal harness
 
 The harness declares three real tools, a system prompt, and the agent loop. Nothing inspects
@@ -401,6 +432,8 @@ rather than each waiting out its own timeout.
 | `S2S_LLM_API_BASE` / `S2S_LLM_MODEL_NAME` | `…:11435/v1` / `qwen3.5-4b` | which llama-server the speech-to-speech LLM stage talks to |
 | `S2S_USE_UPSTREAM_LLM` | unset | `1` runs the stock s2s LLM stage instead of Qwen-Agent |
 | `LLM_MTP` / `LLM_MTP_DRAFT_N` | `1` / `3` | self-speculative decoding on MTP weights |
+| `QWEN_AGENT_USE_RAW_API` | `true` | native tool calls; `false` falls back to qwen-agent's prompt dialect |
+| `LLM_AGENT_MAX_TOKENS` | `2048` | per-turn generation cap (thinking + tool call + answer) |
 | `LLM_SEED` / `LLM_AGENT_SEED` | random / unset | reproducible runs |
 | `LLM_AGENT_TEMP`, `LLM_AGENT_TOP_P` | `0.7`, `0.9` | agent-turn sampling |
 | `LLM_AGENT_THINKING` | `1` | thinking pass on agent turns |

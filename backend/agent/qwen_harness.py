@@ -37,7 +37,12 @@ _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 #     llama-server honours it) turns a benchmark run reproducible. Neither changes the
 #     defaults unless you set them.
 _DEFAULT_TZ = os.getenv("VOICE_TZ", "Asia/Taipei")
-LLM_AGENT_MAX_TOKENS = int(os.getenv("LLM_AGENT_MAX_TOKENS", "512"))
+# Headroom for one turn: thinking + a tool call + the answer. 512 was too tight --
+# a thinking pass that ran long left nothing for the tool call, and the turn ended
+# with finish_reason=length having produced neither. Safe to raise only because
+# tool calls are now native (see use_raw_api below); under prompt-based calling,
+# raising this made failures MORE likely, because the extra room went to thinking.
+LLM_AGENT_MAX_TOKENS = int(os.getenv("LLM_AGENT_MAX_TOKENS", "2048"))
 LLM_AGENT_TEMP = float(os.getenv("LLM_AGENT_TEMP", "0.7"))
 LLM_AGENT_TOP_P = float(os.getenv("LLM_AGENT_TOP_P", "0.9"))
 LLM_AGENT_SEED = os.getenv("LLM_AGENT_SEED", "").strip()
@@ -274,6 +279,15 @@ def _msg_field(m, key, default=None):
 
 
 
+def _raw_tool_calls() -> bool:
+    """Native tool calls (tools= on the request) rather than the prompt dialect.
+
+    Kept switchable because it needs a server that implements native tool calling;
+    llama-server with --jinja does. See the note in _make_agent for the numbers.
+    """
+    return os.getenv("QWEN_AGENT_USE_RAW_API", "true").strip().lower() not in ("0", "false", "no")
+
+
 def _thinking_on() -> bool:
     """Whether llama-server runs the model's thinking pass for agent turns.
 
@@ -326,21 +340,37 @@ def _make_agent(function_list=None):
             'max_tokens': LLM_AGENT_MAX_TOKENS,
             'temperature': LLM_AGENT_TEMP,
             'top_p': LLM_AGENT_TOP_P,
-            # Thinking is expensive here in the literal sense: at enable_thinking True the
-            # 2 B model spends 6-9 s of first-token latency and hits the 25 s wall budget on
-            # trivial turns, and its deliberation arrives in `content`, so the voice output
-            # literally spoke lines like "根据规则，必须调用工具…" to the user. Measured both
-            # ways (see README): thinking off = same tool routing, ~4x faster first token,
-            # no spoken scratchpad. Set LLM_AGENT_THINKING=1 to opt back in.
+            # Thinking on. It costs first-token latency, but with --reasoning-format
+            # deepseek the deliberation goes to `reasoning_content` and never reaches
+            # the speaker. LLM_AGENT_THINKING=0 turns it off.
             'chat_template_kwargs': {'enable_thinking': _thinking_on()},
-            # Cap thinking tokens (llama-server's native reasoning_budget_tokens,
-            # forwarded via extra_body) without touching max_tokens for the real
-            # answer/tool-call. Voice turns don't need long deliberation, and an
-            # uncapped thinking pass can burn most of max_tokens on reasoning
-            # alone, which is what caused the truncated tool-call JSON bug this
-            # session (reasoning ate the budget, leaving too few tokens to close
-            # the <tool_call> block) as well as unnecessary first-audio latency.
-            'extra_body': {'reasoning_budget_tokens': 200},
+            # Native tool calls instead of qwen-agent's prompt-based dialect.
+            #
+            # By default qwen-agent injects a <tool_call>{json}</tool_call> template
+            # into the system prompt and regex-parses the model's free text back out.
+            # That puts the tool call in competition with everything else the model
+            # is generating: measured on Qwen3.5 4B, a weather question failed 1 in 9
+            # times with the model emitting no tool call and no answer at all, having
+            # spent the whole budget thinking. It is also what made the truncated
+            # tool-call JSON bug possible, since extract_fn() drops the last
+            # character of an unterminated block.
+            #
+            # use_raw_api passes tools= to the server instead, so llama-server
+            # (with --jinja) generates the call under the model's own chat template
+            # with grammar constraints -- it cannot emit malformed JSON, and the call
+            # cannot be crowded out. Measured: 9/9 weather turns, and 0 failures with
+            # 0 reasoning leaks across all five demo prompt shapes.
+            #
+            # Requires a server that accepts native tools. Set
+            # QWEN_AGENT_USE_RAW_API=false to fall back to the prompt dialect.
+            'use_raw_api': _raw_tool_calls(),
+            # NB: no reasoning_budget_tokens here. llama-server ignores it as a
+            # per-request field (verified: a request with reasoning_budget_tokens=30
+            # still produced 512 completion tokens of reasoning), so it was doing
+            # nothing. The server flag --reasoning-budget DOES work, but capping
+            # thinking cuts off the tool-call decision with it: 5/12 with the budget
+            # at 200 against 9/9 without. The fix for runaway thinking was native
+            # tool calls, not a shorter leash.
         },
         'enable_thinking': _thinking_on()
     }
