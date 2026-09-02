@@ -32,6 +32,37 @@ logger = logging.getLogger(__name__)
 LLM_API_BASE = os.getenv("S2S_LLM_API_BASE", "http://127.0.0.1:11435/v1")
 LLM_MODEL_NAME = os.getenv("S2S_LLM_MODEL_NAME", "bonsai-8b")
 
+def _neutralize_mps_empty_cache() -> None:
+    """Work around an upstream bug that breaks Chinese voice input on non-Mac.
+
+    speech_to_speech 0.2.12's ParaformerSTTHandler.process() calls
+    torch.mps.empty_cache() unconditionally (STT/paraformer_handler.py:59). Every
+    other call site in the package guards it with `if self.device == "mps"`; this
+    one does not. On CUDA/Linux it raises
+
+        RuntimeError: Cannot execute emptyCache() without MPS backend
+
+    *after* a successful transcription, so the STT stage dies on every utterance
+    and no voice turn ever reaches the LLM. Paraformer is the only Chinese STT
+    backend, so zh voice input cannot work on Linux without this.
+
+    Where MPS is unavailable the call can never do anything but raise, so making
+    it a no-op is what it should have been. Reported upstream; delete this when a
+    release carries the guard.
+    """
+    try:
+        import torch
+    except ImportError:
+        return
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return
+    try:
+        torch.mps.empty_cache = lambda *a, **k: None
+        torch.mps.synchronize = lambda *a, **k: None
+    except Exception:
+        logger.debug("could not neutralize torch.mps helpers", exc_info=True)
+
+
 _upstream_get_llm_handler = s2s_pipeline.get_llm_handler
 
 
@@ -71,6 +102,7 @@ def _get_llm_handler(
 
 
 def main() -> None:
+    _neutralize_mps_empty_cache()
     s2s_pipeline.get_llm_handler = _get_llm_handler
     # chat-completions' argument dataclass is the one carrying base_url/api_key,
     # and it is what the builder stamps cancel_scope onto.
