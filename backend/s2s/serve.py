@@ -63,6 +63,64 @@ def _neutralize_mps_empty_cache() -> None:
         logger.debug("could not neutralize torch.mps helpers", exc_info=True)
 
 
+def _install_vram_route() -> None:
+    """Expose GPU memory on the Realtime server, for the UI's VRAM readout.
+
+    The browser client speaks only the Realtime protocol and has no backend of its
+    own, so a host-level number has to come from the one server it already talks to.
+    Wrapping create_app() adds the route without forking the framework.
+
+    Two details:
+      * torch.cuda.mem_get_info() reports the DRIVER's free/total, so it counts every
+        process on the card -- llama-server included -- which is what "VRAM used"
+        should mean here. torch.cuda.memory_allocated() would only see this process.
+      * CORS has to be added too. The framework ships none, which is fine for
+        WebSockets (not subject to CORS) but would block a cross-origin fetch, and
+        the page is served from a different origin than :8765 whenever it is not
+        opened on this box.
+    """
+    from speech_to_speech.api.openai_realtime import websocket_router as _wsr
+
+    _upstream_create_app = _wsr.create_app
+
+    def create_app(*args, **kwargs):
+        app = _upstream_create_app(*args, **kwargs)
+        try:
+            from fastapi.middleware.cors import CORSMiddleware
+
+            app.add_middleware(
+                CORSMiddleware,
+                allow_origins=["*"],      # read-only, no credentials, no secrets
+                allow_methods=["GET"],
+                allow_headers=["*"],
+            )
+
+            @app.get("/v1/vram")
+            def vram() -> dict:
+                try:
+                    import torch
+
+                    if not torch.cuda.is_available():
+                        return {"available": False, "reason": "no CUDA device"}
+                    free, total = torch.cuda.mem_get_info()
+                    return {
+                        "available": True,
+                        "device": torch.cuda.get_device_name(0),
+                        "total_mib": total // (1 << 20),
+                        "used_mib": (total - free) // (1 << 20),
+                        "free_mib": free // (1 << 20),
+                    }
+                except Exception as e:  # never let a readout break the server
+                    return {"available": False, "reason": f"{type(e).__name__}: {e}"}
+
+            logger.info("GET /v1/vram registered")
+        except Exception:
+            logger.exception("could not register /v1/vram (continuing without it)")
+        return app
+
+    _wsr.create_app = create_app
+
+
 _upstream_get_llm_handler = s2s_pipeline.get_llm_handler
 
 
@@ -103,6 +161,7 @@ def _get_llm_handler(
 
 def main() -> None:
     _neutralize_mps_empty_cache()
+    _install_vram_route()
     s2s_pipeline.get_llm_handler = _get_llm_handler
     # chat-completions' argument dataclass is the one carrying base_url/api_key,
     # and it is what the builder stamps cancel_scope onto.

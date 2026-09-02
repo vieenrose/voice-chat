@@ -319,7 +319,8 @@ mic frames counted rather than listed, so a 300-chunk turn exports at ~48 kB ins
   user's transcript is converted with OpenCC for display.
 - **Thinking never spoken.** Deliberation stays in `reasoning_content`, out of both the audio and
   the transcript.
-- **Live partial transcripts** while you speak, and a debug export of the whole session.
+- **Live partial transcripts** while you speak, a VRAM readout, and a debug export of the whole
+  session.
 
 ## Measured (RTX 3060, live stack)
 
@@ -410,6 +411,13 @@ rejects the entire `session.update`. Output declares 24000, the rate Qwen3-TTS p
 
 One session at a time by default (`--num_pipelines 1`); further connections are rejected. Each
 extra pipeline has its own STT/TTS handlers and costs VRAM.
+
+`GET /v1/vram` is added by `s2s/serve.py` (not upstream) and reports the card's total/used/free
+MiB, which the UI polls while connected. It reads `torch.cuda.mem_get_info()`, i.e. the driver's
+view, so it counts every process on the card including llama-server — `memory_allocated()` would
+only see the pipeline's own tensors. The route also installs permissive CORS for GET: the
+framework ships none, which is fine for WebSockets but would block the fetch whenever the page is
+served from a different origin than the server.
 
 ## Security
 

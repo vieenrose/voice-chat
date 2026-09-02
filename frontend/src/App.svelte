@@ -40,6 +40,7 @@
   let lastStatus = $state('')
 
   let level = $state(0)            // mic peak, for the meter
+  let vram = $state(null)          // {used_mib, total_mib, device} from the server
   let textInput = $state('')
   // Light by default. index.html carries class="light" so the pre-mount paint
   // matches and the page does not flash dark before Svelte takes over.
@@ -54,6 +55,43 @@
   let mic = null
   let play = null
   let chatEl = $state(null)
+
+  // The Realtime server exposes GET /v1/vram (added in s2s/serve.py). Derive its URL
+  // from the endpoint the user is already connected to, so it follows the TLS proxy.
+  function vramUrl() {
+    try {
+      const u = new URL(url.replace(/^ws/, 'http'))
+      u.pathname = '/v1/vram'
+      return u.toString()
+    } catch {
+      return null
+    }
+  }
+
+  async function pollVram() {
+    const target = vramUrl()
+    if (!target) return
+    try {
+      const r = await fetch(target, { cache: 'no-store' })
+      const d = await r.json()
+      vram = d.available ? d : null
+    } catch {
+      vram = null   // server down, or an origin that refuses the fetch
+    }
+  }
+
+  let vramTimer = null
+  $effect(() => {
+    // Poll only while connected: the readout is for watching the model load and run.
+    if (connected && !vramTimer) {
+      pollVram()
+      vramTimer = setInterval(pollVram, 3000)
+    } else if (!connected && vramTimer) {
+      clearInterval(vramTimer)
+      vramTimer = null
+      vram = null
+    }
+  })
 
   function scroll() {
     queueMicrotask(() => { if (chatEl) chatEl.scrollTop = chatEl.scrollHeight })
@@ -312,6 +350,12 @@
     <div class="header-actions">
       <span class="pill {connected ? 'ok' : ''}">{connected ? '● Live' : '○ Offline'}</span>
       {#if listening}<span class="pill ok">🎤 收音中</span>{/if}
+      {#if vram}
+        <span class="pill" title="{vram.device} — 整張卡的用量，含 llama-server"
+              style="font-variant-numeric:tabular-nums">
+          VRAM {(vram.used_mib / 1024).toFixed(1)}/{(vram.total_mib / 1024).toFixed(1)} GB
+        </span>
+      {/if}
       <button class="ghost" style="padding:6px 10px; font-size:12px" onclick={exportLog}
               title="下載這次工作階段的完整記錄（JSON），用於回報問題">⬇ 記錄</button>
       <button class="ghost" style="padding:6px 10px; font-size:12px" onclick={toggleTheme}
