@@ -43,10 +43,14 @@ this corpus into 131 k tokens against Qwen's 117 k. In bits per byte the 2B is c
 at Q8 — and pays for it in quality, rather than coming out ahead. The file size also oversells
 the footprint: 2.18 GB of weights still took 7.1 GB of VRAM at 16 k context.
 
-Bonsai 27B was measured and not registered. Its raw PPL of 24.214 looks disastrous next to the
-8B's 16.518 and is mostly a tokenizer artifact — in bits per byte the two are near-tied (1.0917
-vs 1.0786). It is still the wrong fit here: 34.9 tok/s, 7.8 GB of VRAM, and an appetite for
-thinking tokens that a voice turn cannot afford.
+Bonsai 27B was measured and not registered — but not for the reason first reported. Its raw PPL
+of 24.214 looks disastrous next to the 8B's 16.518 and is mostly a tokenizer artifact; in bits
+per byte the two are near-tied (1.0917 vs 1.0786). Run through the real pipeline, where the
+agent's 200-token reasoning budget applies, it scores the same 3/4 as the 8B with all four tools
+routed correctly. What rules it out is latency and fit: **first audio 9.9-15.7 s** against the
+8B's 3.2-3.9 s, 34.9 tok/s, and 7.8 GB of VRAM that leaves ~1 GB of headroom once TTS and STT
+are resident. It also drifts into Simplified Chinese (总统, 帮, 吗). A model that answers well
+but takes fifteen seconds to start speaking is the wrong shape for a voice demo.
 
 It needs Prism's llama.cpp fork, which is why registry entries may carry a `"bin"` of their own:
 their `Q2_0` reuses upstream's `GGML_TYPE_Q2_0` type id with a different block layout, so
