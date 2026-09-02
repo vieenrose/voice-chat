@@ -163,22 +163,29 @@ really a truncation failure, since the same question typed routes to the clock e
 Mandarin has intra-sentence pauses longer than 300 ms. At **700 ms** the same utterance measures
 2.7 s and routes correctly. The cost is 400 ms of endpointing after the user stops speaking.
 
-**The on-screen transcript comes from a side path.** X-ASR transcribes the same segment on a
-daemon thread purely so the UI has a caption; nothing downstream reads it, and the model never
-sees it. A mistake in it is cosmetic rather than a wrong answer — which is the point of the
-split, since X-ASR once heard "huggingface" as "huninface" and the old pipeline, where the
-transcript *was* the prompt, answered about Huawei.
+**The on-screen transcript streams live, from a side path.** X-ASR decodes the same audio as it
+arrives, so the caption builds while the user is still speaking — 62 updates over a 25 s
+utterance, one roughly every 0.3 s, growing character by character. Nothing downstream reads it
+and the model never sees it, so a mistake there is cosmetic rather than a wrong answer: X-ASR once
+heard "huggingface" as "huninface" and the old pipeline, where the transcript *was* the prompt,
+answered about Huawei.
 
-Two details make it genuinely free, and the second was measured the hard way:
+Three properties keep it genuinely free, and each was got wrong first:
 
-- It runs on **CPU** and nothing awaits the thread. Its result reaches the client at ~0.9 s after
-  speech ends, well before first audio.
-- It is published as a **partial** transcription, not a completed one. A completed transcription
-  is handled by `RealtimeService`, which adds the text to the `Chat` as a user message — so it
-  enters the main pipeline and reaches the model on the following turn. That cost **0.3 s of
-  median first-audio latency** (2.44 s against a 2.12 s baseline). A partial mutates no state at
-  all, and the cost disappears: 2.07 s median, i.e. the baseline. "Off the critical path" was not
-  enough; it had to be out of the pipeline's *state* too.
+- **It is teed, not staged.** Audio is copied inside `AudioHandler.append_pcm`, the one funnel
+  every inbound chunk passes through for both transports, so no handler joins the chain and no
+  queue hop is added. The tee is one non-blocking put; all decoding is on a daemon thread, on CPU.
+  Measured: 2.07 s median first audio with captions against 2.09 s without.
+- **It is published as a *partial*.** A completed transcription is handled by `RealtimeService`,
+  which adds the text to the `Chat` as a user message — it enters the pipeline and reaches the
+  model on the next turn. That cost 0.3 s of median latency. A partial mutates nothing.
+- **Its boundaries come from the pipeline's VAD**, not from X-ASR's own endpointing or a timer,
+  which would drift and caption a different span than the answer describes. The VAD announces
+  speech start and stop on `text_output_queue`, so that queue is proxied — it publishes those
+  events from six or more places, and a proxy catches all of them without reimplementing any.
+  Note that `speech_started` arrives a few hundred ms *into* the speech and the pipeline keeps
+  that pre-roll: resetting the decoder on it dropped the opening words, so audio is fed
+  continuously and only *publishing* is gated.
 
 `S2S_CAPTION=0` turns it off; `pipeline-stt.sh` is the older route where Paraformer feeds the
 model directly.

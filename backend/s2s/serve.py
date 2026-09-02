@@ -153,6 +153,33 @@ def _install_vram_route() -> None:
     _wsr.create_app = create_app
 
 
+_caption_stream = None
+
+
+def _tee_audio_to_captions() -> None:
+    """Copy inbound audio to the caption stream, without touching the audio path.
+
+    AudioHandler.append_pcm is the single funnel every inbound chunk passes
+    through, for both the WebSocket and WebRTC transports, so teeing here inserts
+    no handler and adds no queue hop. The tee is one non-blocking put per chunk;
+    the decoding happens on the caption thread.
+
+    Deliberately not a pipeline stage: a stage would sit in the chain and its cost,
+    however small, would be on the turn.
+    """
+    from speech_to_speech.api.openai_realtime.handlers.audio import AudioHandler
+
+    upstream = AudioHandler.append_pcm
+
+    def append_pcm(self, conn_id, pcm_bytes, src_rate):
+        if _caption_stream is not None and pcm_bytes:
+            _caption_stream.feed(pcm_bytes, src_rate)
+        return upstream(self, conn_id, pcm_bytes, src_rate)
+
+    AudioHandler.append_pcm = append_pcm
+    logger.info("inbound audio teed to the caption stream")
+
+
 def _give_stage_the_event_queue() -> None:
     """Let our LLM stage publish transcription events.
 
@@ -170,10 +197,52 @@ def _give_stage_the_event_queue() -> None:
         for h in handlers:
             if isinstance(h, AgentLanguageModelHandler):
                 h.text_output_queue = q
-                logger.info("LLM stage can publish transcription events")
+        # Captions stream from the audio tee rather than from the LLM stage, so they
+        # appear while the user is still speaking instead of after the segment closes.
+        global _caption_stream
+        if q is not None and os.getenv("S2S_CAPTION", "1").strip().lower() not in ("0", "false", "no"):
+            from s2s.caption import CaptionStream
+
+            _caption_stream = CaptionStream(q)
+            _align_captions_to_vad(handlers, _caption_stream)
         return handlers
 
     s2s_pipeline._build_pipeline_handlers = build
+
+
+def _align_captions_to_vad(handlers, caption) -> None:
+    """Drive the caption's utterance boundaries from the pipeline's own VAD.
+
+    The alternative -- X-ASR's endpoint detection, or an idle timer -- drifts from
+    the pipeline, so a caption ends up describing a different span of audio than the
+    answer does. Silero plus Smart Turn already decide where a turn begins and ends,
+    and the VAD handler announces both on text_output_queue.
+
+    So the queue is proxied rather than the handler subclassed: the VAD publishes
+    those events from six or more places, and a proxy catches all of them without
+    reimplementing any.
+    """
+    from speech_to_speech.VAD.vad_handler import VADHandler
+
+    class _Tap:
+        def __init__(self, real):
+            self._real = real
+
+        def put(self, item, *a, **kw):
+            kind = getattr(item, "type", None)
+            if kind == "speech_started":
+                caption.begin()
+            elif kind == "speech_stopped":
+                caption.end()
+            return self._real.put(item, *a, **kw)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    for h in handlers:
+        if isinstance(h, VADHandler) and getattr(h, "text_output_queue", None) is not None:
+            h.text_output_queue = _Tap(h.text_output_queue)
+            logger.info("caption boundaries aligned to the pipeline VAD")
 
 
 _upstream_get_llm_handler = s2s_pipeline.get_llm_handler
@@ -217,6 +286,7 @@ def _get_llm_handler(
 def main() -> None:
     _neutralize_mps_empty_cache()
     _give_stage_the_event_queue()
+    _tee_audio_to_captions()
     _install_vram_route()
     logger.info("LLM endpoint: %s (%s)", LLM_API_BASE, LLM_MODEL_NAME)
     s2s_pipeline.get_llm_handler = _get_llm_handler
