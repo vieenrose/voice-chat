@@ -80,6 +80,7 @@
       llmCfg = await r.json()
       provider = llmCfg.provider
       modelId = llmCfg.model
+      if (llmCfg.providers?.[provider]?.needs_key) await loadModels(provider)
     } catch {
       llmCfg = null
     }
@@ -87,9 +88,12 @@
 
   let modelsError = $state('')
 
+  let modelsLoading = false
+
   async function loadModels(name) {
     const target = serverUrl(`/v1/llm-models?provider=${encodeURIComponent(name)}`)
-    if (!target) return
+    if (!target || modelsLoading) return
+    modelsLoading = true
     models = []
     modelsError = ''
     try {
@@ -103,26 +107,27 @@
       }
     } catch (e) {
       modelsError = e.message
+    } finally {
+      modelsLoading = false
     }
   }
 
   // Only providers with a catalogue offer a model list; 'local' takes its model
   // from the server's own registry.
-  let lastProvider = null
-  $effect(() => {
-    if (!llmCfg) return
-    if (provider !== lastProvider) {
-      // A model id belongs to the provider it came from. Carrying one across a
-      // switch would post e.g. "anthropic/claude-opus-5" to the local server.
-      if (lastProvider !== null) modelId = provider === llmCfg.provider ? llmCfg.model : ''
-      lastProvider = provider
-    }
-    if (llmCfg.providers?.[provider]?.needs_key) {
-      if (!models.length) loadModels(provider)
-    } else {
-      models = []
-    }
-  })
+  // Deliberately NOT an $effect. An effect that read models.length and called a
+  // loader which sets models = [] re-triggered itself: 3565 requests to
+  // /v1/llm-models in one page view, with the list never settling, which is what
+  // rendered 模型（0/0）. Loading is driven by the two events that can change it --
+  // the config arriving, and the user picking a provider.
+  async function selectProvider(name) {
+    provider = name
+    // A model id belongs to the provider it came from; carrying one across a switch
+    // would post e.g. "anthropic/claude-opus-5" to the local server.
+    modelId = name === llmCfg?.provider ? (llmCfg?.model ?? '') : ''
+    models = []
+    modelsError = ''
+    if (llmCfg?.providers?.[name]?.needs_key) await loadModels(name)
+  }
 
   const shownModels = $derived(
     models
@@ -525,7 +530,8 @@
             {#if llmCfg.key_set}<span class="subtle"> · 金鑰 {llmCfg.key_hint}</span>{/if}
           </div>
           <label for="llm-provider" class="subtle" style="display:block;margin-bottom:4px">供應者</label>
-          <select id="llm-provider" class="input" style="margin-bottom:8px" bind:value={provider}>
+          <select id="llm-provider" class="input" style="margin-bottom:8px" value={provider}
+                  onchange={(e) => selectProvider(e.currentTarget.value)}>
             {#each Object.entries(llmCfg.providers) as [name, p]}
               <option value={name}>{p.label}</option>
             {/each}
