@@ -183,7 +183,8 @@ against it. Measured here, same card, same prompts:
 
 | | weights | decode |
 |---|---|---|
-| **Gemma 4 E4B Q4_K_M** | 4.98 GB | **79 tok/s** |
+| **Gemma 4 E4B QAT UD-Q4_K_XL + MTP** | 4.22 GB | **106 tok/s** |
+| Gemma 4 E4B Q4_K_M (no MTP) | 4.98 GB | 79 tok/s |
 | Qwen3.5 9B Q4_K_M | 5.87 GB | 47 tok/s |
 | Qwen3.5 4B UD-Q8_K_XL | 6.07 GB | 52 tok/s |
 | Granite 4.2 3B Q8_0 | 3.89 GB | 78 tok/s |
@@ -204,9 +205,15 @@ it was slower than the 4 B it replaced, and it answered 台灣的首都 with
 「台湾是中国不可分割的一部分」 in Simplified. `s2s/deploy/` keeps the launch scripts if it is worth
 revisiting.
 
+The QAT release is both smaller and better than the plain Q4_K_M: quantization-aware training
+means the weights were trained to tolerate 4 bits, and it holds fluency in zh-TW with 0 Simplified
+characters on the probe set.
+
 `--jinja` is what enables native tool calls; without it the agent falls back to qwen-agent's
-prompt dialect. No `--spec-type`: this repo ships the NextN/MTP head as a separate file rather
-than inside these weights.
+prompt dialect. The MTP (NextN) head ships as its own 0.10 GB file rather than inside the weights,
+so it is passed as the draft model — `--spec-draft-model` plus `--spec-type draft-mtp` — which is
+the difference between 106 and 79 tok/s. Accepted drafts are the tokens the target model would
+have produced anyway, so that is throughput, not a quality trade.
 
 ## Quick Start
 

@@ -47,24 +47,35 @@ LLM_SEED = int(os.getenv("LLM_SEED", "-1"))
 # tool template, quoted the prompt back, or repeated itself — each needing another
 # filter. Unquantized f16 scored the same as q8, so this is capacity, not quantization.
 MODEL_REGISTRY: dict[str, dict] = {
-    # The only model. Gemma 4 E4B at Q4_K_M: 4.98 GB of weights and 79 tok/s decode on
-    # the RTX 3060, against 47 for Qwen3.5 9B Q4 and 41 for Qwen3.6 35B-A3B with its
-    # experts streaming from DRAM. It is also the model the speech-to-speech docs use,
-    # so the framework's own defaults are tested against it.
+    # Gemma 4 E4B, the QAT release at UD-Q4_K_XL. Quantization-aware training means the
+    # weights were trained to tolerate 4-bit, so this is both smaller and better than the
+    # plain Q4_K_M it replaces -- 4.22 GB against 4.98 GB, with no loss of fluency in
+    # zh-TW and 0 Simplified characters on the probe set.
     #
-    # E4B is a nested/effective-4B checkpoint, so llama.cpp serves it as one model with
-    # no extra flags; --jinja is what enables native tool calls, which this demo needs.
-    # MTP is off: the repo ships the NextN head separately (MTP/mtp-*.gguf) rather than
-    # inside these weights, so --spec-type draft-mtp has nothing to draft from here.
-    "gemma-4-e4b-q4": {
-        "label": "Gemma 4 E4B · Q4_K_M",
-        "path": os.getenv("LLM_PATH_GEMMA", "/home/user/llms/gemma/gemma-4-E4B-it-Q4_K_M.gguf"),
-        "alias": "gemma-4-e4b",
+    # 106 tok/s decode against the plain Q4's 79, because this repo also ships the MTP
+    # (NextN) head as a separate 0.10 GB file. llama.cpp takes it via
+    # --spec-draft-model plus --spec-type draft-mtp, so speculative decoding works even
+    # though the head is not baked into the weights -- see _mtp_args() and
+    # s2s/deploy/llm.sh. Accepted drafts are the tokens the target model would have
+    # produced anyway, so this is throughput, not a quality trade.
+    #
+    # Measured alternatives, same card: Granite 4.2 3B Q4_K_M is faster still (113 tok/s
+    # from 2.24 GB) but its Chinese is visibly damaged; its Q8_0 fixes that and lands at
+    # 78 tok/s, giving up the advantage. Qwen3.6 35B-A3B on FreeToken ran at 41 tok/s
+    # with experts streaming from DRAM. See the README table.
+    "gemma-4-e4b-qat": {
+        "label": "Gemma 4 E4B · QAT UD-Q4_K_XL",
+        "path": os.getenv("LLM_PATH_GEMMA",
+                          "/home/user/llms/gemma-qat/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf"),
+        "alias": "gemma-4-e4b-qat",
+        "mtp": True,
+        # The NextN head ships separately in this repo rather than inside the weights.
+        "mtp_draft": os.getenv("LLM_PATH_GEMMA_MTP",
+                               "/home/user/llms/gemma-qat/MTP/mtp-gemma-4-E4B-it-Q8_0.gguf"),
     },
 }
 
-
-DEFAULT_MODEL_ID = os.getenv("LLM_DEFAULT_MODEL_ID", "gemma-4-e4b-q4")
+DEFAULT_MODEL_ID = os.getenv("LLM_DEFAULT_MODEL_ID", "gemma-4-e4b-qat")
 
 
 def _alias_to_model_id(alias: str) -> Optional[str]:
@@ -148,7 +159,17 @@ class LLMServerManager:
             logger.warning("this llama-server build has no --spec-type; MTP weights will run without "
                            "speculative decoding (correct, just slower)")
             return []
-        return ["--spec-type", "draft-mtp", "--spec-draft-n-max", os.getenv("LLM_MTP_DRAFT_N", "3")]
+        args = ["--spec-type", "draft-mtp", "--spec-draft-n-max", os.getenv("LLM_MTP_DRAFT_N", "3")]
+        # Some repos ship the NextN head as its own file instead of baking it into the
+        # weights (Gemma 4 E4B does). llama.cpp loads it as the draft model, so MTP works
+        # either way; without this the flag has nothing to draft from and is ignored.
+        draft = info.get("mtp_draft")
+        if draft:
+            if not Path(draft).exists():
+                logger.warning("MTP head missing at %s; running without speculative decoding", draft)
+                return []
+            args += ["--spec-draft-model", draft]
+        return args
 
     def _server_bin(self, info: dict) -> str:
         """Which llama-server serves this entry.
