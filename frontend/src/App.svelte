@@ -5,18 +5,6 @@
   import { toTW, toTWP, zhtwReady } from './lib/zhtw.js'
   import { serverUrl as buildUrl } from './lib/endpoints.js'
 
-  // What the pipeline card shows. The server leaves session.model null, so the
-  // client cannot learn the model from the protocol -- these are declared here, in
-  // one place. Keep the LLM line in step with llm_manager.MODEL_REGISTRY, which is
-  // the source of truth.
-  const PIPELINE = [
-    ['VAD', 'Silero v5 + Smart Turn v3.2'],
-    ['STT', 'Paraformer（FunASR）'],
-    ['LLM', 'Qwen3.5 9B · Q4_K_M · MTP'],
-    ['Agent', 'Qwen-Agent · 原生工具呼叫（3 工具）'],
-    ['TTS', 'Qwen3-TTS 12Hz · GGML 24k'],
-  ]
-
   const INSTRUCTIONS =
     '你是一個親切的語音助理。一律使用繁體中文（台灣用語）回答，' +
     '無論問題用什麼語言提出；只有專有名詞或無法翻譯的術語才保留英文。回答要口語、簡潔。'
@@ -47,6 +35,21 @@
   let apiKey = $state('')
   let cfgBusy = $state(false)
   let cfgMsg = $state('')
+
+  // What the pipeline card shows. The LLM row is derived from the live config, not
+  // hardcoded: the model is chosen at runtime now, and a fixed string went stale the
+  // moment the provider changed (it still read "Qwen3.5 9B · Q4_K_M · MTP" while the
+  // turn was being served by OpenRouter). The other rows are fixed stages of the
+  // framework's pipeline; keep them in step with s2s/serve.py's CLI.
+  const PIPELINE = $derived([
+    ['VAD', 'Silero v5 + Smart Turn v3.2'],
+    ['STT', 'Paraformer（FunASR）'],
+    ['LLM', llmCfg
+      ? `${llmCfg.providers?.[llmCfg.provider]?.label ?? llmCfg.provider} · ${llmCfg.model}`
+      : '尚未連線'],
+    ['Agent', 'Qwen-Agent · 原生工具呼叫（3 工具）'],
+    ['TTS', 'Qwen3-TTS 12Hz · GGML 24k'],
+  ])
   let models = $state([])          // provider catalogue
   let modelId = $state('')
   let modelFilter = $state('')

@@ -424,6 +424,10 @@ extra pipeline has its own STT/TTS handlers and costs VRAM.
 
 Three routes are added by `s2s/serve.py`, not upstream:
 
+The pipeline card's LLM row is derived from `/v1/llm-config`, not hardcoded — a fixed string went
+stale the moment the provider changed, still reading "Qwen3.5 9B · Q4_K_M · MTP" while OpenRouter
+was serving the turn.
+
 `GET|POST /v1/llm-config` lets the page choose the LLM endpoint — the local llama-server, or
 OpenRouter with the user's own key. The browser has no backend of its own and the LLM stage runs
 server-side, so a key pasted into the UI has to be handed over somewhere; this is that seam. The
