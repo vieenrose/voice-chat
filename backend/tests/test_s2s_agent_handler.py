@@ -19,7 +19,7 @@ from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.LLM.chat import make_assistant_message, make_system_message, make_user_message
 from speech_to_speech.pipeline.messages import EndOfResponse, GenerateResponseRequest, LLMResponseChunk
 
-from s2s.qwen_agent_handler import QwenAgentLanguageModelHandler
+from s2s.agent_handler import AgentLanguageModelHandler
 
 
 class FakeCancelScope:
@@ -50,7 +50,7 @@ def make_runtime_config(turns):
     return rc
 
 
-class _Handler(QwenAgentLanguageModelHandler):
+class _Handler(AgentLanguageModelHandler):
     """Skips setup()'s network/LLM construction; the harness is injected."""
 
     def setup(self, events=None, cancel_scope=None, **kw):
@@ -73,7 +73,7 @@ class _Handler(QwenAgentLanguageModelHandler):
             yield from scripted
             return
         so_far = ""
-        real = QwenAgentLanguageModelHandler._drive
+        real = AgentLanguageModelHandler._drive
 
         def fake_stream(_self, _h, _p):
             nonlocal so_far

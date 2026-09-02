@@ -69,8 +69,9 @@ Two constraints shape it:
 the model's own chat template with grammar constraints: it cannot emit malformed JSON, and the
 call cannot be crowded out by whatever else the model is generating.
 
-This is the alternative to qwen-agent's default, which injects a `<tool_call>{json}</tool_call>`
-template into the system prompt and regex-parses the model's free text. Measured on Qwen3.5 4B:
+The alternative — which this project used until the harness was replaced — is a
+`<tool_call>{json}</tool_call>` template injected into the system prompt and regex-parsed out of
+the model's free text. Measured on Qwen3.5 4B when both were available:
 
 | | weather turns | all five prompt shapes |
 |---|---|---|
@@ -234,30 +235,46 @@ because no tool touches a shell, and `../../etc/passwd` as a timezone falls back
 
 ### The harness
 
-`backend/agent/qwen_harness.py` declares three tools, a system prompt, and the agent loop.
-Nothing inspects the model's answer to decide what it *should* have done, and no rule matches
-question phrasing: the model calls its own tools.
+`backend/agent/` is three tools, a system prompt, and a bounded call → observe → answer loop in
+`native_loop.py` that drives `/v1/chat/completions` directly. Nothing inspects the model's answer
+to decide what it *should* have done, and no rule matches question phrasing: the model calls its
+own tools.
+
+It used to be qwen-agent's `Assistant`. That was removed because it had stopped earning its place:
+with `use_raw_api` its Qwen-specific tool dialect (`NousFnCallPrompt`) was instantiated and never
+used — the server generates tool calls under the model's own chat template — so what remained was
+a cumulative-snapshot protocol, each iteration re-yielding the whole message list for the
+streaming code to diff, plus a bug that labelled tool results `id` instead of the schema-required
+`tool_call_id` and so broke strict servers. 13 MB and 39 declared dependencies for a loop we were
+already driving.
+
+Driving it ourselves is ~150 lines and strictly more direct: deltas arrive as deltas rather than
+being recovered by diffing snapshots, `tool_call_id` is correct by construction, reasoning comes
+from the server's own `reasoning_content` field instead of being sniffed out of the answer text,
+the step ceiling is a constant here rather than an environment variable read at import time (the
+old default was 20, which is how an 8-call loop once happened), and validation and sanitisation
+happen at the single point where tool results enter the prompt.
+
+Removal changed no behaviour: 152 unit tests and 20/20 end-to-end before and after.
 
 What remains is filtering, in `backend/llm/ling_streaming.py`, and it is shape-based rather than a
 list of observed phrases:
 
-- **Nothing the machine says to itself is spoken.** Reasoning goes to `reasoning_content` via
-  `--reasoning-format deepseek` and reaches the client as its own event. Four other things look
-  like answers and are not: the system prompt replayed back (matched by shingle overlap, so
-  paraphrases are caught), qwen-agent's Simplified-Chinese tool narration, checklist scaffolding
+- **Nothing the machine says to itself is spoken.** Reasoning arrives as its own event. Four other
+  things look like answers and are not: the system prompt replayed back (matched by shingle
+  overlap, so paraphrases are caught), Simplified-Chinese tool narration, checklist scaffolding
   (`Evaluate the Input:`), and any standalone sentence-length all-English span — answers here are
   zh-TW with English only *inside* a Chinese sentence.
-- **A sentence recognized as reasoning after streaming is retracted** from the transcript as well
+- **A sentence recognised as reasoning after streaming is retracted** from the transcript as well
   as withheld from speech (`retract_span`), since a single token is too small a unit to classify.
-- **Nothing is said twice.** The harness streams deltas live, then reconciles against the
-  authoritative final text and speaks only the remainder — comparing normalized forms, and testing
+- **Nothing is said twice.** The loop streams deltas live, then reconciles against the
+  authoritative final text and speaks only the remainder — comparing normalised forms, and testing
   containment first, because the final text can be a filtered *subset* of what streamed.
 - **A short answer is an answer.** Content is detected by one ideograph or a three-letter latin
   word, never by length: 台北 answers 台灣的首都是哪裡？ in two characters, as do 是的 and 五.
 - **Markdown is not speech.** `tts/spoken_text.py` rewrites notation only — markup, `°C`→`度`,
-  `68%`→`百分之68`, emoji, URLs — never content, and reports which rules fired. Text is then
-  segmented by script and synthesized with an explicit per-segment language.
-- **Search is honest.** No curated results. Chinese queries are tokenized with jieba before
+  `68%`→`百分之68`, emoji, URLs — never content, and reports which rules fired.
+- **Search is honest.** No curated results. Chinese queries are tokenised with jieba before
   relevance scoring, and fallback backends race concurrently rather than each waiting out its own
   timeout.
 
@@ -271,7 +288,7 @@ The language instruction is stated once, in the system prompt, never appended to
 | **Turn-taking** | Silero VAD v5 + Smart Turn v3.2 | local ONNX; speculative turns with revisions |
 | **STT** | Paraformer (FunASR) | Chinese-oriented; `pip install "speech-to-speech[paraformer]"` |
 | **LLM** | OpenRouter (353 tool-capable models) or `Qwen3.5-9B-Q4_K_M` | provider chosen in the UI; local llama-server `:11435` with MTP is the offline fallback |
-| **Agent** | `qwen-agent` `Assistant` | custom s2s LLM stage, native tool calls |
+| **Agent** | own loop (`agent/native_loop.py`) | custom s2s LLM stage, native tool calls, 3-step ceiling |
 | **TTS** | `Qwen3-TTS-12Hz CustomVoice` Q8_0 | stock s2s handler on GGML CUDA, ~20-80 ms TTFA |
 | **Search** | SearXNG `:8888` + wttr.in | 180 engines, real results only |
 | **Embedding** | `granite-embedding-97m-multilingual` Q8_0 | 384 d, `:11434`, semantic rerank |
@@ -308,8 +325,8 @@ The QAT release is both smaller and better than the plain Q4_K_M: quantization-a
 means the weights were trained to tolerate 4 bits, and it holds fluency in zh-TW with 0 Simplified
 characters on the probe set.
 
-`--jinja` is what enables native tool calls; without it the agent falls back to qwen-agent's
-prompt dialect. The MTP (NextN) head ships as its own 0.10 GB file rather than inside the weights,
+`--jinja` is what enables native tool calls: without it the server does not apply the model's
+chat template, and no tool call is generated at all. The MTP (NextN) head ships as its own 0.10 GB file rather than inside the weights,
 so it is passed as the draft model — `--spec-draft-model` plus `--spec-type draft-mtp` — which is
 the difference between 106 and 79 tok/s. Accepted drafts are the tokens the target model would
 have produced anyway, so that is throughput, not a quality trade.
@@ -511,7 +528,7 @@ Tool routing and reasoning leaks: 0 failures and 0 leaks over all five shapes.
 |---|---|---|
 | `S2S_LLM_API_BASE` / `S2S_LLM_MODEL_NAME` | `…:11435/v1` / `qwen3.5-4b` | which llama-server the LLM stage talks to |
 | `S2S_USE_UPSTREAM_LLM` | unset | `1` runs the stock s2s LLM stage instead of Qwen-Agent |
-| `QWEN_AGENT_USE_RAW_API` | `true` | native tool calls; `false` uses qwen-agent's prompt dialect |
+| `LLM_AGENT_MAX_STEPS` | `3` | tool-loop ceiling: enough for tool → observe → answer |
 | `LLM_AGENT_MAX_TOKENS` | `2048` | per-turn generation cap (thinking + tool call + answer) |
 | `LLM_AGENT_THINKING` | `1` | thinking pass; off only on a model measured not to fabricate without it |
 | `LLM_AGENT_TEMP` / `LLM_AGENT_TOP_P` | `0.7` / `0.9` | agent-turn sampling |

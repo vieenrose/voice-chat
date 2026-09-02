@@ -2,7 +2,7 @@
 """Environment self-check: does this interpreter have what the default stack needs?
 
 backend/requirements.txt used to be wrong in both directions — pins for packages the
-repo never imports, and nothing at all for sherpa-onnx / qwen-agent / jieba / lxml /
+repo never imports, and nothing at all for sherpa-onnx / jieba / lxml /
 faster-qwen3-tts / qwentts-cpp-python, which the STT+TTS+agent import ladders require.
 That failure mode was silent: every ladder has a try/except, so the service booted
 "ok" with mock/degraded backends.
@@ -30,7 +30,6 @@ REQUIRED = [
     ("lxml", "lxml", "web_search scraping / page enrichment"),
     ("jieba", "jieba", "CJK tokenization for relevance + query reformulation"),
     ("sherpa_onnx", "sherpa-onnx", "STT: X-ASR streaming recognizer"),
-    ("qwen_agent", "qwen-agent", "agent harness (default): function calling"),
     ("faster_qwen3_tts", "faster-qwen3-tts", "TTS: Qwen3-TTS GGML runtime"),
     ("qwentts_cpp", "qwentts-cpp-python", "TTS: GGML backend wheel (cu124 index)"),
     ("websockets", "websockets", "test/e2e clients"),

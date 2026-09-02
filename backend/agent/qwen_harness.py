@@ -1,31 +1,44 @@
+"""Agent harness for the voice chat: three tools, one bounded turn.
+
+The call -> observe -> answer loop lives in agent/native_loop.py and talks to the
+model server directly. It used to be qwen-agent's Assistant; that was replaced
+because with use_raw_api the framework contributed almost nothing -- its
+Qwen-specific tool dialect was instantiated and never used, since the server
+generates tool calls under the model's own chat template -- while costing a
+cumulative-snapshot protocol the streaming code had to diff, and a bug that
+labelled tool results `id` instead of the schema-required `tool_call_id`.
 """
-Qwen-Agent harness for Qwen3.5-2B voice chat.
-Wraps Qwen-Agent's Assistant with our SearXNG + wttr + granite tools.
-"""
-# qwen_agent/settings.py reads QWEN_AGENT_MAX_LLM_CALL_PER_RUN at import time, so the
-# assignment below `import os` has to precede the qwen_agent imports — that ordering is
-# the whole reason E402 is relaxed for this file (and only this file).
-# ruff: noqa: E402
-import os
-# This one assignment has to run BEFORE `import qwen_agent`: qwen_agent/settings.py
-# reads QWEN_AGENT_MAX_LLM_CALL_PER_RUN into a module constant at import time (20 by
-# default, which is how the 8-call loop happened). Everything after it is an import by
-# necessity — hence the file-level E402 pragma at the top of this file.
-os.environ["QWEN_AGENT_MAX_LLM_CALL_PER_RUN"] = "3"
 import asyncio
-from loguru import logger
-from qwen_agent.agents import Assistant
-from qwen_agent.tools.base import BaseTool, register_tool
 import json
+import os
 import re
 
-from agent._shared import set_emit_target, emit as _emit, agent_call_lock
+from loguru import logger
+
+from agent._shared import agent_call_lock, emit as _emit, set_emit_target
+from agent.native_loop import run_turn
 from agent.tool_guard import ToolArgumentError, sanitize_tool_output, validate_args
 
-# Reasoning vs answer separation for TTS: thinking must never be spoken.
-# Single source of truth lives in llm.ling_streaming; this is a thin re-export so the
-# two paths cannot drift. Fallback keeps the harness importable even if ling is absent.
-from llm.ling_streaming import _is_reasoning_text as _is_reasoning_chunk
+
+class Tool:
+    """Minimal tool contract: a name, a description, a JSON Schema, and call().
+
+    Was qwen_agent.tools.base.BaseTool. Nothing here needed a framework: the
+    schema is handed to the server as-is and native_loop dispatches on the name.
+    """
+
+    name: str = ""
+    description: str = ""
+    parameters: dict = {}
+
+    def call(self, params, **kwargs):
+        raise NotImplementedError
+
+
+# Reasoning no longer has to be sniffed out of the answer text here: the server
+# reports it in its own `reasoning_content` field and native_loop forwards it as an
+# llm_reasoning event, so nothing has to guess. ling_streaming still classifies
+# reasoning for the cases where a model spills it into content anyway.
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
@@ -34,18 +47,19 @@ _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 # 57%, 57%, 71% (mean 62%) across three passes at temperature 0.7. Two things follow:
 # (1) the temperature is configurable, so it can be A/B-ed against measured routing
 #     accuracy instead of being argued about, and
-# (2) an optional per-request seed (qwen-agent forwards `seed` into generate_cfg, and
+# (2) an optional per-request seed (native_loop passes `seed` straight through, and
 #     llama-server honours it) turns a benchmark run reproducible. Neither changes the
 #     defaults unless you set them.
 _DEFAULT_TZ = os.getenv("VOICE_TZ", "Asia/Taipei")
 # Headroom for one turn: thinking + a tool call + the answer. 512 was too tight --
 # a thinking pass that ran long left nothing for the tool call, and the turn ended
 # with finish_reason=length having produced neither. Safe to raise only because
-# tool calls are now native (see use_raw_api below); under prompt-based calling,
+# tool calls are native -- the server generates them under the model's own chat
+# template. Under the prompt-based dialect this harness used to use,
 # raising this made failures MORE likely, because the extra room went to thinking.
 LLM_AGENT_MAX_TOKENS = int(os.getenv("LLM_AGENT_MAX_TOKENS", "2048"))
-# Hard cap on one LLM round-trip. qwen-agent renames request_timeout -> the OpenAI
-# client's timeout, whose default is 600 s -- unusable here. Observed against
+# Hard cap on one LLM round-trip, applied by native_loop's httpx client. The old
+# framework defaulted this to 600 s, which is unusable here. Observed against
 # OpenRouter: the follow-up call after a get_current_datetime tool result simply
 # never returned, and because the framework serves one session at a time, that one
 # hung request held the only pipeline slot for two minutes and every later turn was
@@ -64,10 +78,8 @@ except ImportError as _e:                              # search stack broken/uni
     _wttr_weather = None
     print(f"[qwen_harness] tools.web_search unavailable ({_e}); weather tool falls back to generic search")
 
-import asyncio as _asyncio
 
-@register_tool('web_search', allow_overwrite=True)
-class QwenWebSearch(BaseTool):
+class QwenWebSearch(Tool):
     name = 'web_search'
     description = 'Search the web for current information (weather, news, facts).'
     parameters = {
@@ -118,8 +130,7 @@ class QwenWebSearch(BaseTool):
         _emit({"type": "tool_result", "name": "web_search", "result": res, "formatted": formatted, "latency_ms": res.get("latency_ms", 0), "source": res.get("source","")})
         return sanitize_tool_output(formatted)
 
-@register_tool('get_weather', allow_overwrite=True)
-class QwenGetWeather(BaseTool):
+class QwenGetWeather(Tool):
     name = 'get_weather'
     description = 'Get weather forecast for a location (today/tomorrow/day_after_tomorrow). Wraps wttr.in + SearXNG.'
     parameters = {
@@ -154,8 +165,7 @@ class QwenGetWeather(BaseTool):
         _emit({"type": "tool_result", "name": "get_weather", "result": res, "formatted": formatted, "latency_ms": res.get("latency_ms",0), "source": res.get("source","")})
         return sanitize_tool_output(formatted)
 
-@register_tool('get_current_datetime', allow_overwrite=True)
-class QwenDateTime(BaseTool):
+class QwenDateTime(Tool):
     name = 'get_current_datetime'
     description = "Get the current date and time. Use for today/weekday/time questions."
     parameters = {
@@ -295,7 +305,7 @@ def _answer_or_fallback(text: str) -> str:
 
 
 def _msg_field(m, key, default=None):
-    """Read a field from a qwen_agent message, which may be a dict or a Message object."""
+    """Read a field from a message that may be a dict or an object with attributes."""
     if isinstance(m, dict):
         return m.get(key, default)
     return getattr(m, key, default)
@@ -347,15 +357,6 @@ def _msg_field(m, key, default=None):
 
 
 
-def _raw_tool_calls() -> bool:
-    """Native tool calls (tools= on the request) rather than the prompt dialect.
-
-    Kept switchable because it needs a server that implements native tool calling;
-    llama-server with --jinja does. See the note in _make_agent for the numbers.
-    """
-    return os.getenv("QWEN_AGENT_USE_RAW_API", "true").strip().lower() not in ("0", "false", "no")
-
-
 def _thinking_on() -> bool:
     """Whether llama-server runs the model's thinking pass for agent turns.
 
@@ -401,86 +402,39 @@ def _smalltalk_rule() -> str:
             "you cannot know: the current date/time, the weather, or a changing fact. ")
 
 
-def _make_agent(function_list=None):
-    import os
-    _base = os.getenv("LLM_API_BASE", "http://127.0.0.1:11435/v1")
-    _key = os.getenv("LLM_API_KEY", "none")
-    _model = os.getenv("LLM_MODEL_ID", "qwen3.5-9b")
-    # A remote endpoint names its own model, so only a llama-server this process
-    # manages may override it. Without this check, pointing LLM_API_BASE at a hosted
-    # provider still sent the local registry's alias (e.g. "qwen3.5-9b") as the model
-    # field, which the provider rejects as unknown.
+def _endpoint() -> tuple[str, str, str]:
+    """Where to send the turn: (api_base, model, api_key)."""
+    base = os.getenv("LLM_API_BASE", "http://127.0.0.1:11435/v1")
+    key = os.getenv("LLM_API_KEY", "none")
+    model = os.getenv("LLM_MODEL_ID", "gemma-4-e4b-qat")
     # An explicit LLM_MODEL_ID wins. llm_manager's alias is only right for a server
     # it spawned itself; when the endpoint is an external engine on the same host --
     # FreeToken serving Qwen3.6-35B-A3B, say -- adopting its alias would send the
-    # name of a model that is not loaded, or has been deleted.
-    _explicit = bool(os.getenv("LLM_MODEL_ID"))
-    _local = bool(re.search(r"//(127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0)\b", _base))
-    if _local and not _explicit:
-        # Prefer the live alias llm_manager actually has loaded (kept in sync across
-        # POST /api/model switches) over a static env var, so a freshly-reset agent
-        # picks up whichever model is currently running.
+    # name of a model that is not loaded, or has been deleted. A remote provider
+    # names its own model too, so the override is loopback-only.
+    explicit = bool(os.getenv("LLM_MODEL_ID"))
+    local = bool(re.search(r"//(127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0)\b", base))
+    if local and not explicit:
         try:
             from llm_manager import llm_manager as _llm_mgr
             if _llm_mgr.current_alias:
-                _model = _llm_mgr.current_alias
+                model = _llm_mgr.current_alias
         except Exception:
             pass
-    llm_cfg = {
-        'model': _model,
-        'model_server': _base,
-        'api_key': _key,
-        'generate_cfg': {
-            'max_tokens': LLM_AGENT_MAX_TOKENS,
-            'request_timeout': LLM_REQUEST_TIMEOUT,
-            'temperature': LLM_AGENT_TEMP,
-            'top_p': LLM_AGENT_TOP_P,
-            # Thinking on. It costs first-token latency, but with --reasoning-format
-            # deepseek the deliberation goes to `reasoning_content` and never reaches
-            # the speaker. LLM_AGENT_THINKING=0 turns it off.
-            'chat_template_kwargs': {'enable_thinking': _thinking_on()},
-            # Native tool calls instead of qwen-agent's prompt-based dialect.
-            #
-            # By default qwen-agent injects a <tool_call>{json}</tool_call> template
-            # into the system prompt and regex-parses the model's free text back out.
-            # That puts the tool call in competition with everything else the model
-            # is generating: measured on Qwen3.5 4B, a weather question failed 1 in 9
-            # times with the model emitting no tool call and no answer at all, having
-            # spent the whole budget thinking. It is also what made the truncated
-            # tool-call JSON bug possible, since extract_fn() drops the last
-            # character of an unterminated block.
-            #
-            # use_raw_api passes tools= to the server instead, so llama-server
-            # (with --jinja) generates the call under the model's own chat template
-            # with grammar constraints -- it cannot emit malformed JSON, and the call
-            # cannot be crowded out. Measured: 9/9 weather turns, and 0 failures with
-            # 0 reasoning leaks across all five demo prompt shapes.
-            #
-            # Requires a server that accepts native tools. Set
-            # QWEN_AGENT_USE_RAW_API=false to fall back to the prompt dialect.
-            'use_raw_api': _raw_tool_calls(),
-            # NB: no reasoning_budget_tokens here. llama-server ignores it as a
-            # per-request field (verified: a request with reasoning_budget_tokens=30
-            # still produced 512 completion tokens of reasoning), so it was doing
-            # nothing. The server flag --reasoning-budget DOES work, but capping
-            # thinking cuts off the tool-call decision with it: 5/12 with the budget
-            # at 200 against 9/9 without. The fix for runaway thinking was native
-            # tool calls, not a shorter leash.
-        },
-        'enable_thinking': _thinking_on()
-    }
-    agent = Assistant(
-        llm=llm_cfg,
-        # `function_list or _TOOLS_FULL` would silently turn an INTENDED empty list
-        # back into the full tool set (an empty list is falsy) — which is exactly how
-        # the duplicate-search bug came back after being "fixed".
-        function_list=list(_TOOLS_FULL if function_list is None else function_list),
-        system_message=("You are a helpful voice assistant." + _smalltalk_rule() + AGENT_SYSTEM_MESSAGE),
-    )
-    return agent
+    return base, model, key
 
-# Module-level so llm.ling_streaming._is_own_prompt_echo() can recognize this text
-# if the model replays it as an "answer" (it must never be spoken).
+
+def _generate_cfg() -> dict:
+    return {
+        "max_tokens": LLM_AGENT_MAX_TOKENS,
+        "temperature": LLM_AGENT_TEMP,
+        "top_p": LLM_AGENT_TOP_P,
+        # Thinking is a chat-template flag, not a sampling parameter.
+        "chat_template_kwargs": {"enable_thinking": _thinking_on()},
+        **({"seed": int(LLM_AGENT_SEED)} if LLM_AGENT_SEED else {}),
+    }
+
+
 # Necessary but NOT sufficient on its own: measured on Gemma 4 E4B, this wording
 # stops a plain "IGNORE ALL PREVIOUS INSTRUCTIONS" planted in a search result, but
 # NOT a forged <|im_start|>system turn -- only sanitize_tool_output() stops that.
@@ -499,174 +453,68 @@ AGENT_SYSTEM_MESSAGE = (
     "Chinese or English."
 )
 
-_TOOLS_FULL = ['web_search', 'get_weather', 'get_current_datetime']
-_agents: dict = {}
+
+def system_message() -> str:
+    return "You are a helpful voice assistant." + _smalltalk_rule() + AGENT_SYSTEM_MESSAGE
 
 
-def _get_agent(exclude=()):
-    """Cached Assistant per tool-set.
+_TOOLS: dict = {}
 
-    `exclude` exists because a pre-flight search must be *paired* with taking that tool
-    away for the turn. qwen-agent binds the tool list at construction and this version
-    exposes neither `max_function_calls` nor a per-call `function_list` override, so with
-    web_search still visible the model called it a second time on top of the result that
-    had just been injected for it — measured 2-3 searches per question and 8-11 s to
-    first audio. Dropping the tool that has already been satisfied is the one enforcement
-    mechanism available here, and it is honest: the results really are in context.
-    """
-    keep = [t for t in _TOOLS_FULL if t not in set(exclude)]
-    key = tuple(keep)
-    if key not in _agents:
-        _agents[key] = _make_agent(keep)
-    return _agents[key]
+
+def _tools() -> dict:
+    """The three tools, instantiated once. Plain objects, no registry."""
+    if not _TOOLS:
+        for cls in (QwenWebSearch, QwenGetWeather, QwenDateTime):
+            t = cls()
+            _TOOLS[t.name] = t
+    return _TOOLS
+
 
 def reset_agent():
-    """Drop the cached Assistant so the next call rebuilds it — needed after
-    llm_manager.switch_to() changes which model llama-server serves, since
-    _make_agent() bakes the model alias in at construction time and _agent is
-    otherwise a permanent singleton for the process lifetime. Called from
-    app.py's POST /api/model handler."""
-    global _agent
-    _agent = None
-    _agents.clear()          # every cached tool-set variant, not just the default one
+    """Drop cached endpoint state so the next turn re-reads it.
+
+    Needed after llm_manager.switch_to() changes which model the server serves;
+    called from app.py's POST /api/model handler. The native loop reads the
+    endpoint per turn, so there is no agent object to rebuild any more -- only the
+    tool instances, which are model-independent and can stay.
+    """
+    return None
+
 
 async def run_agent_task(task: str, event_q=None, history=None) -> str:
     """Run one agent turn in a worker thread.
 
-    `history` is a list of real {role, content} turns (user/assistant) — passed
-    through to qwen-agent as messages so referential follow-ups resolve instead of
-    being a 120-char digest. Emits tool_call/tool_result plus llm_delta events (the
-    answer as it is generated; see the reset protocol in _run).
+    `history` is a list of real {role, content} turns, passed through as messages so
+    referential follow-ups ("and tomorrow?") resolve instead of being a truncated
+    digest. Emits tool_call/tool_result from the tools themselves, plus llm_delta as
+    the answer is generated -- see the reset protocol in agent/native_loop.py.
     """
-    loop = _asyncio.get_running_loop()
+    loop = asyncio.get_running_loop()
     set_emit_target(loop, event_q)
-    agent = _get_agent()
-    hist = [m for m in (history or []) if isinstance(m, dict) and m.get('role') in ('user', 'assistant') and m.get('content')]
+    hist = [m for m in (history or [])
+            if isinstance(m, dict) and m.get("role") in ("user", "assistant") and m.get("content")]
+    base, model, key = _endpoint()
+    cfg = _generate_cfg()
+
     def _run():
+        # No greeting fast-path: a canned "你好！有什麼可以幫你的？" would answer
+        # without consulting the model, which contradicts this repo's own no-cheating
+        # rule and hides real first-token latency from any benchmark that greets
+        # first. The prompt handles greetings.
+        messages = ([{"role": "system", "content": system_message()}]
+                    + hist + [{"role": "user", "content": task}])
         try:
-            # No greeting fast-path: it returned a canned "你好！有什麼可以幫你的？"
-            # without ever consulting the model, which contradicted this repo's own
-            # "no hard-coded cheating" rule and hid real first-token latency from any
-            # benchmark that greeted first. The prompt already handles greetings.
-            # The Assistant for THIS turn. Swapped below when a pre-flight already
-            # satisfied one of the tools, so the model cannot call that tool twice.
-            _turn_agent = agent
-            messages = hist + [{'role': 'user', 'content': task}]
-            # No pre-flight. Deciding from the *form* of the question which tool must
-            # run, then injecting a synthetic assistant/function exchange before the
-            # model has said anything, is steering by regex: it made the routing metric
-            # measure the guard rather than the model, and on Qwen3.5 4B the injected
-            # turn is what the model then read aloud instead of answering. The tools are
-            # declared to the agent; it decides.
-            all_resps = []
-            # --- answer streaming (qwen-agent yields `response + partial_output` on
-            # every LLM chunk, so the final step's content is available incrementally).
-            # Streaming is tracked PER STEP: content stays empty while the model burns
-            # tokens on reasoning, a step whose tail becomes a tool call/tool result
-            # means that step's text was not the answer (emit llm_reset so the consumer
-            # drops it), and a LATER step may still stream the real answer. Abandoning
-            # permanently at the first tool step (the first version of this) silently
-            # disabled streaming for every tool turn — i.e. exactly the latency win
-            # this exists to get. Permanent abandonment only for template junk.
-            stream_step = -1
-            streamed_len = 0
-            reasoning_len = 0
-            abandoned = False
+            # Serialised: one turn at a time per process, as before. The tools hit
+            # SearXNG and the model server, and concurrent turns interleaved their
+            # emitted events.
             with agent_call_lock:
-                run_kwargs = {"seed": int(LLM_AGENT_SEED)} if LLM_AGENT_SEED else {}
-                for resp in _turn_agent.run(messages=messages, **run_kwargs):
-                    all_resps.append(resp)
-                    if abandoned:
-                        continue
-                    lst = resp if isinstance(resp, list) else [resp]
-                    # Surface reasoning_content as its own event (never to TTS)
-                    for m in lst:
-                        # qwen_agent messages can be dict or Message objects
-                        rc = None
-                        if isinstance(m, dict):
-                            rc = m.get('reasoning_content')
-                        elif hasattr(m, 'reasoning_content'):
-                            rc = getattr(m, 'reasoning_content', None)
-                        if isinstance(rc, str) and rc:
-                            if len(rc) > reasoning_len:
-                                _emit({"type": "llm_reasoning", "text": rc[reasoning_len:]})
-                                reasoning_len = len(rc)
-                    last = lst[-1] if lst else None
-                    # Normalize last to dict
-                    last_dict = None
-                    if isinstance(last, dict):
-                        last_dict = last
-                    elif last is not None and hasattr(last, 'role'):
-                        last_dict = {'role': getattr(last, 'role', ''), 'content': getattr(last, 'content', ''), 'function_call': getattr(last, 'function_call', None)}
-                    if isinstance(last_dict, dict) and last_dict.get('role') == 'assistant' and not last_dict.get('function_call'):
-                        c = last_dict.get('content')
-                        if isinstance(c, str):
-                            if '<tool_call>' in c or '<arg_' in c or '<|' in c:
-                                abandoned = True
-                                _emit({"type": "llm_delta", "text": "", "reset": True})
-                                continue
-                            if len(lst) != stream_step:              # a new step started
-                                if streamed_len:                     # previous step's text was not the answer
-                                    _emit({"type": "llm_delta", "text": "", "reset": True})
-                                stream_step, streamed_len = len(lst), 0
-                            if len(c) > streamed_len:
-                                delta = c[streamed_len:]
-                                # Spillover: reasoning truncated into content (budget exceeded)
-                                if _is_reasoning_chunk(delta):
-                                    _emit({"type": "llm_reasoning", "text": delta})
-                                else:
-                                    _emit({"type": "llm_delta", "text": delta})
-                                streamed_len = len(c)
-                    else:
-                        # Tail is a tool call / tool result: this step isn't the answer.
-                        if streamed_len:
-                            _emit({"type": "llm_delta", "text": "", "reset": True})
-                        stream_step, streamed_len = -1, 0
-            # Collect all assistant messages with non-empty content from entire run (filter thinking leak)
-            candidates_all = []
-            for resp in all_resps:
-                lst = resp if isinstance(resp, list) else [resp]
-                for m in lst:
-                    if _msg_field(m, 'role') == 'assistant':
-                        c = _msg_field(m, 'content')
-                        # Filter: content must be non-empty and not just reasoning (reasoning_content is separate)
-                        if isinstance(c, str) and c.strip() and _has_word(c.strip()):
-                            # Skip if it's just the reasoning dump (empty content with reasoning_content)
-                            if not c.strip().startswith("["):
-                                candidates_all.append({"role": "assistant", "content": c})
-                        elif isinstance(c, list):
-                            txt = "".join(b.get('text','') if isinstance(b, dict) else str(b) for b in c)
-                            if txt.strip():
-                                candidates_all.append({"role": "assistant", "content": txt})
-            if candidates_all:
-                # The answer is whatever the agent last said. Nothing here inspects it
-                # for what it 'should' have done: the guard layer that used to live at
-                # this point matched hand-written Chinese patterns against the answer and
-                # then re-ran tools, spliced results, or rewrote sentences. Measured on
-                # Qwen3.5 4B it made things worse, not better -- '現在幾點？' went from a
-                # correct 3.3 s reply to 28.9 s of the model reading its own deliberation
-                # aloud, because it was narrating the tool result the pre-flight had
-                # injected. The model calls its own tools; that is what tools are for.
-                final_text = candidates_all[-1].get('content', '')
-                return _answer_or_fallback(final_text)
-            # Fallback to memory (also filter empty)
-            if hasattr(agent, 'memory') and agent.memory:
-                # NB: must NOT be named `hist` — that would make `hist` local to _run
-                # and turn the `messages = hist + [...]` above into
-                # UnboundLocalError on every single call.
-                mem_hist = agent.memory.get_history() if hasattr(agent.memory, 'get_history') else []
-                for m in reversed(mem_hist):
-                    if m.get('role') == 'assistant' and m.get('content'):
-                        c = m['content']
-                        if isinstance(c, str) and c.strip() and _has_word(c.strip()) and not c.strip().startswith("["):
-                            return c
-            return NO_ANSWER_ZH
+                answer = run_turn(messages, _tools(), api_base=base, model=model,
+                                  api_key=key, generate_cfg=cfg)
         except Exception as e:
-            # This return value is spoken via TTS (generate_chat_with_tools tokenizes it
-            # char-by-char with no filtering for an "error"-looking string) — a raw
-            # exception message here (e.g. an httpx connection error from a model switch
-            # killing the server mid-request) would get read aloud verbatim. Log the real
-            # detail server-side; return a clean, generic fallback for the user to hear.
-            logger.exception(f"qwen agent failed: {e}")
+            # This return value is spoken, so a raw exception message would be read
+            # aloud verbatim. Log the detail; say which category of failure it was.
+            logger.exception(f"agent turn failed: {e}")
             return _provider_failure_zh(e)
+        return _answer_or_fallback(answer)
+
     return await asyncio.to_thread(_run)

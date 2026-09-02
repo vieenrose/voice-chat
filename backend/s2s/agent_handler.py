@@ -1,9 +1,9 @@
-"""Qwen-Agent as the LLM stage of the HuggingFace speech-to-speech pipeline.
+"""Our agent as the LLM stage of the HuggingFace speech-to-speech pipeline.
 
 Replaces what ``get_llm_handler()`` returns, so s2s owns VAD, Smart Turn
 endpointing, STT, TTS, transport and cancellation, while the turn itself is
-still driven by this project's Qwen-Agent harness (routing rules, pre-flight,
-fabrication guards) and the ``ling_streaming`` text filters.
+still driven by this project's own harness (three tools, a bounded call ->
+observe loop) and the ``ling_streaming`` text filters.
 
 Tools run SERVER-SIDE, inside the harness, and the Realtime client-tool
 protocol is deliberately left unused. That protocol expects the *client* to
@@ -61,7 +61,7 @@ def _worth_speaking(chunk: str) -> bool:
     return bool(_CJK.search(chunk)) or len(_LATIN.findall(chunk)) >= 2
 
 
-class QwenAgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
+class AgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
     """s2s LLM stage backed by ``LingStreaming.generate_chat_with_tools``."""
 
     def setup(
@@ -84,8 +84,8 @@ class QwenAgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
         # The harness is async; this stage is a thread. One long-lived loop in a
         # daemon thread avoids paying event-loop setup on every single turn.
         self._loop = asyncio.new_event_loop()
-        threading.Thread(target=self._loop.run_forever, daemon=True, name="qwen-agent-loop").start()
-        logger.info("QwenAgentLanguageModelHandler ready (%s @ %s)", model_name, api_base)
+        threading.Thread(target=self._loop.run_forever, daemon=True, name="agent-loop").start()
+        logger.info("AgentLanguageModelHandler ready (%s @ %s)", model_name, api_base)
 
     def reconfigure(self, api_base: str, model_name: str) -> None:
         """Point the stage at a different endpoint without restarting the pipeline.
