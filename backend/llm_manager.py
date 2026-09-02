@@ -47,41 +47,24 @@ LLM_SEED = int(os.getenv("LLM_SEED", "-1"))
 # tool template, quoted the prompt back, or repeated itself — each needing another
 # filter. Unquantized f16 scored the same as q8, so this is capacity, not quantization.
 MODEL_REGISTRY: dict[str, dict] = {
-    # The only model. Chosen on perplexity over 194 kB of non-repeating zh-TW Wikipedia
-    # prose, a deterministic measure of how far quantization moved the model -- unlike the
-    # four-prompt UI matrix, whose spread (4-6 of 8 across builds differing only in
-    # throughput) is noise and cannot rank anything:
-    #
-    #   2B  UD-Q8_K_XL 16.738   UD-Q4_K_XL 17.080   Q4_K_M 17.091
-    #   4B  UD-Q8_K_XL 13.027   UD-Q4_K_XL 13.173
-    #
-    # Q8 is the most faithful at both sizes (~2% lower). The 4B is the reference the
-    # harness and the speech-to-speech pipeline are validated against.
+    # The only model. 9B at Q4_K_M rather than the 4B at Q8: Q4 halves the bytes read
+    # per token, so doubling the parameters costs almost nothing in throughput --
+    # measured 47 tok/s against the 4B Q8's 52 -- while 5.87 GB still leaves ~3.1 GB of
+    # the 12 GB card for KV and activations once the speech stages have their ~3.5 GB.
     #
     # MTP is ON: the weights carry NextN layers, so the model drafts its own next tokens
-    # and verifies them -- accepted drafts are the tokens that would have been produced
-    # anyway, which is why it recovers throughput without touching precision. Measured
-    # +20% on 4B with byte-identical greedy output. See _mtp_args(); LLM_MTP=0 disables.
-    #
-    # Dropped, all measured on this box:
-    #   Qwen3.5 2B Q8   -- 13.027 vs 16.738 perplexity; the 4B is simply better and the
-    #                      VRAM is available.
-    #   Bonsai 8B ternary -- 8.2B params in 2.18 GB is real compression, but in
-    #                      tokenizer-independent bits/byte it lost to the 2B (1.0786 vs
-    #                      0.9652). Ternary pays for its size in quality. It also needed
-    #                      Prism's llama.cpp fork, a second binary to keep working.
-    #   Ling 3.0 tiny   -- same score as 2B, slower (148 vs 172 tok/s), more VRAM, and
-    #                      drifted into Simplified Chinese, which this demo must not do.
-    "qwen3.5-4b-q8": {
-        "label": "Qwen3.5 4B · Q8_K_XL",
-        "path": os.getenv("LLM_PATH_4B", "/home/user/llms/mtp/Qwen3.5-4B-UD-Q8_K_XL.gguf"),
-        "alias": "qwen3.5-4b",
+    # and verifies them. Accepted drafts are the tokens that would have been produced
+    # anyway, so this is throughput, not quality. See _mtp_args(); LLM_MTP=0 disables.
+    "qwen3.5-9b-q4": {
+        "label": "Qwen3.5 9B · Q4_K_M",
+        "path": os.getenv("LLM_PATH_9B", "/home/user/llms/mtp/Qwen3.5-9B-Q4_K_M.gguf"),
+        "alias": "qwen3.5-9b",
         "mtp": True,
     },
 }
 
 
-DEFAULT_MODEL_ID = os.getenv("LLM_DEFAULT_MODEL_ID", "qwen3.5-4b-q8")
+DEFAULT_MODEL_ID = os.getenv("LLM_DEFAULT_MODEL_ID", "qwen3.5-9b-q4")
 
 
 def _alias_to_model_id(alias: str) -> Optional[str]:

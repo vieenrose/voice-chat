@@ -30,6 +30,7 @@ import llm_manager as llmmod              # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 
+
 def _client():
     # Deliberately NOT used as a context manager: that would run the lifespan and
     # try to spawn a second SearXNG on :8888.
@@ -154,11 +155,11 @@ class TestAuth(unittest.TestCase):
         appmod.MODEL_SWITCH_REQUIRE_TOKEN = False
         self._reset_switch_state()
         with self._switch_ok():
-            r = _client().post("/api/model", json={"model_id": "qwen3.5-4b-q8"})
+            r = _client().post("/api/model", json={"model_id": llmmod.DEFAULT_MODEL_ID})
         self.assertEqual(r.status_code, 200, r.text)
         hist = appmod.stats["model_switches"]
         self.assertEqual(len(hist), 1, "the switch must be recorded")
-        self.assertTrue(hist[-1]["ok"] and hist[-1]["model"] == "qwen3.5-4b-q8")
+        self.assertTrue(hist[-1]["ok"] and hist[-1]["model"] == llmmod.DEFAULT_MODEL_ID)
         self.assertTrue(hist[-1]["peer"], "it must be attributable")
 
     def test_closed_mode_is_still_available_as_a_choice(self):
@@ -166,7 +167,7 @@ class TestAuth(unittest.TestCase):
         appmod.MODEL_SWITCH_REQUIRE_TOKEN = True
         self._reset_switch_state()
         try:
-            r = _client().post("/api/model", json={"model_id": "qwen3.5-4b-q8"})
+            r = _client().post("/api/model", json={"model_id": llmmod.DEFAULT_MODEL_ID})
             self.assertEqual(r.status_code, 403)
             self.assertIn("remedy", r.json(), "a refusal must say what to do about it")
             self.assertEqual(len(appmod.stats["model_switches"]), 0, "refused switches are not performed")
@@ -181,10 +182,10 @@ class TestAuth(unittest.TestCase):
         self._reset_switch_state()
         with self._switch_ok():
             c = _client()
-            first = c.post("/api/model", json={"model_id": "qwen3.5-4b-q8"})
+            first = c.post("/api/model", json={"model_id": llmmod.DEFAULT_MODEL_ID})
             # The registry holds a single model, so the thrash to guard against is the
             # same id twice in a row -- which still restarts llama-server for everyone.
-            second = c.post("/api/model", json={"model_id": "qwen3.5-4b-q8"})
+            second = c.post("/api/model", json={"model_id": llmmod.DEFAULT_MODEL_ID})
         self.assertEqual(first.status_code, 200)
         self.assertEqual(second.status_code, 429, "immediate re-switch must not restart the server twice")
         j = second.json()
@@ -196,9 +197,9 @@ class TestAuth(unittest.TestCase):
         appmod.AUTH_TOKEN = "sekret"
         self._reset_switch_state()
         try:
-            self.assertEqual(_client().post("/api/model", json={"model_id": "qwen3.5-4b-q8"}).status_code, 401)
+            self.assertEqual(_client().post("/api/model", json={"model_id": llmmod.DEFAULT_MODEL_ID}).status_code, 401)
             with self._switch_ok():
-                ok = _client().post("/api/model", json={"model_id": "qwen3.5-4b-q8"},
+                ok = _client().post("/api/model", json={"model_id": llmmod.DEFAULT_MODEL_ID},
                                     headers={"X-Auth-Token": "sekret"})
             self.assertEqual(ok.status_code, 200, ok.text)
         finally:
