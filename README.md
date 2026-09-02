@@ -461,6 +461,10 @@ It implements the protocol details under [API](#api), plus three of its own:
   The dictionaries load lazily, so the main bundle stays ~62 kB and nothing on the audio path
   waits for them.
 
+The pipeline card reads its LLM row from `/v1/llm-config` and fetches it on mount rather than on
+connect — it is informational, and it used to read 尚未連線 while the server was perfectly
+reachable.
+
 **⬇ 記錄** in the header exports the session as one `.json`: the protocol trace both ways, the
 transcript (with the raw STT text alongside the converted form), client-side events such as
 barge-in flushes and microphone errors, and the audio counters. Audio payloads are elided and

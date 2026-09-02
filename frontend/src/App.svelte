@@ -35,8 +35,8 @@
   const PIPELINE = $derived([
     ['VAD', 'Silero v5 + Smart Turn v3.2'],
     ['STT', 'Paraformer（FunASR）'],
-    ['LLM', llmCfg ? llmCfg.model : '尚未連線'],
-    ['Agent', 'Qwen-Agent · 原生工具呼叫（3 工具）'],
+    ['LLM', llmCfg ? llmCfg.model : '無法取得（伺服器未啟動？）'],
+    ['Agent', '自建工具迴圈 · 原生工具呼叫（3 工具，上限 3 步）'],
     ['TTS', 'Qwen3-TTS 12Hz · GGML 24k'],
   ])
   let textInput = $state('')
@@ -65,13 +65,19 @@
     if (!target) return
     try {
       const r = await fetch(target, { cache: 'no-store' })
-      llmCfg = await r.json()
-
-
+      llmCfg = r.ok ? await r.json() : null
     } catch {
       llmCfg = null
     }
   }
+
+  // The pipeline card is informational, so it should not wait for the user to
+  // press 連線: the model row read 尚未連線 while the server was perfectly
+  // reachable. Fetched once on mount, and again on connect in case the endpoint
+  // field was edited in between.
+  $effect(() => {
+    loadLlmCfg()
+  })
 
 
 
