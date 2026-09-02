@@ -86,6 +86,21 @@ MODEL_REGISTRY: dict[str, dict] = {
     # Not downloaded by default: Q4_K_M is 22.66 GB, and it needs the RAM for the
     # offloaded experts on top of that. /health reports exists=false and the UI greys it
     # out until LLM_PATH_35B points at a real file.
+    # Bonsai 8B, ternary (1.58-bit) weights in Prism's PQ2_0 format. 8.2B parameters in
+    # 2.18 GB — and measured on the same zh corpus as the entries above, PPL 16.518
+    # against the 2B's 16.738 and the 4B's 13.027. So a ternary 8B lands roughly where a
+    # 2B Q8 does: the compression is real and so is the quality cost per parameter.
+    #
+    # Needs Prism's llama.cpp fork ("bin" below). Their Q2_0 reuses upstream's
+    # GGML_TYPE_Q2_0 id with a different block layout, so mainline refuses the file. Note
+    # the HF repo also ships a plain *-Q2_0.gguf which is their LEGACY group-128 layout
+    # and fails even on the fork; PQ2_0 is the current one.
+    "bonsai-8b-ternary": {
+        "label": "Bonsai 8B ternary PQ2_0",
+        "path": os.getenv("LLM_PATH_BONSAI_8B", "/home/user/llms/bonsai/Ternary-Bonsai-8B-PQ2_0.gguf"),
+        "alias": "bonsai-8b",
+        "bin": os.getenv("LLAMA_SERVER_BIN_PRISM", "/home/user/prism-llama/build/bin/llama-server"),
+    },
     "qwen3.6-35b-a3b-q4": {
         "label": "Qwen3.6 35B-A3B UD-Q4_K_M (experts in RAM)",
         "path": os.getenv("LLM_PATH_35B", "/home/user/llms/mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"),
@@ -143,7 +158,7 @@ class LLMServerManager:
         self.switching = False
         self._lock = asyncio.Lock()
 
-    def _reasoning_args(self) -> list[str]:
+    def _reasoning_args(self, server_bin: str = LLAMA_SERVER_BIN) -> list[str]:
         """`--reasoning-format deepseek` moves the model's thinking pass out of
         `message.content` and into `message.reasoning_content`.
 
@@ -160,13 +175,13 @@ class LLMServerManager:
         fmt = os.getenv("LLM_REASONING_FORMAT", "deepseek").strip()
         if not fmt or fmt == "none":
             return []
-        if not _supports_llama_flag(LLAMA_SERVER_BIN, "--reasoning-format"):
+        if not _supports_llama_flag(server_bin, "--reasoning-format"):
             logger.warning("this llama-server build has no --reasoning-format; thinking text will stay "
                            "in message.content (LLM_REASONING_FORMAT to override)")
             return []
         return ["--reasoning-format", fmt]
 
-    def _mtp_args(self, info: dict) -> list[str]:
+    def _mtp_args(self, info: dict, server_bin: str = LLAMA_SERVER_BIN) -> list[str]:
         """Self-speculative decoding for weights that carry MTP (NextN) layers.
 
         The model drafts its own next few tokens and the target model verifies them, so
@@ -183,13 +198,13 @@ class LLMServerManager:
             return []
         if os.getenv("LLM_MTP", "1").strip() in ("0", "false", "no"):
             return []
-        if not _supports_llama_flag(LLAMA_SERVER_BIN, "--spec-type"):
+        if not _supports_llama_flag(server_bin, "--spec-type"):
             logger.warning("this llama-server build has no --spec-type; MTP weights will run without "
                            "speculative decoding (correct, just slower)")
             return []
         return ["--spec-type", "draft-mtp", "--spec-draft-n-max", os.getenv("LLM_MTP_DRAFT_N", "3")]
 
-    def _moe_offload_args(self, info: dict) -> list[str]:
+    def _moe_offload_args(self, info: dict, server_bin: str = LLAMA_SERVER_BIN) -> list[str]:
         """Keep a sparse MoE's expert weights in system RAM instead of VRAM.
 
         A 35B-A3B activates ~3B parameters per token but must have all 35B resident
@@ -209,26 +224,39 @@ class LLMServerManager:
             return []
         n = os.getenv("LLM_CPU_MOE_LAYERS", "").strip()
         flag = "--n-cpu-moe" if n else "--cpu-moe"
-        if not _supports_llama_flag(LLAMA_SERVER_BIN, flag):
+        if not _supports_llama_flag(server_bin, flag):
             logger.warning(f"this llama-server build has no {flag}; a sparse-MoE entry will try to "
                            "load entirely into VRAM and will most likely fail to allocate")
             return []
         return [flag, n] if n else [flag]
+
+    def _server_bin(self, info: dict) -> str:
+        """Which llama-server serves this entry.
+
+        Normally the one binary in LLAMA_SERVER_BIN. An entry may name its own with
+        "bin" when its weights need a build mainline cannot load — Prism\'s ternary
+        Q2_0/PQ2_0 blocks, for instance, collide with upstream\'s GGML_TYPE_Q2_0 type id
+        but use a different layout, so mainline rejects the file outright. Flag probing
+        (_supports_llama_flag) is already keyed by binary, so a fork with a different
+        flag set is handled without further special-casing.
+        """
+        return info.get("bin") or LLAMA_SERVER_BIN
 
     def _spawn(self, model_id: str) -> None:
         info = MODEL_REGISTRY[model_id]
         path = Path(info["path"])
         if not path.exists():
             raise FileNotFoundError(f"model file not found: {path}")
+        server_bin = self._server_bin(info)
         cmd = [
-            LLAMA_SERVER_BIN, "-m", str(path),
+            server_bin, "-m", str(path),
             "--host", LLM_HOST, "--port", str(LLM_PORT),
             "-c", str(LLM_CTX), "--alias", info["alias"],
             "--n-gpu-layers", "99", "--jinja",
         ]
-        cmd += self._reasoning_args()
-        cmd += self._mtp_args(info)
-        cmd += self._moe_offload_args(info)
+        cmd += self._reasoning_args(server_bin)
+        cmd += self._mtp_args(info, server_bin)
+        cmd += self._moe_offload_args(info, server_bin)
         if LLM_SEED != -1:
             cmd += ["--seed", str(LLM_SEED)]
         logger.info(f"LLMServerManager: spawning {model_id} ({info['label']}): {' '.join(cmd)}")

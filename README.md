@@ -30,10 +30,25 @@ libraries installed; `/health` reports `mock` when a rung is reached.
 
 ### Switchable models
 
-`qwen3.5-2b-q4` (default), `qwen3.5-4b-q4` and `qwen3.6-35b-a3b-q4`, selectable from the UI's
-Model card or `POST /api/model`. Only one is loaded at a time — VRAM on a 12 GB card is tight
+`qwen3.5-2b-q4` (default), `qwen3.5-4b-q4`, `bonsai-8b-ternary` and `qwen3.6-35b-a3b-q4`,
+selectable from the UI's Model card or `POST /api/model`. Only one is loaded at a time — VRAM on a 12 GB card is tight
 with embedding + TTS + STT resident. **Bare-metal only**: the compose setup runs the LLM in a
 fixed sibling container.
+
+**Bonsai 8B is ternary (1.58-bit)** — 8.2 B parameters in a 2.18 GB file. Measured on the same
+zh corpus as the entries above it scores PPL 16.518, against the 2B Q8's 16.738 and the 4B's
+13.027, at 118 tok/s and 3/4 on the UI prompts with all four tools routed correctly. So a
+ternary 8B lands roughly where a 2 B Q8 does: the compression is real, and so is the quality
+cost per parameter. The file size also oversells the footprint — 2.18 GB of weights still took
+7.1 GB of VRAM at 16 k context.
+
+It needs Prism's llama.cpp fork, which is why registry entries may carry a `"bin"` of their own:
+their `Q2_0` reuses upstream's `GGML_TYPE_Q2_0` type id with a different block layout, so
+mainline refuses the file outright. Build the `prism` branch with `-DGGML_CUDA=ON` (their README
+says CPU/Metal only — out of date, the CUDA kernels including `mmvq` are there) and point
+`LLAMA_SERVER_BIN_PRISM` at it. Set `TMPDIR` to a real disk first: nvcc's intermediates hit the
+`/tmp` quota otherwise. Note the HF repo also ships a plain `*-Q2_0.gguf` in their *legacy*
+group-128 layout that fails even on the fork; `PQ2_0` is the current one.
 
 **Qwen3.6 35B-A3B runs by keeping its experts in system RAM.** 35B total parameters, ~3B active
 per token: far too large for a 12 GB card outright, but the experts are the bulk of the weights
