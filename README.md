@@ -123,7 +123,9 @@ docker compose up -d --build     # UI at http://localhost:8000
 ## Features
 
 - **Full-duplex barge-in, either direction.** Speaking over a reply cancels it, whether that
-  reply came from voice or text, and vice versa. STT runs on a background pump rather than
+  reply came from voice or text, and vice versa — on the *first partial transcript*, not when
+  the user stops talking. That distinction is the whole feature on a long answer: waiting for
+  `stt_final` means the assistant talks over the user for the length of their utterance. STT runs on a background pump rather than
   blocking on the current turn, so new speech is recognized *while* the assistant is talking.
   Every reply carries a monotonic `turn_id`; the client drops events from a superseded turn, and
   a shared lock serializes the voice, text and explicit cancellation paths.
@@ -330,6 +332,7 @@ ruff check backend --config ruff.toml                # gate: E4, E7, E9, F, B
 
 # against a LIVE deployment (real models)
 python3 backend/test_e2e_report.py --server http://127.0.0.1:8000
+python3 backend/test_bargein_voice.py         # speak over a long reply; must cut it dead
 python3 backend/test_tts_asr_roundtrip.py --tts qwen3 --repeats 3 --modes full,stream
 python3 backend/compare_tts_reports.py before.json after.json
 

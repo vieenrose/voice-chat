@@ -553,6 +553,9 @@ class HFSpeechToSpeechPipeline:
 
         response_task: Optional[asyncio.Task] = None
         current_turn_id = 0
+        # Latch: a text_input reply is superseded once per spoken utterance, not
+        # once per partial. Reset when the utterance ends (stt_final) below.
+        superseded_text_reply = False
         stt_task = asyncio.create_task(stt_pump())
         try:
             while True:
@@ -569,9 +572,8 @@ class HFSpeechToSpeechPipeline:
                     continue
                 (ev,) = rest  # kind == "stt"
                 yield ev
-                if response_task is not None and not response_task.done() and (
-                    ev["type"] in ("stt_partial", "stt_final") and ev.get("text", "").strip()
-                ):
+                _is_speech = ev["type"] in ("stt_partial", "stt_final") and ev.get("text", "").strip()
+                if _is_speech and response_task is not None and not response_task.done():
                     # User is talking again (partial) or finished a new utterance (final)
                     # while the previous reply is still playing — that supersedes it.
                     # Must check non-empty text for stt_final too: not every STT backend
@@ -581,12 +583,32 @@ class HFSpeechToSpeechPipeline:
                     await cancel_current_turn(response_task)
                     response_task = None
                     yield {"type": "barge_in", "reason": "voice", "turn_id": current_turn_id}
+                elif _is_speech and on_new_voice_turn is not None and not superseded_text_reply:
+                    # Same interruption, but the reply in flight came from `text_input`,
+                    # so it is not `response_task` — it lives in app.py's task set and is
+                    # only reachable through on_new_voice_turn.
+                    #
+                    # This used to be handled exclusively under `stt_final` below, i.e.
+                    # only once the user had STOPPED talking and the transcript was final.
+                    # Speaking over a typed reply therefore did nothing until the whole
+                    # utterance finished — which is invisible on a short answer and very
+                    # obvious on a long one, where the assistant talks over the user for
+                    # seconds. Voice interrupting voice reacted to the first partial;
+                    # voice interrupting text now does too.
+                    #
+                    # Latched until the utterance ends so a stream of partials cancels
+                    # once rather than re-firing per partial.
+                    superseded_text_reply = True
+                    await on_new_voice_turn()
+                    yield {"type": "barge_in", "reason": "voice", "turn_id": current_turn_id}
                 if ev["type"] == "stt_final":
                     stt_final_text = ev["text"]
                     stt_ms = ev.get("latency_ms", 0)
+                    _superseded_this_utterance = superseded_text_reply
+                    superseded_text_reply = False      # utterance over; re-arm the latch
                     if not stt_final_text.strip():
                         continue
-                    if on_new_voice_turn is not None:
+                    if on_new_voice_turn is not None and not _superseded_this_utterance:
                         # Symmetric with app.py's do_barge_in (which cancels an in-flight
                         # voice turn before starting a text_input reply): a fresh spoken
                         # utterance must equally supersede an in-flight text_input reply,
