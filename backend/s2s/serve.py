@@ -28,9 +28,12 @@ from s2s.qwen_agent_handler import QwenAgentLanguageModelHandler
 
 logger = logging.getLogger(__name__)
 
-# Which llama-server the harness talks to. Defaults match llm_manager's Bonsai 8B.
-LLM_API_BASE = os.getenv("S2S_LLM_API_BASE", "http://127.0.0.1:11435/v1")
-LLM_MODEL_NAME = os.getenv("S2S_LLM_MODEL_NAME", "bonsai-8b")
+# Which endpoint the LLM stage talks to. LLM_API_BASE / LLM_MODEL_ID are what the
+# harness itself reads, so they are the primary names here too -- one source of
+# truth, rather than an S2S_* copy that can disagree with the agent's own config.
+# The S2S_* names remain accepted for compatibility.
+LLM_API_BASE = os.getenv("LLM_API_BASE") or os.getenv("S2S_LLM_API_BASE", "http://127.0.0.1:11435/v1")
+LLM_MODEL_NAME = os.getenv("LLM_MODEL_ID") or os.getenv("S2S_LLM_MODEL_NAME", "qwen3.5-9b")
 
 def _neutralize_mps_empty_cache() -> None:
     """Work around an upstream bug that breaks Chinese voice input on non-Mac.
@@ -61,6 +64,151 @@ def _neutralize_mps_empty_cache() -> None:
         torch.mps.synchronize = lambda *a, **k: None
     except Exception:
         logger.debug("could not neutralize torch.mps helpers", exc_info=True)
+
+
+# The live LLM stage, so /v1/llm-config can repoint it without a restart.
+_llm_stage = None
+
+# Providers the UI may select. Keeping this a fixed map rather than accepting an
+# arbitrary base URL means a request from the page cannot aim the agent (and its
+# API key) at a host of the caller's choosing.
+PROVIDERS = {
+    # base/model None means "whatever this process was started with" -- see
+    # _provider_local(), so the local option follows the CLI rather than a copy of it.
+    "local": {"base": None, "model": None, "needs_key": False, "label": "本機 llama-server"},
+    "openrouter": {
+        "base": "https://openrouter.ai/api/v1",
+        "model": "openrouter/free",      # the auto-router; any catalogue id may replace it
+        "needs_key": True,
+        "label": "OpenRouter",
+        "catalogue": "https://openrouter.ai/api/v1/models",
+    },
+}
+
+
+def _install_llm_config_route(app) -> None:
+    """GET/POST /v1/llm-config: let the page choose the LLM endpoint.
+
+    The browser client has no backend of its own, and the LLM stage runs
+    server-side, so a key pasted into the UI has to be handed over somewhere. This
+    is that seam.
+
+    The key is held in this process only (os.environ for the harness to read) and
+    is never logged, never written to disk, and never returned -- GET reports a
+    masked fingerprint so the UI can show whether a key is set.
+    """
+    import time
+
+    from fastapi import Body, HTTPException
+
+    def _state() -> dict:
+        key = os.getenv("LLM_API_KEY", "")
+        base = os.getenv("LLM_API_BASE", LLM_API_BASE)
+        provider = next((n for n, p in PROVIDERS.items()
+                         if p["base"] and p["base"] == base), "local")
+        return {
+            "provider": provider,
+            "model": os.getenv("LLM_MODEL_ID", LLM_MODEL_NAME),
+            # Enough to tell two keys apart, not enough to use one.
+            "key_set": bool(key and key != "none"),
+            "key_hint": (key[:7] + "…" + key[-4:]) if key and key != "none" else "",
+            "providers": {n: {"label": p["label"], "needs_key": p["needs_key"]}
+                          for n, p in PROVIDERS.items()},
+        }
+
+    _catalogue_cache: dict = {}
+
+    @app.get("/v1/llm-models")
+    def list_llm_models(provider: str = "openrouter") -> dict:
+        """The provider's text models, for the UI's dropdown.
+
+        Proxied rather than fetched by the browser so the page needs no third-party
+        origin, and cached because it is a 400-entry list that changes rarely.
+
+        Only tool-capable text models are returned. This demo's agent calls three
+        tools, and a model that cannot call them is never a valid choice here -- it
+        answers weather and news questions from its weights instead, which is the
+        fabrication failure this project spends most of its effort avoiding. 66 of
+        the 421 text models are filtered out on that basis.
+        """
+        spec = PROVIDERS.get(provider)
+        if spec is None or not spec.get("catalogue"):
+            raise HTTPException(status_code=400, detail=f"no catalogue for {provider!r}")
+        cached = _catalogue_cache.get(provider)
+        if cached and (time.time() - cached[0]) < 900:
+            return cached[1]
+        try:
+            import httpx
+
+            r = httpx.get(spec["catalogue"], timeout=15.0)
+            r.raise_for_status()
+            raw = r.json().get("data") or []
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"{type(e).__name__}: {e}") from e
+
+        out = []
+        for m in raw:
+            arch = m.get("architecture") or {}
+            if "text" not in (arch.get("output_modalities") or []):
+                continue
+            params = m.get("supported_parameters") or []
+            if "tools" not in params:
+                continue
+            price = str((m.get("pricing") or {}).get("prompt", "1"))
+            out.append({
+                "id": m.get("id"),
+                "name": m.get("name") or m.get("id"),
+                "context": m.get("context_length") or 0,
+                "tools": "tools" in params,
+                "free": price in ("0", "0.0", "0.00"),
+            })
+        out.sort(key=lambda x: (not x["free"], x["id"]))
+        payload = {"provider": provider, "count": len(out), "models": out}
+        _catalogue_cache[provider] = (time.time(), payload)
+        return payload
+
+    @app.get("/v1/llm-config")
+    def get_llm_config() -> dict:
+        return _state()
+
+    @app.post("/v1/llm-config")
+    def set_llm_config(body: dict = Body(...)) -> dict:
+        name = str(body.get("provider") or "local")
+        spec = PROVIDERS.get(name)
+        if spec is None:
+            raise HTTPException(status_code=400, detail=f"unknown provider {name!r}")
+        key = str(body.get("api_key") or "").strip()
+        if spec["needs_key"] and not key:
+            raise HTTPException(status_code=400, detail=f"{spec['label']} needs an API key")
+
+        base = spec["base"] or _provider_local()["base"]
+        model = spec["model"] or _provider_local()["model"]
+        # A caller-supplied model is just a string forwarded to a FIXED base URL, so
+        # it cannot redirect the request anywhere; only providers with a catalogue
+        # accept one, and the local server's model comes from its own registry.
+        want = str(body.get("model") or "").strip()
+        if want and spec.get("catalogue"):
+            model = want
+        os.environ["LLM_API_BASE"] = base
+        os.environ["LLM_MODEL_ID"] = model
+        os.environ["LLM_API_KEY"] = key or "none"
+
+        # The Assistant bakes model and key in at construction, so it must be dropped.
+        try:
+            from agent.qwen_harness import reset_agent
+
+            reset_agent()
+        except Exception:
+            logger.exception("could not reset the agent after a config change")
+        if _llm_stage is not None:
+            _llm_stage.reconfigure(base, model)
+        logger.info("LLM stage -> %s (%s), key_set=%s", base, model, bool(key))
+        return _state()
+
+
+def _provider_local() -> dict:
+    """The local endpoint as configured at startup."""
+    return {"base": LLM_API_BASE, "model": LLM_MODEL_NAME}
 
 
 def _install_vram_route() -> None:
@@ -113,7 +261,8 @@ def _install_vram_route() -> None:
                 except Exception as e:  # never let a readout break the server
                     return {"available": False, "reason": f"{type(e).__name__}: {e}"}
 
-            logger.info("GET /v1/vram registered")
+            _install_llm_config_route(app)
+            logger.info("GET /v1/vram and GET|POST /v1/llm-config registered")
         except Exception:
             logger.exception("could not register /v1/vram (continuing without it)")
         return app
@@ -145,18 +294,20 @@ def _get_llm_handler(
 
     kw = vars(responses_api_language_model_handler_kwargs)
     logger.info("LLM stage: Qwen-Agent harness -> %s (%s)", LLM_API_BASE, LLM_MODEL_NAME)
-    return QwenAgentLanguageModelHandler(
+    global _llm_stage
+    _llm_stage = QwenAgentLanguageModelHandler(
         stop_event,
         queue_in=text_prompt_queue,
         queue_out=lm_response_queue,
         setup_kwargs={
-            "api_base": LLM_API_BASE,
-            "model_name": LLM_MODEL_NAME,
+            "api_base": os.getenv("LLM_API_BASE", LLM_API_BASE),
+            "model_name": os.getenv("LLM_MODEL_ID", LLM_MODEL_NAME),
             # Injected per pipeline unit by _build_realtime_pipeline_unit.
             "cancel_scope": kw.get("cancel_scope"),
             "speculative_turns": kw.get("speculative_turns"),
         },
     )
+    return _llm_stage
 
 
 def main() -> None:

@@ -412,6 +412,26 @@ rejects the entire `session.update`. Output declares 24000, the rate Qwen3-TTS p
 One session at a time by default (`--num_pipelines 1`); further connections are rejected. Each
 extra pipeline has its own STT/TTS handlers and costs VRAM.
 
+Three routes are added by `s2s/serve.py`, not upstream:
+
+`GET|POST /v1/llm-config` lets the page choose the LLM endpoint — the local llama-server, or
+OpenRouter with the user's own key. The browser has no backend of its own and the LLM stage runs
+server-side, so a key pasted into the UI has to be handed over somewhere; this is that seam. The
+key lives in this process only, is never logged, never written to disk and never returned — GET
+reports a masked fingerprint so the UI can show whether one is set. Providers are a fixed map, so
+a request from the page cannot aim the agent (and the key) at a host of the caller's choosing; a
+caller-supplied *model* is just a string forwarded to that fixed base URL.
+
+`GET /v1/llm-models` proxies OpenRouter's catalogue for the model dropdown, cached 15 minutes.
+**Only tool-capable text models are returned** — 355 of 421. The agent calls three tools, and a
+model that cannot call them answers weather and news questions from its weights instead, which is
+the fabrication failure this project spends most of its effort avoiding.
+
+Switching to a hosted provider means the voice content leaves the machine, which the UI says
+plainly. It is also markedly slower: a clock turn measured 3.9 s locally against 28 s through
+OpenRouter's auto-router, and the router is non-deterministic — it once landed on a content-safety
+classifier that returned no text at all, and a weak free model produced an empty answer in 90 s.
+
 `GET /v1/vram` is added by `s2s/serve.py` (not upstream) and reports the card's total/used/free
 MiB, which the UI polls while connected. It reads `torch.cuda.mem_get_info()`, i.e. the driver's
 view, so it counts every process on the card including llama-server — `memory_allocated()` would

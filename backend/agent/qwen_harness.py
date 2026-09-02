@@ -336,21 +336,27 @@ def _smalltalk_rule() -> str:
 def _make_agent(function_list=None):
     import os
     _base = os.getenv("LLM_API_BASE", "http://127.0.0.1:11435/v1")
-    # Prefer the live alias llm_manager actually has loaded (kept in sync across
-    # POST /api/model switches) over a static env var, so a freshly-reset agent
-    # (see reset_agent() below) picks up whichever model is currently running
-    # instead of whatever was true at process startup.
-    _model = os.getenv("LLM_MODEL_ID", "qwen3.5-2b")
-    try:
-        from llm_manager import llm_manager as _llm_mgr
-        if _llm_mgr.current_alias:
-            _model = _llm_mgr.current_alias
-    except Exception:
-        pass
+    _key = os.getenv("LLM_API_KEY", "none")
+    _model = os.getenv("LLM_MODEL_ID", "qwen3.5-9b")
+    # A remote endpoint names its own model, so only a llama-server this process
+    # manages may override it. Without this check, pointing LLM_API_BASE at a hosted
+    # provider still sent the local registry's alias (e.g. "qwen3.5-9b") as the model
+    # field, which the provider rejects as unknown.
+    _local = bool(re.search(r"//(127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0)\b", _base))
+    if _local:
+        # Prefer the live alias llm_manager actually has loaded (kept in sync across
+        # POST /api/model switches) over a static env var, so a freshly-reset agent
+        # picks up whichever model is currently running.
+        try:
+            from llm_manager import llm_manager as _llm_mgr
+            if _llm_mgr.current_alias:
+                _model = _llm_mgr.current_alias
+        except Exception:
+            pass
     llm_cfg = {
         'model': _model,
         'model_server': _base,
-        'api_key': 'none',
+        'api_key': _key,
         'generate_cfg': {
             'max_tokens': LLM_AGENT_MAX_TOKENS,
             'temperature': LLM_AGENT_TEMP,

@@ -78,6 +78,7 @@ class QwenAgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
         self.cancel_scope = cancel_scope
         self.speculative_turns = speculative_turns
         self.max_new_tokens = max_new_tokens
+        self.api_base, self.model_name = api_base, model_name
         self.llm = LingStreaming(api_base=api_base, model_name=model_name)
 
         # The harness is async; this stage is a thread. One long-lived loop in a
@@ -85,6 +86,19 @@ class QwenAgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
         self._loop = asyncio.new_event_loop()
         threading.Thread(target=self._loop.run_forever, daemon=True, name="qwen-agent-loop").start()
         logger.info("QwenAgentLanguageModelHandler ready (%s @ %s)", model_name, api_base)
+
+    def reconfigure(self, api_base: str, model_name: str) -> None:
+        """Point the stage at a different endpoint without restarting the pipeline.
+
+        Used by POST /v1/llm-config so the UI can switch between the local
+        llama-server and a hosted provider mid-session. The adapter caches its
+        reachability probe per instance, so it is rebuilt rather than mutated.
+        """
+        from llm.ling_streaming import LingStreaming
+
+        self.api_base, self.model_name = api_base, model_name
+        self.llm = LingStreaming(api_base=api_base, model_name=model_name)
+        logger.info("LLM stage repointed at %s (%s)", api_base, model_name)
 
     # -- turn gating ----------------------------------------------------
     def _turn_output_allowed(self, turn_id: str | None, turn_revision: int | None) -> bool:

@@ -479,7 +479,11 @@ class LingStreaming:
             return self._last_probe[1], self._last_probe[2]
         ok, detail = True, ""
         try:
-            async with httpx.AsyncClient(timeout=1.5) as c:
+            # 1.5 s is right for a loopback llama-server but flaky against a hosted
+            # provider over the internet, where a slow TLS handshake would look like
+            # "the server was never there" and degrade a perfectly good turn.
+            _t = 1.5 if re.search(r"//(127\.0\.0\.1|localhost|\[::1\])", self.api_base) else 6.0
+            async with httpx.AsyncClient(timeout=_t) as c:
                 r = await c.get(f"{self.api_base}/models")
                 if r.status_code != 200:
                     ok, detail = False, f"HTTP {r.status_code} from {self.api_base}/models"
