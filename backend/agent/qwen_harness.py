@@ -291,20 +291,35 @@ def _raw_tool_calls() -> bool:
 def _thinking_on() -> bool:
     """Whether llama-server runs the model's thinking pass for agent turns.
 
-    A/B-measured on the benchmark set, both at the default (random) seed, 3 passes each:
+    OFF. Thinking existed to protect tool routing: without it the model used to
+    answer straight from the weights, and its failures were not misses but
+    fabrications -- "東京天氣晴朗，平均溫度約25°C" with no get_weather call, generic
+    "news" with no web_search. An invented temperature is a confident lie nobody
+    notices, so the latency was worth paying.
 
-      thinking ON   tool accuracy 81 % (71/86/86)   LLM TTFT p50 1384 ms   E2E p50 3856 ms
-      thinking OFF  tool accuracy 71 % (71/71/71)   LLM TTFT p50   56 ms   E2E p50 1638 ms
+    Native tool calls removed that trade-off. With tools= passed to the server the
+    call is generated under grammar constraints, so the model cannot quietly answer
+    instead of calling. Measured on Qwen3.5 4B with native calls, thinking off:
 
-    Off is seven times faster to first token and it fixes the spoken scratchpad by simply
-    not producing one — and it is WORSE, because the failures it produces are not routing
-    misses but fabrications: "東京天氣晴朗，平均溫度約25°C" with no get_weather call, generic
-    AI "news" with no web_search, and a greeting answered with an invented date. A missing
-    tool call is a MISS in the report; an invented temperature is a confident lie that
-    nobody notices. So thinking stays on and the scratchpad is filtered on the way to the
-    speaker instead (_strip_thinking in llm/ling_streaming.py). LLM_AGENT_THINKING=0 to
-    try the fast-but-inventive variant deliberately."""
-    return os.getenv("LLM_AGENT_THINKING", "1").strip().lower() in ("1", "true", "yes")
+      20/20 turns across the five demo shapes, every tool correctly routed, no
+      reasoning leaks; and 18/18 on a fabrication set (foreign-city weather, news,
+      incumbency, plus greetings that must NOT trigger a tool) with zero
+      fabrications and zero misses.
+
+    What it buys is latency, which on a voice turn is the product:
+
+      shape     ttft ON -> OFF     total ON -> OFF
+      chat      0.64s -> 0.19s     0.83s -> 0.38s
+      plain     2.33s -> 0.24s     2.68s -> 0.65s
+      clock     2.21s -> 0.72s     2.91s -> 1.35s
+      weather   7.03s -> 3.12s    10.19s -> 5.98s
+      search    8.12s -> 4.11s    12.59s -> 9.11s
+
+    Thinking also scales with context, so the cost grows through a conversation: a
+    clock question measured 2.2 s cold and 8.8 s six turns into a live session.
+
+    LLM_AGENT_THINKING=1 turns it back on."""
+    return os.getenv("LLM_AGENT_THINKING", "0").strip().lower() in ("1", "true", "yes")
 
 
 def _smalltalk_rule() -> str:

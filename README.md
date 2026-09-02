@@ -86,6 +86,32 @@ answer — which is safe because native calls cannot be crowded out.
 flag `--reasoning-budget` does work and is deliberately unused, because capping thinking takes the
 tool-call decision with it (5/12 weather turns at 200).
 
+### Thinking is off
+
+Thinking existed to protect tool routing. Without it the model answered from the weights, and its
+failures were not misses but **fabrications** — 「東京天氣晴朗，平均溫度約25°C」 with no
+`get_weather` call. An invented temperature is a confident lie nobody notices, so the latency was
+worth paying.
+
+Native tool calls removed the trade-off: the call is generated under grammar constraints, so the
+model cannot quietly answer instead of calling. With thinking off, measured on Qwen3.5 4B —
+**20/20** turns across the five demo shapes with every tool correctly routed, and **18/18** on a
+fabrication set (foreign-city weather, news, incumbency, plus greetings that must *not* trigger a
+tool) with zero fabrications and zero misses.
+
+What it buys is the thing a voice turn is judged on:
+
+| Shape | ttft on → off | total on → off |
+|---|---|---|
+| chat | 0.64 s → **0.19 s** | 0.83 s → **0.38 s** |
+| plain | 2.33 s → **0.24 s** | 2.68 s → **0.65 s** |
+| clock | 2.21 s → **0.72 s** | 2.91 s → **1.35 s** |
+| weather | 7.03 s → **3.12 s** | 10.19 s → **5.98 s** |
+| search | 8.12 s → **4.11 s** | 12.59 s → **9.11 s** |
+
+Thinking also scales with context, so its cost grows through a conversation: a clock question
+measured 2.2 s cold and 8.8 s six turns into a live session. `LLM_AGENT_THINKING=1` restores it.
+
 ### Barge-in
 
 The framework's `CancelScope` handles it structurally rather than per-call-site: a generation
@@ -142,7 +168,7 @@ The language instruction is stated once, in the system prompt, never appended to
 | **Orchestrator** | `speech-to-speech` 0.2.12 | OpenAI Realtime server on `:8765`, WebSocket + WebRTC |
 | **Turn-taking** | Silero VAD v5 + Smart Turn v3.2 | local ONNX; speculative turns with revisions |
 | **STT** | Paraformer (FunASR) | Chinese-oriented; `pip install "speech-to-speech[paraformer]"` |
-| **LLM** | `Qwen3.5-4B-UD-Q8_K_XL` | llama-server `:11435`, MTP on, thinking on, 3 tools |
+| **LLM** | `Qwen3.5-4B-UD-Q8_K_XL` | llama-server `:11435`, MTP on, thinking off, 3 tools |
 | **Agent** | `qwen-agent` `Assistant` | custom s2s LLM stage, native tool calls |
 | **TTS** | `Qwen3-TTS-12Hz CustomVoice` Q8_0 | stock s2s handler on GGML CUDA, ~20-80 ms TTFA |
 | **Search** | SearXNG `:8888` + wttr.in | 180 engines, real results only |
@@ -314,6 +340,18 @@ Per-stage p50 over the five prompt shapes, measured at the harness
 | weather | 6.50 s | 9.11 s | 150 chars |
 | search | 7.34 s | 10.57 s | 225 chars |
 
+Generation on the RTX 3060, 4B at Q8_K_XL (6.07 GB of weights), greedy, thinking off:
+
+| | decode | prefill |
+|---|---|---|
+| **with MTP** (default) | **52.4 tok/s** | ~75–113 tok/s |
+| without MTP | 46.2 tok/s | ~58–78 tok/s |
+
+The card's 360 GB/s of bandwidth over 6.07 GB per token puts the ceiling at **59.3 tok/s**, so
+decode runs at **88 % of what the hardware can do** — decode is memory-bandwidth-bound, and the
+remaining headroom is not in the runtime. MTP's self-speculation is what pushes past the
+single-token bound.
+
 Qwen3-TTS time-to-first-audio is 0.02–0.08 s at RTF 0.2–0.25, so a tool turn's latency is the
 lookup round-trip, not synthesis.
 
@@ -330,7 +368,7 @@ Tool routing and reasoning leaks: 0 failures and 0 leaks over all five shapes.
 | `S2S_USE_UPSTREAM_LLM` | unset | `1` runs the stock s2s LLM stage instead of Qwen-Agent |
 | `QWEN_AGENT_USE_RAW_API` | `true` | native tool calls; `false` uses qwen-agent's prompt dialect |
 | `LLM_AGENT_MAX_TOKENS` | `2048` | per-turn generation cap (thinking + tool call + answer) |
-| `LLM_AGENT_THINKING` | `1` | thinking pass on agent turns |
+| `LLM_AGENT_THINKING` | `0` | thinking pass on agent turns; off because native tool calls made it unnecessary |
 | `LLM_AGENT_TEMP` / `LLM_AGENT_TOP_P` | `0.7` / `0.9` | agent-turn sampling |
 | `LLM_AGENT_SEED` | unset | reproducible agent turns |
 | `LLM_AGENT_NO_TOOL_SMALLTALK` | `1` | greetings get a reply, not a tool call |
