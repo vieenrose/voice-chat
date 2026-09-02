@@ -26,11 +26,40 @@ const defaultUrl = () =>
     ? `wss://${location.hostname}:${RT_TLS_PORT}/v1/realtime`
     : `ws://${location.hostname}:${RT_PLAIN_PORT}/v1/realtime`
 
+/** Base64 payloads are megabytes of noise in a log; keep the shape, drop the bytes. */
+function elideAudio(obj) {
+  const out = {}
+  for (const [k, v] of Object.entries(obj)) {
+    if ((k === 'audio' || k === 'delta') && typeof v === 'string' && v.length > 96) {
+      out[k] = `<${v.length} b64 chars elided>`
+    } else {
+      out[k] = v
+    }
+  }
+  return out
+}
+
 export class RealtimeClient {
-  constructor(handlers = {}) {
+  constructor(handlers = {}, { logLimit = 4000 } = {}) {
     this.h = handlers
     this.ws = null
     this.ready = false
+    // Every frame both ways, for the export button. Bounded so a long session
+    // cannot grow without limit; audio payloads are elided, not stored.
+    this.log = []
+    this.logLimit = logLimit
+    this.audioBytesIn = 0
+    this.t0 = 0
+  }
+
+  _record(dir, obj) {
+    if (this.log.length >= this.logLimit) this.log.shift()
+    this.log.push({
+      t: this.t0 ? +(performance.now() - this.t0).toFixed(1) : 0,
+      wall: new Date().toISOString(),
+      dir,
+      ...elideAudio(obj),
+    })
   }
 
   connect(url = defaultUrl(), instructions = '') {
@@ -47,6 +76,8 @@ export class RealtimeClient {
 
       ws.onopen = () => {
         this.ready = true
+        this.t0 = performance.now()
+        this._record('meta', { type: 'connected', url })
         this.send({
           type: 'session.update',
           session: {
@@ -81,6 +112,7 @@ export class RealtimeClient {
         } catch {
           return
         }
+        this._record('in', d)
         this._dispatch(d)
       }
     })
@@ -125,7 +157,10 @@ export class RealtimeClient {
         this.h.onAssistantText?.(d.delta || '')
         break
       case 'response.output_audio.delta':
-        if (d.delta) this.h.onAudio?.(d.delta)
+        if (d.delta) {
+          this.audioBytesIn += d.delta.length
+          this.h.onAudio?.(d.delta)
+        }
         break
 
       case 'response.done': {
@@ -144,10 +179,15 @@ export class RealtimeClient {
 
   send(obj) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(obj))
+    // Mic frames go out every 20 ms; logging each one buries everything else, so
+    // they are counted in the summary instead (see appendAudio).
+    if (obj.type !== 'input_audio_buffer.append') this._record('out', obj)
   }
 
   /** base64 PCM16 @ the server's 16k pipeline rate. */
   appendAudio(b64) {
+    this.micFrames = (this.micFrames || 0) + 1
+    this.micBytes = (this.micBytes || 0) + b64.length
     this.send({ type: 'input_audio_buffer.append', audio: b64 })
   }
 

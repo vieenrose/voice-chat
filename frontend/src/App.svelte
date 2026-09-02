@@ -73,6 +73,7 @@
       if (play?.playing) {
         play.flush()
         speaking = false
+        note('barge_in.local_flush', { secondsPlayed: +audioSeconds.toFixed(2) })
       }
     },
     onSpeechStop() {
@@ -104,7 +105,7 @@
       lastStatus = status === 'cancelled' ? `已中斷（${reason || 'cancelled'}）` : ''
       sealAssistant(status === 'cancelled')
     },
-    onError(msg) { error = msg },
+    onError(msg) { error = msg; note('server.error', { message: msg }) },
     onClose() { connected = false; listening = false; speaking = false },
   }
 
@@ -148,8 +149,10 @@
       })
       await mic.start()
       listening = true
+      note('mic.started', { rate: mic.sampleRate, secure: window.isSecureContext })
     } catch (e) {
       error = `麥克風無法啟動：${e.message}`
+      note('mic.error', { message: e.message, name: e.name, secure: window.isSecureContext })
     }
   }
 
@@ -170,9 +173,68 @@
   }
 
   function interrupt() {
+    note('interrupt.button')
     client?.cancel()
     play?.flush()
     speaking = false
+  }
+
+  // --- debug export -------------------------------------------------------
+  // A single .json holding the protocol trace plus the client-side state, so a
+  // report of "it said the wrong thing" can be read back without guessing what
+  // the browser saw. Audio payloads are elided in the client's own log.
+  let clientEvents = $state([])   // things only the UI knows: flushes, mic errors
+
+  function note(what, detail = {}) {
+    clientEvents.push({
+      t: +performance.now().toFixed(1),
+      wall: new Date().toISOString(),
+      what,
+      ...detail,
+    })
+    if (clientEvents.length > 500) clientEvents.shift()
+  }
+
+  function buildLog() {
+    return {
+      exported: new Date().toISOString(),
+      page: { url: location.href, protocol: location.protocol, hostname: location.hostname },
+      endpoint: url,
+      agent: navigator.userAgent,
+      state: { connected, listening, responding, speaking, lastStatus, error },
+      audio: {
+        firstAudioMs: firstAudioMs || null,
+        secondsPlayed: +audioSeconds.toFixed(2),
+        playbackRate: play?.sampleRate ?? null,
+        captureRate: mic?.sampleRate ?? null,
+        micFrames: client?.micFrames ?? 0,
+        micBase64Bytes: client?.micBytes ?? 0,
+        audioBase64BytesIn: client?.audioBytesIn ?? 0,
+      },
+      transcript: turns.map((t) => ({
+        role: t.role,
+        text: t.text,
+        cancelled: !!t.cancelled,
+        done: !!t.done,
+      })),
+      clientEvents,
+      // Mic frames are counted above rather than listed; everything else is here.
+      protocol: client?.log ?? [],
+    }
+  }
+
+  function exportLog() {
+    const blob = new Blob([JSON.stringify(buildLog(), null, 2)], { type: 'application/json' })
+    const href = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = href
+    a.download = `voice-chat-log-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    // Revoked on a later tick: revoking immediately can cancel the download in
+    // some browsers before it has read the blob.
+    setTimeout(() => URL.revokeObjectURL(href), 10000)
   }
 
   function toggleTheme() {
@@ -195,6 +257,8 @@
     <div class="header-actions">
       <span class="pill {connected ? 'ok' : ''}">{connected ? '● Live' : '○ Offline'}</span>
       {#if listening}<span class="pill ok">🎤 收音中</span>{/if}
+      <button class="ghost" style="padding:6px 10px; font-size:12px" onclick={exportLog}
+              title="下載這次工作階段的完整記錄（JSON），用於回報問題">⬇ 記錄</button>
       <button class="ghost" style="padding:6px 10px; font-size:12px" onclick={toggleTheme}
               aria-label={theme === 'dark' ? '切換為亮色主題' : '切換為深色主題'}>
         {theme === 'dark' ? '☀️' : '🌙'}

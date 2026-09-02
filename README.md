@@ -193,6 +193,17 @@ Press **連線**, then **開始說話**. It speaks the Realtime protocol straigh
 backend of its own — and shows live partial transcripts, the reply as it is spoken, and a
 cancelled badge on any turn you interrupt.
 
+**⬇ 記錄** in the header downloads the whole session as one `.json` — the protocol trace both
+ways, the transcript, client-only events (barge-in flushes, mic errors), and the audio/latency
+counters. Attach it to a bug report instead of describing what happened. Audio payloads are
+elided rather than stored, so a 300-chunk turn exports at ~48 KB instead of ~3.5 MB, and mic
+frames are counted rather than listed (they arrive every 20 ms and would bury everything else).
+
+> The server runs **one session at a time** by default (`--num_pipelines 1`); further
+> connections are rejected with "all 1 pipeline slots in use". An open browser tab holds that
+> slot, so close it before running the checks below. Each extra pipeline has its own STT/TTS
+> handlers and costs VRAM.
+
 Or check it all without a microphone:
 
 ```bash
@@ -200,6 +211,7 @@ cd backend  && python3 -m s2s.checks.turn "台灣的首都是哪裡？"  # one t
 cd backend  && python3 -m s2s.checks.bargein                    # interrupt a long answer
 cd frontend && node checks/turn.mjs                             # a voice turn through the UI's client
 cd frontend && node checks/bargein.mjs                          # barge-in through the UI's client
+cd frontend && node checks/log.mjs                              # the debug export (no server needed)
 ```
 
 Dependencies beyond `requirements.txt`:
