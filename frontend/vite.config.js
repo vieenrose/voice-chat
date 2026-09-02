@@ -8,15 +8,10 @@ export default defineConfig({
     port: 5173,
     allowedHosts: true,
     hmr: { host: "localhost" },
-    proxy: {
-      '/ws': {
-        target: 'ws://localhost:8000',
-        ws: true
-      },
-      '/api': 'http://localhost:8000',
-      '/health': 'http://localhost:8000',
-      '/stats': 'http://localhost:8000'
-    }
+    // No proxy. The app talks the OpenAI Realtime protocol straight to the
+    // speech-to-speech server on :8765 (endpoint is editable in the UI); it uses
+    // no HTTP API of its own. The old proxy pointed at app.py on :8000, which
+    // this frontend no longer speaks to.
   },
   preview: {
     host: "0.0.0.0",

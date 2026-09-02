@@ -1,379 +1,282 @@
 <script>
-  import { onMount, onDestroy } from 'svelte';
-  import { marked } from 'marked';
-  import DOMPurify from 'dompurify';
-  marked.setOptions({ breaks: true, gfm: true });
-  function safeUrl(url){
-    // Search results come from SearXNG (untrusted, internet-sourced) — only ever let
-    // real http(s) links into an href; a javascript: URI would execute on click.
-    try{ return /^https?:\/\//i.test(url) ? url : '#'; }catch(e){ return '#'; }
+  import { onDestroy } from 'svelte'
+  import { RealtimeClient } from './lib/realtime.js'
+  import { MicCapture, Playback } from './lib/audio.js'
+
+  const INSTRUCTIONS =
+    '你是一個親切的語音助理。一律使用繁體中文（台灣用語）回答，' +
+    '無論問題用什麼語言提出；只有專有名詞或無法翻譯的術語才保留英文。回答要口語、簡潔。'
+
+  let url = $state(`ws://${location.hostname}:8765/v1/realtime`)
+  let connected = $state(false)
+  let connecting = $state(false)
+  let listening = $state(false)
+  let error = $state('')
+
+  let turns = $state([])           // {role:'user'|'assistant', text, cancelled?}
+  let userPartial = $state('')
+  let userSpeaking = $state(false)
+  let responding = $state(false)
+  let speaking = $state(false)
+  let lastStatus = $state('')
+
+  let level = $state(0)            // mic peak, for the meter
+  let textInput = $state('')
+  let theme = $state('dark')
+
+  // Latency: from the user's speech ending (or text send) to first audio out.
+  let tSpeechEnd = 0
+  let firstAudioMs = $state(0)
+  let audioSeconds = $state(0)
+
+  let client = null
+  let mic = null
+  let play = null
+  let chatEl = $state(null)
+
+  function scroll() {
+    queueMicrotask(() => { if (chatEl) chatEl.scrollTop = chatEl.scrollHeight })
   }
-  function escapeHtml(text){
-    return (text||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+
+  function appendAssistant(text) {
+    if (!text) return
+    const last = turns[turns.length - 1]
+    if (last && last.role === 'assistant' && !last.done) {
+      last.text += text
+      turns = turns
+    } else {
+      turns = [...turns, { role: 'assistant', text, done: false }]
+    }
+    scroll()
   }
-  function renderMarkdown(text){
-    // text can contain untrusted content (web search results, tool output) that reaches
-    // the DOM via {@html} below — if marked/DOMPurify ever throw, the fallback MUST still
-    // be sanitized (escape first, then <br/>), not raw text, or it's a stored-XSS hole.
-    try{ const html = marked.parse(text || ''); return DOMPurify.sanitize(html); }catch(e){ return escapeHtml(text).replace(/\n/g,'<br/>'); }
+
+  function sealAssistant(cancelled) {
+    const last = turns[turns.length - 1]
+    if (last && last.role === 'assistant') {
+      last.done = true
+      last.cancelled = cancelled
+      turns = turns
+    }
   }
-  let s2tConverter = null;
-  let toTraditional = (text) => text;
-  async function initOpenCC(){
-    try{
-      const OpenCC = await import('opencc-js');
-      // 'twp' (not 'tw') also substitutes Taiwan-specific vocabulary (視頻→影片, 軟件→軟體,
-      // 網絡→網路, …), not just simplified→traditional glyphs — zh-TW is this app's default
-      // language, so this display-layer conversion should read as authentic Taiwan usage,
-      // not just Traditional-glyph-flavored Mainland phrasing.
-      s2tConverter = OpenCC.Converter({ from: 'cn', to: 'twp' });
-      toTraditional = (text) => {
-        try { return text && /[\u4e00-\u9fff]/.test(text) ? s2tConverter(text) : text; } catch(e) { return text; }
-      };
-    }catch(e){ console.warn('OpenCC not loaded', e); }
-  }
-  let connected = $state(false);
-  let connecting = $state(false);
-  let listening = $state(false);
-  let speaking = $state(false);
-  // True from the moment a turn starts (typed message sent, or a voice utterance
-  // finalized) until it truly ends (tts_end/barge_in) — covers the LLM-generation and
-  // tool-call phase too, unlike `speaking` (which only turns true once TTS audio
-  // actually starts). Gates the interrupt button so a reply stuck in a slow tool call,
-  // before any audio has played, can still be cancelled.
-  let turnActive = $state(false);
-  let useWorklet = $state(true);
-  let vadEnabled = $state(true);
-  let sttPartial = $state('');
-  let sttFinal = $state('');
-  let llmStreaming = $state('');
-  let reasoningStreaming = $state('');
-  let ttsText = $state('');
-  let chatHistory = $state([]);
-  let latency = $state({stt_ms:0, llm_ttft_ms:0, tts_ttfb_ms:0, e2e_ms:0});
-  let rssMb = $state(0);
-  let audioLevel = $state(0);
-  let mode = $state('mock');
-  let ws = null;
-  // Backend origin. Same-origin by default (the backend serves this SPA at /), with
-  // an explicit override for split-host dev: ?api=http://host:8000 (or ?api=... in
-  // localStorage) — previously the port was hard-coded to 8000, so any deploy that
-  // didn't match it silently broke every fetch and the WS.
-  const qpInit = new URLSearchParams(location.search);
-  const API_BASE = (qpInit.get('api') || localStorage.getItem('vc-api') || '').replace(/\/+$/, '')
-                   || (location.protocol === 'https:' ? '' : `${location.protocol}//${location.hostname}:8000`);
-  // Shared token (backend VOICE_CHAT_TOKEN). Read from the query string once and kept
-  // in memory only — putting it in localStorage would leave a credential on shared
-  // machines, and the app is a demo that normally runs without a token anyway.
-  const AUTH_TOKEN = qpInit.get('token') || '';
-  const authHeaders = () => AUTH_TOKEN ? {'X-Auth-Token': AUTH_TOKEN} : {};
-  const withAuth = (path) => { if(!AUTH_TOKEN) return path; const u = new URL(path, location.href); u.searchParams.set('token', AUTH_TOKEN); return u.pathname + u.search; };
-  let audioCtx = null;
-  let workletNode = null;
-  let mediaStream = null;
-  let analyser = null;
-  let jitterQueue = [];
-  let nextPlayTime = 0;
-  let wsUrl = $derived(`${API_BASE ? API_BASE.replace(/^http/, 'ws') : (location.protocol==='https:' ? 'wss://'+location.host : 'ws://'+location.hostname+':8000')}/ws/chat?session_id=${'demo-'+Math.random().toString(36).slice(2,7)}${AUTH_TOKEN ? '&token='+encodeURIComponent(AUTH_TOKEN) : ''}`);
-  let statsInterval = null;
-  let canvasEl;
-  let animId;
-  function log(msg, obj) { console.log('[UI]', msg, obj||''); }
-  function apiUrl(path){ return API_BASE ? `${API_BASE}${path}` : path; }
-  // Live model info, sourced from /health's llm_manager block — replaces what used to be
-  // three separately hardcoded copies of the model name (header subtitle, Stack card,
-  // footer) that each went stale the last time the deployed model actually changed.
-  let llmModels = $state([]);
-  let currentModelId = $state('');
-  let selectedModelId = $state('');
-  let modelSwitching = $state(false);
-  let modelSwitchStatus = $state('');
-  let sttBackend = $state('');
-  let ttsBackend = $state('');
-  async function fetchHealth(){
-    try{
-      const r = await fetch(apiUrl(withAuth('/health')), {headers: authHeaders()});
-      const j = await r.json();
-      rssMb = j.rss_mb;
-      mode = j.mock ? 'mock' : 'real';
-      searxngOk = j.searxng?.ok || false;
-      sttBackend = j.models_loaded?.stt || '';
-      ttsBackend = j.models_loaded?.tts || '';
-      const lm = j.llm_manager;
-      if(lm){
-        llmModels = lm.available || [];
-        currentModelId = lm.current_model_id || '';
-        if(!modelSwitching && !selectedModelId) selectedModelId = currentModelId;
-        // Reflect a switch made from elsewhere (another tab, curl, etc.) without
-        // stomping on a switch this tab itself is mid-flight on.
-        if(!modelSwitching) modelSwitching = !!lm.switching;
+
+  const handlers = {
+    onSpeechStart() {
+      userSpeaking = true
+      // Barge-in: the server cancels the response, and the audio already scheduled
+      // in the browser has to be dropped too or the reply keeps talking locally.
+      if (play?.playing) {
+        play.flush()
+        speaking = false
       }
-      return j;
-    }catch(e){ rssMb=0; return null; }
+    },
+    onSpeechStop() {
+      userSpeaking = false
+      tSpeechEnd = performance.now()
+      firstAudioMs = 0
+      // A VAD-triggered turn gets no response.created -- the server only emits that
+      // for an explicit response.create -- so end-of-speech is the signal that the
+      // reply is being worked on. Without this the "thinking" state never showed
+      // for the voice path, which is the main path.
+      responding = true
+      lastStatus = ''
+    },
+    onUserPartial(text) { userPartial = text; scroll() },  // cumulative: replace
+    onUserFinal(text) {
+      userPartial = ''
+      if (text.trim()) turns = [...turns, { role: 'user', text }]
+      scroll()
+    },
+    onResponseStart() { responding = true; lastStatus = '' },
+    onAssistantText(t) { appendAssistant(t) },
+    onAudio(b64) {
+      if (!firstAudioMs && tSpeechEnd) firstAudioMs = Math.round(performance.now() - tSpeechEnd)
+      audioSeconds += play.push(b64)
+      speaking = true
+    },
+    onResponseDone(status, reason) {
+      responding = false
+      lastStatus = status === 'cancelled' ? `已中斷（${reason || 'cancelled'}）` : ''
+      sealAssistant(status === 'cancelled')
+    },
+    onError(msg) { error = msg },
+    onClose() { connected = false; listening = false; speaking = false },
   }
-  async function switchModel(){
-    if(modelSwitching || !selectedModelId || selectedModelId===currentModelId) return;
-    modelSwitching = true; modelSwitchStatus = `載入中：${selectedModelId}…`;
-    try{
-      const r = await fetch(apiUrl(withAuth('/api/model')), {method:'POST', headers:{'Content-Type':'application/json', ...authHeaders()}, body: JSON.stringify({model_id: selectedModelId})});
-      const j = await r.json();
-      if(!r.ok){ modelSwitchStatus = `載入失敗：${j.error||r.status}`; }
-      else{ currentModelId = j.model_id; modelSwitchStatus = `已載入 ${j.label}（${j.took_s ?? '?'} 秒）`; }
-    }catch(e){ modelSwitchStatus = `載入失敗：${e}`; }
-    modelSwitching = false;
-    await fetchHealth();
-    setTimeout(()=>{ if(!modelSwitching) modelSwitchStatus=''; }, 4000);
-  }
-  async function testSearch(q){ sendText(q); }
-  async function connect(){
-    if (connected || connecting) return;
-    connecting = true;
-    // A fresh connection means a fresh backend turn_id sequence (the backend's counter
-    // is scoped to its own pipeline instance/process, not to this tab) — e.g. a backend
-    // restart between disconnect and reconnect resets it to 0, while this tab's
-    // activeTurnId could already be far higher from before, which would permanently
-    // misclassify every new turn as stale. There is no in-flight audio to preserve
-    // across a reconnect anyway (the old connection is gone), so resetting here is safe.
-    activeTurnId = -1;
-    killedTurnIds = new Set();
-    let url = wsUrl;
-    const qp = new URLSearchParams(location.search);
-    if (qp.get('ws')) url = qp.get('ws');
-    ws = new WebSocket(url);
-    ws.binaryType = 'arraybuffer';
-    ws.onopen = () => { connected=true; connecting=false; log('WS open', url); chatHistory = [...chatHistory, {role:'system', text:`Connected ${url} — mock=${mode}`}]; };
-    ws.onclose = () => { connected=false; connecting=false; listening=false; log('WS closed'); };
-    ws.onerror = (e) => { log('WS error', e); connecting=false; };
-    ws.onmessage = async (ev) => {
-      try{ const data = JSON.parse(ev.data); handleServerMessage(data); }catch(e){}
-    };
-  }
-  function disconnect(){ if(ws){ ws.close(); ws=null; } connected=false; stopMic(); }
-  let toolStatus = $state('');
-  let audioError = $state('');
-  let lastSearchResults = $state([]);
-  let searxngOk = $state(false);
-  // Turn staleness tracking: every assistant-response event (llm_token/tool_*/tts_*)
-  // carries a monotonic turn_id from the backend. A turn_id lower than the highest
-  // one we've seen is definitely from an already-superseded (barged-in) reply — drop
-  // it. killedTurnIds additionally blacklists the turn we just locally interrupted,
-  // closing the brief network-race window before the new turn's first message (which
-  // would otherwise arrive with the SAME turn_id as the one we're killing). This
-  // replaces a fixed "ignore audio for 800ms" timer, which — being duration-based, not
-  // turn-based — would also silently drop the start of the *new* reply if it began
-  // streaming inside that window.
-  let activeTurnId = -1;
-  let killedTurnIds = new Set();
-  function isStaleTurn(turnId){
-    if(turnId === undefined || turnId === null) return false;
-    if(turnId > activeTurnId){
-      activeTurnId = turnId;
-      // Prune ids we'll never need again: turn_id is monotonic, so once activeTurnId
-      // has passed a killed id the `turnId < activeTurnId` check below already keeps
-      // classifying it stale forever — without this, a long session with many
-      // barge-ins would grow this Set without bound.
-      for(const k of killedTurnIds){ if(k < activeTurnId) killedTurnIds.delete(k); }
-    }
-    return turnId < activeTurnId || killedTurnIds.has(turnId);
-  }
-  function handleServerMessage(msg){
-    switch(msg.type){
-      case 'stt_partial': sttPartial = toTraditional(msg.text); break;
-      case 'reasoning':
-      case 'llm_reasoning': {
-        const delta = toTraditional(msg.text || msg.delta || '');
-        if(!delta) break;
-        reasoningStreaming += delta;
-        // Find this turn's reasoning bubble — it may not be the last entry, since tool
-        // messages interleave. Stop at the most recent user message: a reasoning bubble
-        // older than that belongs to a previous turn, and appending to it piled every
-        // later turn's thinking into the first question's bubble.
-        let rIdx = -1;
-        for(let i=chatHistory.length-1; i>=0; i--){
-          if(chatHistory[i].role==='user') break;
-          if(chatHistory[i].role==='reasoning'){ rIdx=i; break; }
-        }
-        if(rIdx >= 0){
-          // Append only the new delta to the existing bubble to avoid duplicating
-          // the cumulative prefix when a new bubble would otherwise be created
-          // after an interleaving tool message.
-          chatHistory[rIdx].text += delta;
-          chatHistory[rIdx].streaming = true;
-          chatHistory = [...chatHistory];
-        } else {
-          chatHistory = [...chatHistory, {role:'reasoning', text: delta, streaming:true}];
-        }
-        break;
-      }
-      case 'stt_final': sttFinal = toTraditional(msg.text); sttPartial = ''; chatHistory = [...chatHistory, {role:'user', text: toTraditional(msg.text)}]; llmStreaming = ''; reasoningStreaming = ''; ttsText = ''; toolStatus = ''; if(msg.text && msg.text.trim()) turnActive = true; break;
-      case 'llm_reset': if(isStaleTurn(msg.turn_id)) break;
-        // The assistant streamed text it then withdrew (a tool call appeared mid
-        // stream). Nothing was ever spoken from it — clear the partial bubble rather
-        // than leaving a half-sentence on screen next to the real answer.
-        llmStreaming = '';
-        reasoningStreaming = '';
-        // Remove trailing streaming reasoning bubble as well if present
-        if(chatHistory.length && chatHistory[chatHistory.length-1].role==='reasoning' && chatHistory[chatHistory.length-1].streaming){
-          chatHistory = chatHistory.slice(0, -1);
-        }
-        if(chatHistory.length && chatHistory[chatHistory.length-1].streaming){
-          chatHistory = chatHistory.slice(0, -1);
-        }
-        break;
-      case 'llm_token': if(isStaleTurn(msg.turn_id)) break; llmStreaming = toTraditional(msg.text_so_far); break;
-      case 'tool_call': {
-          if(isStaleTurn(msg.turn_id)) break;
-          const tn = msg.name || 'tool'; const q = msg.query || msg.arguments?.query || msg.arguments?.timezone || '';
-          if(tn === 'web_search'){ toolStatus = `🔍 web_search("${q}")`; chatHistory = [...chatHistory, {role:'tool', text: `🔍 Searching "${q}"…`}]; }
-          else { toolStatus = `🕐 ${tn}()`; chatHistory = [...chatHistory, {role:'tool', text: `🕐 ${tn}()`}]; }
-        } break;
-      case 'tool_result': {
-          if(isStaleTurn(msg.turn_id)) break;
-          const src = msg.source || msg.result?.source || 'searxng'; const latency = msg.latency_ms || 0; const count = msg.result?.results?.length || 3;
-          toolStatus = `✓ ${count} results via ${src} · ${latency}ms`; lastSearchResults = msg.result?.results || [];
-          let preview = (msg.formatted||'').slice(0,200).replace(/\n/g,' '); chatHistory = [...chatHistory, {role:'tool', text: `✓ ${src} · ${latency}ms — ${preview}`}]; } break;
-      case 'tts_chunk': if(isStaleTurn(msg.turn_id)) break; ttsText = toTraditional(msg.text); if(msg.pcm){ try{ const pcm = base64ToInt16(msg.pcm); queueAudio(pcm, msg.sampleRate || 16000); }catch(e){ audioError = String(e).slice(0,120); } } updateAssistantStreaming(); break;
-      case 'tts_start': if(isStaleTurn(msg.turn_id)) break; preRollStarted = false; preRollQueue.length = 0; speaking = true; break;
-      case 'tts_end': if(isStaleTurn(msg.turn_id)) break; flushPreRoll(); speaking = false; turnActive = false; finalizeAssistant(); finalizeReasoning(); toolStatus = ''; break;
-      case 'latency': if(isStaleTurn(msg.turn_id)) break; latency = msg; break;
-      case 'barge_in': killedTurnIds.add(msg.turn_id ?? activeTurnId); stopPlayback(); break;
+
+  async function connect() {
+    error = ''
+    connecting = true
+    try {
+      play = new Playback({ sampleRate: 24000 })
+      play.onEnded = () => { speaking = false }
+      client = new RealtimeClient(handlers)
+      await client.connect(url, INSTRUCTIONS)
+      connected = true
+    } catch (e) {
+      error = `連線失敗：${e.message}。伺服器是否在執行？(python3 -m s2s.serve --mode realtime)`
+    } finally {
+      connecting = false
     }
   }
-  function updateAssistantStreaming(){
-    const displayText = toTraditional(llmStreaming);
-    if(displayText){
-      if(chatHistory.length && chatHistory[chatHistory.length-1].role==='assistant' && chatHistory[chatHistory.length-1].streaming){
-        chatHistory[chatHistory.length-1].text = displayText;
-        chatHistory = [...chatHistory];
-      } else { chatHistory = [...chatHistory, {role:'assistant', text: displayText, streaming:true}]; }
+
+  function disconnect() {
+    stopMic()
+    client?.close(); client = null
+    play?.close(); play = null
+    connected = false; speaking = false; responding = false
+  }
+
+  async function startMic() {
+    error = ''
+    try {
+      mic = new MicCapture({
+        sampleRate: 16000,
+        onChunk: (b64) => client?.appendAudio(b64),
+        onLevel: (p) => { level = p },
+      })
+      await mic.start()
+      listening = true
+    } catch (e) {
+      error = `麥克風無法啟動：${e.message}`
     }
   }
-  function finalizeAssistant(){
-    const displayText = toTraditional(llmStreaming);
-    if(chatHistory.length && chatHistory[chatHistory.length-1].streaming){ chatHistory[chatHistory.length-1].streaming = false; chatHistory[chatHistory.length-1].text = displayText; chatHistory = [...chatHistory]; }
-    else if(displayText){ chatHistory = [...chatHistory, {role:'assistant', text: displayText}]; }
-    llmStreaming='';
+
+  function stopMic() {
+    mic?.stop(); mic = null
+    listening = false; level = 0
   }
-  function finalizeReasoning(){
-    for(let i=chatHistory.length-1; i>=0; i--){
-      if(chatHistory[i].role==='reasoning' && chatHistory[i].streaming){
-        chatHistory[i].streaming = false;
-        chatHistory = [...chatHistory];
-        break;
-      }
-    }
-    reasoningStreaming = '';
+
+  function sendText() {
+    const t = textInput.trim()
+    if (!t || !connected) return
+    turns = [...turns, { role: 'user', text: t }]
+    tSpeechEnd = performance.now()
+    firstAudioMs = 0
+    client.sendText(t)
+    textInput = ''
+    scroll()
   }
-  function base64ToInt16(b64){ const bin = atob(b64); const bytes = new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i); return new Int16Array(bytes.buffer); }
-  function floatTo16BitPCM(float32){ const out = new Int16Array(float32.length); for(let i=0;i<float32.length;i++){ let s = Math.max(-1, Math.min(1, float32[i])); out[i] = s < 0 ? s*0x8000 : s*0x7FFF; } return out; }
-  async function startMic(){
-    micError=''; if(listening) return; if(!connected){ await connect(); await new Promise(r=>setTimeout(r,400)); }
-    if(!window.isSecureContext){ micError = `Mic blocked: not secure context.`; chatHistory=[...chatHistory,{role:'system',text: micError}]; }
-    try{
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)({sampleRate:16000});
-      if(audioCtx.state === 'suspended') await audioCtx.resume();
-      mediaStream = await navigator.mediaDevices.getUserMedia({audio:{channelCount:1, sampleRate:16000, echoCancellation:true, noiseSuppression:true, autoGainControl:true}});
-    }catch(e){ micError = `${e.name}: ${e.message}`; chatHistory=[...chatHistory,{role:'system',text: micError}]; return; }
-    const src = audioCtx.createMediaStreamSource(mediaStream);
-    analyser = audioCtx.createAnalyser(); analyser.fftSize = 256; src.connect(analyser);
-    if(useWorklet){
-      try{
-        await audioCtx.audioWorklet.addModule('/audio-processor.js');
-        workletNode = new AudioWorkletNode(audioCtx, 'capture-processor');
-        src.connect(workletNode);
-        workletNode.port.onmessage = (e)=>{ if(e.data.type==='chunk'){ const pcm16 = floatTo16BitPCM(e.data.pcm); let rms=0; for(let i=0;i<e.data.pcm.length;i++) rms+=e.data.pcm[i]*e.data.pcm[i]; audioLevel=Math.min(1,Math.sqrt(rms/e.data.pcm.length)*8); sendPCM(pcm16); } };
-        listening = true;
-      }catch(e){ useWorklet=false; startScriptProcessor(src); }
-    } else { startScriptProcessor(src); }
-    drawWave();
+
+  function interrupt() {
+    client?.cancel()
+    play?.flush()
+    speaking = false
   }
-  function startScriptProcessor(src){
-    const proc = audioCtx.createScriptProcessor(512,1,1); let buffer = new Float32Array(0);
-    proc.onaudioprocess = (e)=>{ const input = e.inputBuffer.getChannelData(0); const combined = new Float32Array(buffer.length + input.length); combined.set(buffer); combined.set(input, buffer.length); buffer = combined; while(buffer.length >= 320){ const chunk = buffer.slice(0,320); buffer = buffer.slice(320); const pcm16 = floatTo16BitPCM(chunk); let rms=0; for(let i=0;i<chunk.length;i++) rms+=chunk[i]*chunk[i]; audioLevel=Math.min(1,Math.sqrt(rms/chunk.length)*6); sendPCM(pcm16); } };
-    src.connect(proc); proc.connect(audioCtx.destination); const gain = audioCtx.createGain(); gain.gain.value=0; proc.connect(gain); workletNode = proc; listening=true;
+
+  function toggleTheme() {
+    theme = theme === 'dark' ? 'light' : 'dark'
+    document.body.classList.toggle('light', theme === 'light')
   }
-  function stopMic(){ listening=false; if(animId) cancelAnimationFrame(animId); if(workletNode){ try{workletNode.disconnect();}catch(e){} workletNode=null; } if(mediaStream){ mediaStream.getTracks().forEach(t=>t.stop()); mediaStream=null; } if(audioCtx){ try{audioCtx.close();}catch(e){} audioCtx=null; } audioLevel=0; if(ws && ws.readyState===1) ws.send(JSON.stringify({type:'stop'})); }
-  function sendPCM(pcm16){ if(!ws || ws.readyState!==1) return; const header = new Uint8Array(1); header[0]=0x01; const out = new Uint8Array(1 + pcm16.byteLength); out.set(header,0); out.set(new Uint8Array(pcm16.buffer),1); try{ ws.send(out); }catch(e){ const b64 = btoa(String.fromCharCode(...new Uint8Array(pcm16.buffer))); ws.send(JSON.stringify({type:'audio_chunk', pcm:b64, sampleRate:16000})); } }
-  function sendText(text){ if(!ws || ws.readyState!==1){ connect(); setTimeout(()=>sendText(text),500); return; } if(turnActive) bargeIn(); turnActive=true; ws.send(JSON.stringify({type:'text_input', text})); chatHistory=[...chatHistory, {role:'user', text}]; llmStreaming=''; }
-  let activeSources = [];
-  let bargeInLock = false;
-  // Stop whatever audio is currently playing/queued locally. Called both when *we*
-  // decide to interrupt (bargeIn, below) and when the server tells us it already
-  // interrupted a voice-triggered reply (the 'barge_in' case in handleServerMessage) —
-  // in the latter case the server has already stopped generating, so there's nothing
-  // to send back, just our own speakers to silence.
-  function stopPlayback(){
-    // Aggressive: stop all scheduled sources including future ones
-    for(const s of [...activeSources]){ try{ s.stop(); }catch(e){} try{ s.disconnect(); }catch(e){} }
-    activeSources=[];
-    // Clear pre-roll queue (0.6s buffered)
-    for(const c of [...preRollQueue]){ try{ c.src.stop(); }catch(e){} try{ c.src.disconnect(); }catch(e){} }
-    preRollQueue.length=0; preRollStarted=false;
-    jitterQueue=[]; nextPlayTime=0; speaking=false; turnActive=false;
-    if(playCtx){ try{ playCtx.suspend(); }catch(e){} try{ playCtx.close(); }catch(e){} playCtx=null; }
-    // Freeze whatever text had already streamed instead of leaving its bubble stuck
-    // showing a "▌" cursor forever — generation genuinely stopped here, it's not
-    // still in flight, so there's no more "streaming" state left to represent.
-    if(chatHistory.length && chatHistory[chatHistory.length-1].streaming){
-      chatHistory[chatHistory.length-1].streaming = false;
-      chatHistory = [...chatHistory];
-    }
-    // Clear any queued TTS chunks and LLM streaming
-    ttsText=''; llmStreaming='';
-    // Interrupting mid-tool-call (now reachable since "Stop reply" shows during that
-    // phase too, not just once audio starts) would otherwise leave this pulsing
-    // indicator on screen forever, since only stt_final/tts_end used to clear it.
-    toolStatus='';
-    // Force speaking false even if onended fires late
-    setTimeout(()=>{ speaking=false; }, 50);
-  }
-  function bargeIn(){ if(bargeInLock) return; bargeInLock=true; setTimeout(()=>bargeInLock=false, 300);
-    killedTurnIds.add(activeTurnId); // blacklist the turn we're interrupting (see isStaleTurn)
-    if(ws && ws.readyState===1) ws.send(JSON.stringify({type:'barge_in'}));
-    stopPlayback();
-  }
-  let playCtx = null;
-  function ensurePlayCtx(sampleRate){
-    if(!playCtx){ try{ playCtx = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){ playCtx = new (window.AudioContext||window.webkitAudioContext)(); } nextPlayTime = playCtx.currentTime;
-      const _resume = () => { if(playCtx && playCtx.state==='suspended') playCtx.resume(); }; document.addEventListener('pointerdown', _resume, {once:true}); window.addEventListener('touchend', _resume, {once:true});
-    } else if(playCtx.state==='suspended'){ try{ playCtx.resume(); }catch(e){} } return playCtx;
-  }
-  function resampleLinear(input, inRate, outRate){ if(inRate===outRate) return input; const ratio = inRate / outRate; const outLen = Math.round(input.length / ratio); const out = new Float32Array(outLen); for(let i=0;i<outLen;i++){ const pos=i*ratio; const idx=Math.floor(pos); const frac=pos-idx; out[i]=(input[idx]||0)+( (input[idx+1]||0)-(input[idx]||0))*frac; } return out; }
-  const PRE_ROLL_SEC = 0.6; const preRollQueue = []; let preRollStarted = false;
-  function queueAudio(pcm16, sampleRate){
-    const ctx = ensurePlayCtx(sampleRate); const float = new Float32Array(pcm16.length); for(let i=0;i<pcm16.length;i++) float[i]=pcm16[i]/32768; const resampled = resampleLinear(float, sampleRate, ctx.sampleRate);
-    const buf = ctx.createBuffer(1, resampled.length, ctx.sampleRate); buf.getChannelData(0).set(resampled); const src = ctx.createBufferSource(); src.buffer=buf; src.connect(ctx.destination); const dur=buf.duration;
-    activeSources.push(src);
-    src.onended = ()=>{ activeSources = activeSources.filter(s=>s!==src); if(ctx.currentTime >= nextPlayTime - 0.05) setTimeout(()=>{ if(ctx.currentTime >= nextPlayTime && activeSources.length===0) speaking=false; }, 200); };
-    if(!preRollStarted){ preRollQueue.push({buf, src, dur}); if(preRollQueue.reduce((a,c)=>a+c.dur,0) >= PRE_ROLL_SEC) flushPreRoll(); return; }
-    if(nextPlayTime < ctx.currentTime || !isFinite(nextPlayTime)) nextPlayTime = ctx.currentTime + 0.08; src.start(nextPlayTime); nextPlayTime += dur; speaking=true;
-  }
-  function flushPreRoll(){ const ctx=ensurePlayCtx(); if(!preRollQueue.length || preRollStarted) return; preRollStarted=true; if(nextPlayTime < ctx.currentTime || !isFinite(nextPlayTime)) nextPlayTime = ctx.currentTime + 0.08; for(const c of preRollQueue){ try{ c.src.start(nextPlayTime); }catch(e){} nextPlayTime+=c.dur; } preRollQueue.length=0; speaking=true; }
-  function drawWave(){
-    if(!canvasEl || !analyser) return; const ctx = canvasEl.getContext('2d'); const data = new Uint8Array(analyser.frequencyBinCount);
-    const draw = ()=>{ animId=requestAnimationFrame(draw); analyser.getByteFrequencyData(data); ctx.clearRect(0,0,canvasEl.width,canvasEl.height); const w=canvasEl.width,h=canvasEl.height; const barW=w/data.length*2.2; let x=0; for(let i=0;i<data.length;i+=2){ const v=data[i]/255; const bh=v*h*0.85; ctx.fillStyle=listening?`hsla(265,90%,65%,${0.45+v*0.5})`:`hsla(220,8%,45%,0.5)`; ctx.fillRect(x,h-bh,barW,bh); x+=barW+1; if(x>=w) break; } ctx.fillStyle=listening?'#7c5cff':'#3a3a44'; ctx.fillRect(0,h-3,w*audioLevel,3); }; draw();
-  }
-  onMount(()=>{ fetchHealth(); statsInterval=setInterval(fetchHealth,3000); initOpenCC(); });
-  onDestroy(()=>{ disconnect(); if(statsInterval) clearInterval(statsInterval); if(animId) cancelAnimationFrame(animId); });
-  let micError = $state('');
-  let textInput = $state('');
-  let theme = $state('dark');
-  $effect(()=>{ try{ theme=localStorage.getItem('vc-theme')||'dark'; }catch(e){} document.body.classList.toggle('light', theme==='light'); });
-  function toggleTheme(){ theme=theme==='dark'?'light':'dark'; try{localStorage.setItem('vc-theme',theme);}catch(e){} document.body.classList.toggle('light', theme==='light'); }
-  function clearChat(){ chatHistory=[]; }
-  function exportConversation(){
-    const payload = {
-      exportedAt: new Date().toISOString(),
-      chatHistory: chatHistory.map(m => ({role: m.role, text: m.text, streaming: !!m.streaming})),
-      latency, mode, sttBackend, ttsBackend, currentModelId, reasoningStreaming, llmStreaming
-    };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], {type: 'application/json'});
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a'); a.href = url;
-    a.download = `conversation-${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.json`;
-    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
-  }
+
+  onDestroy(disconnect)
 </script>
+
+<div class="wrap">
+  <header class="header">
+    <div class="brand">
+      <div class="logo">🎙️</div>
+      <div style="min-width:0">
+        <div class="title">Voice Chat · Realtime</div>
+        <div class="subtitle">HuggingFace speech-to-speech · 全本地 · 繁體中文</div>
+      </div>
+    </div>
+    <div class="header-actions">
+      <span class="pill {connected ? 'ok' : ''}">{connected ? '● Live' : '○ Offline'}</span>
+      {#if listening}<span class="pill ok">🎤 收音中</span>{/if}
+      <button class="ghost" style="padding:6px 10px; font-size:12px" onclick={toggleTheme}
+              aria-label={theme === 'dark' ? '切換為亮色主題' : '切換為深色主題'}>
+        {theme === 'dark' ? '☀️' : '🌙'}
+      </button>
+    </div>
+  </header>
+
+  <div class="grid">
+    <div class="stack controls-col">
+      <div class="card">
+        <h3>連線</h3>
+        <div class="controls">
+          {#if !connected}
+            <button class="primary" onclick={connect} disabled={connecting}>
+              {connecting ? '連線中…' : '連線'}
+            </button>
+          {:else}
+            <button class="ghost" onclick={disconnect}>中斷連線</button>
+          {/if}
+          {#if connected && !listening}
+            <button class="primary" onclick={startMic}>🎤 開始說話</button>
+          {:else if listening}
+            <button class="danger" onclick={stopMic}>停止收音</button>
+          {/if}
+          {#if responding || speaking}
+            <button class="ghost" onclick={interrupt}>⏹ 中斷回覆</button>
+          {/if}
+        </div>
+
+        <label for="ws-url" class="subtle" style="display:block;margin-bottom:4px">Realtime 端點</label>
+        <input id="ws-url" class="input" bind:value={url} disabled={connected} />
+
+        <div class="meter" aria-hidden="true">
+          <div class="meter-fill" style="width:{Math.min(100, level * 180)}%"></div>
+        </div>
+
+        {#if userSpeaking}
+          <div class="status-banner status-speaking"><span class="dot">●</span> 偵測到說話——助理會停止並聆聽</div>
+        {:else if speaking}
+          <div class="status-banner status-speaking"><span class="dot">●</span> 助理正在說話——直接開口即可打斷</div>
+        {:else if responding}
+          <div class="status-banner status-speaking"><span class="dot">●</span> 思考中…（可能含網路搜尋）</div>
+        {/if}
+        {#if lastStatus}
+          <div class="status-banner status-cancel">{lastStatus}</div>
+        {/if}
+        {#if error}
+          <div class="status-banner status-err">⚠️ {error}</div>
+        {/if}
+
+        <div class="lat-grid">
+          <div class="lat"><b>{firstAudioMs || '—'}</b><span>首次出聲 ms</span></div>
+          <div class="lat"><b>{audioSeconds.toFixed(1)}</b><span>已播秒數</span></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>管線</h3>
+        <div style="font-size:12px; line-height:1.7; opacity:0.85">
+          <div><b>VAD</b> Silero v5 + Smart Turn v3.2</div>
+          <div><b>STT</b> Paraformer（FunASR）</div>
+          <div><b>LLM</b> Qwen3.5 4B Q8 · Qwen-Agent（3 工具）</div>
+          <div><b>TTS</b> Qwen3-TTS 12Hz · GGML 24k</div>
+          <div class="subtle" style="margin-top:6px">
+            打斷由伺服器的 CancelScope 處理；瀏覽器同時清掉已排程的音訊。
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="stack chat-col">
+      <div class="card">
+        <h3>對話</h3>
+        <div class="chat" bind:this={chatEl}>
+          {#each turns as t}
+            <div class="bubble {t.role}" class:cancelled={t.cancelled}>{t.text}</div>
+          {/each}
+          {#if userPartial}
+            <div class="bubble user partial">{userPartial}</div>
+          {/if}
+          {#if !turns.length && !userPartial}
+            <div class="subtle" style="margin:auto; text-align:center; font-size:12px">
+              按「連線」，再按「開始說話」。<br />也可以直接打字。
+            </div>
+          {/if}
+        </div>
+        <div class="composer">
+          <input class="input" placeholder="輸入訊息…" bind:value={textInput}
+                 onkeydown={(e) => e.key === 'Enter' && sendText()} disabled={!connected} />
+          <button class="primary" onclick={sendText} disabled={!connected || !textInput.trim()}>送出</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
 
 <style>
   :global(*){box-sizing:border-box}
@@ -387,18 +290,16 @@
   .title{font-size:15px; font-weight:700; letter-spacing:-0.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
   .subtitle{font-size:11px; opacity:0.55; margin-top:2px}
   .header-actions{display:flex; gap:8px; align-items:center; flex-wrap:wrap}
-  .pill{font-size:11px; padding:5px 9px; border-radius:999px; border:1px solid #232332; background:#14141c; display:inline-flex; gap:5px; align-items:center}
+  .pill{font-size:11px; padding:5px 9px; border-radius:999px; border:1px solid #232332; background:#14141c}
   .pill.ok{border-color:#7c5cff; color:#b8a6ff}
   :global(body.light) .pill{background:#fff; border-color:#e3e4ee; color:#555}
-  :global(body.light) .pill.ok{border-color:#7c5cff; color:#6a4beb}
-  .grid{display:grid; grid-template-columns: 380px 1fr; gap:16px}
+  .grid{display:grid; grid-template-columns:380px 1fr; gap:16px}
   @media(max-width:900px){
     .grid{grid-template-columns:1fr}
     .header{flex-direction:column; align-items:stretch}
-    /* Conversation is the primary surface — show it before the controls/model cards
-       once the layout collapses to one column, instead of forcing a scroll past them. */
     .chat-col{order:-1}
   }
+  .stack{display:flex; flex-direction:column; gap:16px}
   .card{background:#14141c; border:1px solid #1e1e28; border-radius:14px; padding:14px}
   :global(body.light) .card{background:#fff; border-color:#e8eaf0; box-shadow:0 1px 3px rgba(0,0,0,0.06)}
   .card h3{font-size:11px; font-weight:600; letter-spacing:0.07em; text-transform:uppercase; opacity:0.6; margin:0 0 10px 0}
@@ -406,215 +307,38 @@
   button{appearance:none; border:0; padding:9px 14px; border-radius:999px; font-weight:600; font-size:13px; cursor:pointer; transition:all .12s}
   button:disabled{opacity:0.4; cursor:not-allowed}
   .primary{background:#7c5cff; color:#fff}
-  .primary:hover{transform:translateY(-1px); box-shadow:0 4px 12px rgba(124,92,255,0.3)}
+  .primary:hover:not(:disabled){transform:translateY(-1px); box-shadow:0 4px 12px rgba(124,92,255,0.3)}
   .ghost{background:#1e1e28; color:#d8d8e6; border:1px solid #232332}
   .ghost:hover{background:#252538}
   :global(body.light) .ghost{background:#f1f2f6; color:#2a2a3a; border-color:#e3e4ee}
   .danger{background:#ff3b5e; color:#fff}
-  .lat-grid{display:grid; grid-template-columns: repeat(4,1fr); gap:8px}
+  .input{width:100%; padding:9px 11px; border-radius:8px; border:1px solid #232332; background:#0f0f14; color:inherit; font-size:13px; font-family:inherit}
+  :global(body.light) .input{background:#f8f9fc; border-color:#e3e4ee}
+  .meter{height:6px; border-radius:999px; background:#0f0f14; border:1px solid #1e1e28; margin:10px 0; overflow:hidden}
+  :global(body.light) .meter{background:#f0f1f8; border-color:#eef0f6}
+  .meter-fill{height:100%; background:#7c5cff; transition:width .06s linear}
+  .lat-grid{display:grid; grid-template-columns:repeat(2,1fr); gap:8px; margin-top:10px}
   .lat{padding:10px 6px; border-radius:10px; background:#0f0f14; border:1px solid #1e1e28; text-align:center}
   .lat b{font-size:15px; display:block; font-variant-numeric:tabular-nums}
-  .lat span{font-size:10px; opacity:0.55; text-transform:uppercase; letter-spacing:0.06em}
+  .lat span{font-size:10px; opacity:0.55; letter-spacing:0.06em}
   :global(body.light) .lat{background:#f8f9fc; border-color:#eef0f6}
-  .wave{width:100%; height:64px; border-radius:10px; background:#0a0a0f; border:1px solid #1e1e28; margin:10px 0; display:block}
-  :global(body.light) .wave{background:#f0f1f8; border-color:#eef0f6}
   .status-banner{display:flex; gap:8px; align-items:center; font-size:12px; padding:8px 10px; border-radius:8px; margin:8px 0}
   .status-speaking{background:#14101f; border:1px solid #2a2242; color:#c7b8ff}
   :global(body.light) .status-speaking{background:#f3f0ff; border-color:#ded4ff; color:#5a3fc0}
+  .status-cancel{background:#1a1510; border:1px solid #3a2c1a; color:#ffd9a3}
+  .status-err{background:#1a0f14; border:1px solid #3a1a1a; color:#ffb3b3}
   .status-banner .dot{animation:pulse 1.2s infinite; color:#7c5cff}
-  .model-picker{margin-top:10px; padding-top:10px; border-top:1px solid #1e1e28}
-  :global(body.light) .model-picker{border-color:#e8eaf0}
-  select.input{-webkit-appearance:none; appearance:none}
-  .chat{height:420px; overflow:auto; display:flex; flex-direction:column; gap:8px; padding:4px; scroll-behavior:smooth}
-  .bubble{max-width:82%; padding:10px 12px; border-radius:12px; font-size:13px; line-height:1.5; word-break:break-word}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.25}}
+  .chat{height:460px; overflow:auto; display:flex; flex-direction:column; gap:8px; padding:4px; scroll-behavior:smooth}
+  .bubble{max-width:82%; padding:10px 12px; border-radius:12px; font-size:13px; line-height:1.6; word-break:break-word; white-space:pre-wrap}
   .bubble.user{align-self:flex-end; background:#7c5cff; color:#fff; border-bottom-right-radius:4px}
-  .bubble.assistant{align-self:flex-start; background:#1e1e28; border:1px solid #232332}
-  .bubble.system{align-self:center; background:transparent; border:1px dashed #2a2a3a; font-size:11px; opacity:0.7}
-  .bubble.tool{align-self:center; background:#0e1a14; border:1px solid #1e3326; color:#8fd9b0; font-size:11px; max-width:90%; border-radius:8px; padding:7px 10px}
-  .bubble.reasoning{align-self:flex-start; background:#1a1628; border:1px solid #2e2648; color:#9d8ec7; font-size:11px; max-width:90%; border-radius:10px; padding:10px 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; line-height:1.6; opacity:0.9}
-  .bubble.reasoning.streaming{opacity:0.7}
-  .reasoning-label{font-size:10px; font-weight:700; letter-spacing:0.08em; text-transform:uppercase; opacity:0.6; margin-bottom:6px; display:flex; align-items:center; gap:6px}
-  .reasoning-body{white-space:pre-wrap; word-break:break-word; max-height:180px; overflow:auto; scrollbar-width:thin}
-  .reasoning-body.collapsed{max-height:72px}
-  :global(body.light) .bubble.reasoning{background:#f3f0ff; border-color:#d8ccff; color:#5a3fc0}
-  .bubble.markdown :global(p){margin:6px 0}
-  .bubble.markdown :global(strong){color:#fff; font-weight:700}
-  :global(body.light) .bubble.markdown :global(strong){color:#1a1a24}
-  .bubble.markdown :global(ul), .bubble.markdown :global(ol){margin:6px 0 6px 18px; padding:0}
-  .bubble.markdown :global(li){margin:4px 0}
-  .bubble.markdown :global(a){color:#8ea6ff; text-decoration:underline; word-break:break-all}
-  .bubble.markdown :global(a:hover){color:#a8beff}
-  .bubble.markdown :global(h1), .bubble.markdown :global(h2), .bubble.markdown :global(h3){margin:10px 0 6px; font-size:13px; font-weight:700; border-bottom:1px solid #232332; padding-bottom:4px}
-  :global(body.light) .bubble.markdown :global(h1), :global(body.light) .bubble.markdown :global(h2), :global(body.light) .bubble.markdown :global(h3){border-color:#e8eaf0}
-  .bubble.markdown :global(h1){font-size:15px}
-  .bubble.markdown :global(h2){font-size:14px}
-  .bubble.markdown :global(code){background:#0f0f14; border:1px solid #1e1e28; padding:1px 5px; border-radius:4px; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11.5px; word-break:break-word}
-  :global(body.light) .bubble.markdown :global(code){background:#f0f1f8; border-color:#e3e4ee}
-  .bubble.markdown :global(pre){background:#0a0a0f; border:1px solid #1e1e28; border-radius:8px; padding:10px 12px; overflow:auto; margin:8px 0; max-height:320px}
-  :global(body.light) .bubble.markdown :global(pre){background:#f8f9fc; border-color:#e8eaf0}
-  .bubble.markdown :global(pre code){background:none; border:none; padding:0; font-size:12px; white-space:pre}
-  .bubble.markdown :global(blockquote){border-left:3px solid #7c5cff; margin:8px 0; padding:6px 10px; background:rgba(124,92,255,0.08); border-radius:0 6px 6px 0; opacity:0.9}
-  :global(body.light) .bubble.markdown :global(blockquote){background:rgba(124,92,255,0.06); border-left-color:#7c5cff}
-  .bubble.markdown :global(table){width:100%; border-collapse:collapse; margin:8px 0; font-size:12px; display:block; overflow:auto}
-  .bubble.markdown :global(th), .bubble.markdown :global(td){border:1px solid #232332; padding:6px 8px; text-align:left}
-  .bubble.markdown :global(th){background:#1a1a28; font-weight:600}
-  :global(body.light) .bubble.markdown :global(th){background:#f1f2f8}
-  :global(body.light) .bubble.markdown :global(td), :global(body.light) .bubble.markdown :global(th){border-color:#e3e4ee}
-  .bubble.markdown :global(hr){border:none; border-top:1px solid #232332; margin:10px 0}
-  :global(body.light) .bubble.markdown :global(hr){border-color:#e8eaf0}
-  .bubble.markdown :global(img){max-width:100%; border-radius:8px; margin:6px 0}
-  :global(body.light) .bubble.assistant{background:#f1f2f8; border-color:#e3e4ee}
-  :global(body.light) .bubble.system{background:#f8f9fc; border-color:#e3e4ee}
-  :global(body.light) .bubble.tool{background:#eef8f0; border-color:#c8e8d0; color:#2a6b4a}
-  .meta{font-size:11px; opacity:0.5; margin-top:6px}
-  .row{display:flex; gap:8px; margin-top:10px}
-  .input{flex:1; background:#0f0f14; border:1px solid #232332; color:#e8e8ef; padding:10px 12px; border-radius:999px; outline:none; font-size:13px}
-  .input:focus{border-color:#7c5cff}
-  :global(body.light) .input{background:#fff; border-color:#e3e4ee; color:#1a1a24}
-  .toggles{display:flex; gap:10px; font-size:11px; opacity:0.8; margin:8px 0; align-items:center; flex-wrap:wrap}
-  .kpi{display:flex; gap:6px; font-size:11px; opacity:0.65; flex-wrap:wrap}
-  .kpi div{background:#0f0f14; padding:5px 8px; border-radius:999px; border:1px solid #1e1e28}
-  :global(body.light) .kpi div{background:#f8f9fc; border-color:#eef0f6}
-  .tool-bar{display:flex; gap:6px; margin-top:8px; flex-wrap:wrap; align-items:center}
-  .tool-chip{font-size:11px; padding:6px 10px; border-radius:999px; background:#1a1a1c; border:1px solid #2a2a3a; color:#ccc; cursor:pointer}
-  .tool-chip:hover{border-color:#7c5cff; color:#b8a6ff}
-  :global(body.light) .tool-chip{background:#fff; border-color:#e3e4ee; color:#555}
-  .stack{display:flex; flex-direction:column; gap:12px}
-  .subtle{font-size:11px; opacity:0.55; line-height:1.5}
-  @keyframes pulse{0%{opacity:0.4}50%{opacity:1}100%{opacity:0.4}}
+  .bubble.assistant{align-self:flex-start; background:#1e1e28; border:1px solid #232332; border-bottom-left-radius:4px}
+  :global(body.light) .bubble.assistant{background:#f1f2f6; border-color:#e3e4ee}
+  .bubble.partial{opacity:0.55; font-style:italic}
+  .bubble.cancelled{opacity:0.6}
+  .bubble.cancelled::after{content:' ⏹'; opacity:0.7}
+  .composer{display:flex; gap:8px; margin-top:10px}
+  .composer .input{flex:1 1 auto; min-width:0}
+  .composer button{flex:0 0 auto}
+  .subtle{opacity:0.55}
 </style>
-
-<div class="wrap">
-  <header class="header">
-    <div class="brand">
-      <div class="logo">🎙️</div>
-      <div style="min-width:0">
-        <div class="title">Voice Chat</div>
-        <div class="subtitle">即時雙語語音助理．雙向插話中斷．支援工具呼叫</div>
-      </div>
-    </div>
-    <div class="header-actions">
-      <span class="pill {connected ? 'ok' : ''}">{connected ? '● Live' : '○ Offline'} · {mode.toUpperCase()}</span>
-      <span class="pill" style="font-variant-numeric:tabular-nums">{rssMb} MB</span>
-      <button class="ghost" style="padding:6px 10px; font-size:12px" onclick={toggleTheme} aria-label={theme==='dark' ? 'Switch to light theme' : 'Switch to dark theme'}>{theme==='dark' ? '☀️' : '🌙'}</button>
-    </div>
-  </header>
-
-  <div class="grid">
-    <div class="stack controls-col">
-      <div class="card">
-        <h3>即時語音</h3>
-        <div class="controls">
-          {#if !connected}
-            <button class="primary" onclick={connect} disabled={connecting}>{connecting ? '連線中…' : '連線'}</button>
-          {:else}
-            <button class="ghost" onclick={disconnect}>中斷連線</button>
-          {/if}
-          {#if !listening}
-            <button class="primary" onclick={startMic} disabled={!connected} aria-label="開始使用麥克風聆聽">🎤 聆聽</button>
-          {:else}
-            <button class="danger" onclick={stopMic}>停止</button>
-          {/if}
-          {#if turnActive}
-            <button class="ghost" onclick={bargeIn} aria-label="中斷助理的回覆">⏹ 中斷回覆</button>
-          {/if}
-          <button class="ghost" onclick={()=>{vadEnabled=!vadEnabled}} aria-pressed={vadEnabled}>{vadEnabled ? 'VAD 開' : 'VAD 關'}</button>
-        </div>
-        {#if micError}
-          <div style="margin:8px 0; padding:10px; background:#1a0f14; border:1px solid #3a1a1a; border-radius:8px; font-size:12px; color:#ffb3b3">{micError}</div>
-        {/if}
-        <canvas bind:this={canvasEl} class="wave" width="640" height="64"></canvas>
-        {#if speaking}
-          <div class="status-banner status-speaking"><span class="dot" aria-hidden="true">●</span> 助理正在說話——開口說話或按下「中斷回覆」即可打斷</div>
-        {:else if turnActive}
-          <div class="status-banner status-speaking"><span class="dot" aria-hidden="true">●</span> 思考中…（可能包含網路搜尋）——開口說話或按下「中斷回覆」即可取消</div>
-        {/if}
-        <div class="lat-grid">
-          <div class="lat"><b>{latency.stt_ms||0}</b><span>STT</span></div>
-          <div class="lat"><b>{latency.llm_ttft_ms||0}</b><span>LLM</span></div>
-          <div class="lat"><b>{latency.tts_ttfb_ms||0}</b><span>TTS</span></div>
-          <div class="lat"><b>{latency.e2e_ms||0}</b><span>E2E</span></div>
-        </div>
-        {#if audioError}<div style="margin-top:8px; padding:7px; background:#1a0f14; border:1px solid #3a1a1a; border-radius:8px; font-size:11px; color:#ffb3b3">⚠️ {audioError}</div>{/if}
-        <div class="kpi" style="margin-top:10px">
-          <div>{sttPartial || '—'}</div>
-          <div>{llmStreaming ? llmStreaming.slice(0,32)+'…' : '—'}</div>
-        </div>
-        <p class="subtle" style="margin-top:10px">Svelte 5 · AudioWorklet · Binary WS · pre-roll 0.6s</p>
-      </div>
-
-      <div class="card">
-        <h3>模型</h3>
-        <div style="font-size:12px; line-height:1.6; opacity:0.85">
-          <div><b>STT</b> {sttBackend || '—'} · <b>Embed</b> Granite-97M Q8 (CUDA, 384d) · <b>TTS</b> {ttsBackend || '—'}</div>
-          <div class="subtle">Agent <b>Qwen-Agent</b> (3 tools) · SearXNG self-host + wttr.in + Bing</div>
-        </div>
-        <div class="model-picker">
-          <label for="llm-select" class="subtle" style="display:block; margin-bottom:4px">語言模型（文字）</label>
-          <!-- min-width:0 on the select and flex-shrink:0 on the button: a flex item
-               defaults to min-width:auto, so a long option label ("Qwen3.6 35B-A3B
-               UD-Q4_K_M (experts in RAM)") widened the select past the row and pushed
-               the 載入 button out of view entirely. -->
-          <div style="display:flex; gap:8px; align-items:center">
-            <select id="llm-select" class="input" style="border-radius:8px; flex:1 1 auto; min-width:0"
-                    bind:value={selectedModelId} disabled={modelSwitching}>
-              {#each llmModels as m}
-                <option value={m.id} disabled={!m.exists}>{m.label}{m.id===currentModelId ? '（已載入）' : ''}{!m.exists ? ' — 檔案不存在' : ''}</option>
-              {/each}
-            </select>
-            <button class="ghost" style="flex:0 0 auto; white-space:nowrap" onclick={switchModel} disabled={modelSwitching || !selectedModelId || selectedModelId===currentModelId}>{modelSwitching ? '載入中…' : '載入'}</button>
-          </div>
-          {#if modelSwitchStatus}<div class="subtle" style="margin-top:6px">{modelSwitchStatus}</div>{/if}
-          <div class="subtle" style="margin-top:6px">切換模型會重新啟動語言模型伺服器——語音／文字回覆會暫停數秒，直到新模型載入完成。</div>
-        </div>
-      </div>
-    </div>
-
-    <div class="stack chat-col">
-      <div class="card" style="display:flex; flex-direction:column; min-height:500px">
-        <h3>Conversation <span style="margin-left:auto; font-size:11px; opacity:0.5; text-transform:none; letter-spacing:0">{chatHistory.length} 則訊息</span> <button class="ghost" style="padding:4px 8px; font-size:11px; margin-left:8px" onclick={exportConversation} title="匯出原始對話 JSON（除錯用）">匯出 JSON</button> <button class="ghost" style="padding:4px 8px; font-size:11px; margin-left:4px" onclick={clearChat}>清除</button></h3>
-        <div class="chat" id="chat">
-          {#each chatHistory as m}
-            {#if m.role==='reasoning'}
-              <details class="bubble reasoning" open={m.streaming ? true : undefined}>
-                <summary class="reasoning-label">🧠 思考過程 {#if m.streaming}<span style="opacity:0.6">· 思考中…</span>{:else}<span style="opacity:0.45">（僅顯示，不會朗讀）</span>{/if}</summary>
-                <div class="reasoning-body">{m.text}{#if m.streaming}<span style="opacity:0.6"> ▌</span>{/if}</div>
-              </details>
-            {:else if m.role==='assistant'}
-              <div class="bubble {m.role} {m.streaming ? 'streaming' : ''} markdown">{@html renderMarkdown(m.text)}{#if m.streaming}<span style="opacity:0.6"> ▌</span>{/if}</div>
-            {:else}
-              <div class="bubble {m.role} {m.streaming ? 'streaming' : ''}">{m.text}{#if m.streaming}<span style="opacity:0.6"> ▌</span>{/if}</div>
-            {/if}
-          {:else}
-            <div class="bubble system">尚無訊息——請按下「聆聽」或於下方輸入文字。</div>
-          {/each}
-        </div>
-        {#if toolStatus}<div style="margin-top:8px; padding:8px 10px; background:#0e1a14; border:1px solid #1e3326; border-radius:8px; font-size:12px; color:#8fd9b0; display:flex; gap:8px; align-items:center"><span style="animation:pulse 1.2s infinite">●</span> {toolStatus}</div>{/if}
-        <div class="row">
-          <input class="input" placeholder="輸入訊息…" bind:value={textInput} onkeydown={(e)=>{ if(e.key==='Enter' && textInput.trim()){ sendText(textInput.trim()); textInput=''; }}} />
-          <button class="primary" onclick={()=>{ if(textInput.trim()){ sendText(textInput.trim()); textInput=''; }}}>送出</button>
-        </div>
-        <div class="tool-bar">
-          <button class="tool-chip" onclick={()=>testSearch('台北今天天氣如何？')}>台北天氣</button>
-          <button class="tool-chip" onclick={()=>testSearch('搜尋最新的科技新聞')}>科技新聞</button>
-          <button class="tool-chip" onclick={()=>testSearch('法國現在的總統是誰？')}>法國總統</button>
-          <button class="tool-chip" onclick={()=>testSearch('今天是星期幾？')}>今天星期幾</button>
-        </div>
-        {#if lastSearchResults.length}
-          <div style="margin-top:10px; padding:8px; background:rgba(0,0,0,0.2); border-radius:8px; max-height:140px; overflow:auto; border:1px solid #1e1e28">
-            {#each lastSearchResults.slice(0,2) as r}
-              <div style="font-size:11px; margin-bottom:6px; padding:6px; background:rgba(255,255,255,0.04); border-radius:6px">
-                <a href={safeUrl(r.url)} target="_blank" rel="noopener noreferrer" style="color:#8ea6ff; font-weight:600; text-decoration:none">{toTraditional(r.title)}</a><br/>
-                <span style="opacity:0.6">{toTraditional(r.content.slice(0,120))}…</span>
-              </div>
-            {/each}
-          </div>
-        {/if}
-      </div>
-    </div>
-  </div>
-
-  <div style="text-align:center; font-size:11px; opacity:0.4; margin-top:16px">
-    全雙工語音對話．自架部署．無需雲端 API · <a href="https://github.com/vieenrose/voice-chat" style="color:inherit">GitHub</a>
-  </div>
-</div>

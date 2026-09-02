@@ -161,12 +161,23 @@ Then talk to it — any OpenAI Realtime client works, including the framework's 
 speech-to-speech talk --url ws://127.0.0.1:8765/v1/realtime
 ```
 
-Or check it without a microphone:
+Or open the web client:
 
 ```bash
-cd backend
-python3 -m s2s.checks.turn "台灣的首都是哪裡？"   # one turn: transcript + latencies
-python3 -m s2s.checks.bargein                     # interrupt a long answer with real audio
+cd frontend && npm install && npm run dev     # http://localhost:5173
+```
+
+Press **連線**, then **開始說話**. It speaks the Realtime protocol straight to `:8765` — no
+backend of its own — and shows live partial transcripts, the reply as it is spoken, and a
+cancelled badge on any turn you interrupt.
+
+Or check it all without a microphone:
+
+```bash
+cd backend  && python3 -m s2s.checks.turn "台灣的首都是哪裡？"  # one turn, server side
+cd backend  && python3 -m s2s.checks.bargein                    # interrupt a long answer
+cd frontend && node checks/turn.mjs                             # a voice turn through the UI's client
+cd frontend && node checks/bargein.mjs                          # barge-in through the UI's client
 ```
 
 Dependencies beyond `requirements.txt`:
@@ -184,16 +195,34 @@ the two already on disk: LLM `/home/user/llms/mtp/Qwen3.5-4B-UD-Q8_K_XL.gguf`, T
 > with `Disk quota exceeded` even though `df` shows free space. Put new weights on a real disk
 > and point the matching `LLM_PATH_*` at them.
 
+### The frontend
+
+`frontend/` is a Realtime client and nothing else: `src/lib/realtime.js` (protocol),
+`src/lib/audio.js` (mic capture, playback queue), `src/App.svelte` (UI). It holds no session
+state of its own and calls no HTTP API — the server owns turn-taking, so the UI only renders
+what the protocol reports.
+
+Three things in it are load-bearing and easy to get wrong:
+
+- **`input_audio_transcription.delta` is cumulative.** Each one carries the whole transcript so
+  far, not the increment, so partials must *replace*. Appending yields
+  「欢迎欢迎大家来欢迎大家来体验…」.
+- **A voice turn never emits `response.created`.** The server sends it only for an explicit
+  `response.create`, so end-of-speech is what tells the UI a reply is coming.
+- **Barge-in has to flush the browser too.** Cancelling server-side stops new audio, but chunks
+  already scheduled in the AudioContext keep playing; `Playback.flush()` stops the scheduled
+  sources, not just the queue.
+
+Capture pins an `AudioContext` to 16 kHz so the browser resamples from whatever the device
+gives, and playback requests 24 kHz output — the rate Qwen3-TTS natively produces, which the
+server would otherwise downsample. Note the input format cannot be declared: `AudioPCM.rate` is
+`Literal[24000]` in the schema, and one invalid field rejects the entire `session.update`.
+
 ### The earlier pipeline
 
-`backend/app.py` (`:8000`) still serves the hand-rolled FastAPI/WebSocket stack and the Svelte
-UI, on X-ASR streaming STT and its own turn machine. It is the thing the speech-to-speech
-pipeline replaces; keep it for comparison, not for new work.
-
-```bash
-cd backend  && python3 app.py --port 8000
-cd frontend && npm install && npm run dev
-```
+`backend/app.py` (`:8000`) still serves the hand-rolled FastAPI/WebSocket stack, on X-ASR
+streaming STT and its own turn machine, but the Svelte app it used to serve is gone — that is
+now the Realtime client. Keep `app.py` for comparison, not for new work.
 
 ## Features
 
