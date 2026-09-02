@@ -9,11 +9,22 @@
  * Callbacks rather than an event emitter, because there is exactly one consumer.
  */
 
-// Same host the page came from, so reaching the UI over Tailscale/LAN reaches the
-// server too -- provided it is bound past loopback (--ws_host 0.0.0.0). wss when the
-// page is https, because a browser blocks ws:// from an https page as mixed content.
+// Where the server is, from the page's own origin.
+//
+//   http  -> the pipeline directly on :8765 (dev, or same machine)
+//   https -> :8443, where a TLS terminator fronts it. A browser blocks ws:// from
+//            an https page as mixed content, and the pipeline speaks plain ws, so
+//            something has to terminate TLS. Here that is `tailscale serve --https
+//            8443 http://127.0.0.1:8765`, which keeps the endpoint tailnet-only
+//            while the page itself may be published more widely.
+//
+// Both are only defaults; the endpoint is editable in the UI.
+const RT_TLS_PORT = 8443
+const RT_PLAIN_PORT = 8765
 const defaultUrl = () =>
-  `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.hostname}:8765/v1/realtime`
+  location.protocol === 'https:'
+    ? `wss://${location.hostname}:${RT_TLS_PORT}/v1/realtime`
+    : `ws://${location.hostname}:${RT_PLAIN_PORT}/v1/realtime`
 
 export class RealtimeClient {
   constructor(handlers = {}) {

@@ -7,8 +7,12 @@
     '你是一個親切的語音助理。一律使用繁體中文（台灣用語）回答，' +
     '無論問題用什麼語言提出；只有專有名詞或無法翻譯的術語才保留英文。回答要口語、簡潔。'
 
+  // Same rule as realtime.js: https implies a TLS terminator on 8443, because a
+  // browser blocks ws:// from an https page and the pipeline speaks plain ws.
   const defaultUrl = () =>
-    `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.hostname}:8765/v1/realtime`
+    location.protocol === 'https:'
+      ? `wss://${location.hostname}:8443/v1/realtime`
+      : `ws://${location.hostname}:8765/v1/realtime`
   let url = $state(defaultUrl())
   let connected = $state(false)
   let connecting = $state(false)
@@ -120,7 +124,7 @@
       error =
         `連線失敗：${e.message}。` +
         (remote
-          ? '伺服器可能只綁定在 127.0.0.1，從其他機器連不到。請以 --ws_host 0.0.0.0 啟動。'
+          ? '從其他機器連線時，https 需要 TLS 轉送：tailscale serve --bg --https 8443 http://127.0.0.1:8765'
           : '伺服器是否在執行？python3 -m s2s.serve --mode realtime --ws_host 0.0.0.0')
     } finally {
       connecting = false

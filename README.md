@@ -145,7 +145,7 @@ llama-server -m /home/user/llms/mtp/Qwen3.5-4B-UD-Q8_K_XL.gguf \
 
 # 3) The speech-to-speech pipeline, with Qwen-Agent as its LLM stage
 cd backend && python3 -m s2s.serve --mode realtime \
-  --ws_host 0.0.0.0 --ws_port 8765 \
+  --ws_host 127.0.0.1 --ws_port 8765 \
   --stt paraformer --language zh \
   --model_name qwen3.5-4b \
   --responses_api_base_url http://127.0.0.1:11435/v1 --responses_api_api_key none \
@@ -167,12 +167,27 @@ Or open the web client:
 cd frontend && npm install && npm run dev     # http://localhost:5173
 ```
 
-> `--ws_host 0.0.0.0` matters as soon as the UI is opened from another machine (Tailscale, a
-> phone on the LAN): the client derives its endpoint from the page's own hostname, so a server
-> bound to `127.0.0.1` is reachable only when the browser is on this box. It also means the
-> pipeline is exposed to every interface, so keep it behind Tailscale rather than a public IP.
-> If the page is served over https the client uses `wss://`, which needs a TLS terminator in
-> front — a browser blocks `ws://` from an https page.
+### Reaching it from another machine
+
+The client derives its endpoint from the page's own origin, so serving the UI elsewhere means
+the WebSocket has to be reachable there too. Two cases:
+
+- **Page on `http://`** (dev, or the same box) — the client uses `ws://<host>:8765` and the
+  pipeline needs `--ws_host 0.0.0.0` to accept it.
+- **Page on `https://`** — a browser blocks `ws://` from an https page as mixed content, and
+  the pipeline speaks plain ws, so something must terminate TLS. The client uses
+  `wss://<host>:8443`, and Tailscale can be that terminator:
+
+  ```bash
+  tailscale serve --bg --https 8443 http://127.0.0.1:8765
+  ```
+
+  This is **tailnet-only** even when the page itself is published through Funnel, and it lets
+  the pipeline stay bound to `127.0.0.1`, which is the point: the Realtime endpoint has **no
+  authentication**, so anyone who can reach it can drive the LLM and the GPU. Never Funnel it
+  or bind it to a public interface.
+
+Either default is only a default — the endpoint is editable in the UI.
 
 Press **連線**, then **開始說話**. It speaks the Realtime protocol straight to `:8765` — no
 backend of its own — and shows live partial transcripts, the reply as it is spoken, and a
