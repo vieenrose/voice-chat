@@ -65,16 +65,31 @@ MODEL_REGISTRY: dict[str, dict] = {
     # touching the precision this quantization was chosen for. Measured +20% on 4B with
     # byte-identical greedy output. See _mtp_args(); LLM_MTP=0 disables it.
     "qwen3.5-2b-q4": {
-        "label": "Qwen3.5 2B UD-Q8_K_XL (MTP)",
+        "label": "Qwen3.5 2B · Q8_K_XL",
         "path": os.getenv("LLM_PATH_2B", "/home/user/llms/mtp/Qwen3.5-2B-UD-Q8_K_XL.gguf"),
         "alias": "qwen3.5-2b",
         "mtp": True,
     },
     "qwen3.5-4b-q4": {
-        "label": "Qwen3.5 4B UD-Q8_K_XL (MTP)",
+        "label": "Qwen3.5 4B · Q8_K_XL",
         "path": os.getenv("LLM_PATH_4B", "/home/user/llms/mtp/Qwen3.5-4B-UD-Q8_K_XL.gguf"),
         "alias": "qwen3.5-4b",
         "mtp": True,
+    },
+    # Bonsai 8B, ternary (1.58-bit) weights in Prism's PQ2_0 format. 8.2B parameters in
+    # 2.18 GB — and measured on the same zh corpus as the entries above, PPL 16.518
+    # against the 2B's 16.738 and the 4B's 13.027. So a ternary 8B lands roughly where a
+    # 2B Q8 does: the compression is real and so is the quality cost per parameter.
+    #
+    # Needs Prism's llama.cpp fork ("bin" below). Their Q2_0 reuses upstream's
+    # GGML_TYPE_Q2_0 id with a different block layout, so mainline refuses the file. Note
+    # the HF repo also ships a plain *-Q2_0.gguf which is their LEGACY group-128 layout
+    # and fails even on the fork; PQ2_0 is the current one.
+    "bonsai-8b-ternary": {
+        "label": "Bonsai 8B · ternary",
+        "path": os.getenv("LLM_PATH_BONSAI_8B", "/home/user/llms/bonsai/Ternary-Bonsai-8B-PQ2_0.gguf"),
+        "alias": "bonsai-8b",
+        "bin": os.getenv("LLAMA_SERVER_BIN_PRISM", "/home/user/prism-llama/build/bin/llama-server"),
     },
     # Qwen3.6 35B-A3B: 35B total, ~3B active per token. Far too large for a 12 GB card
     # outright, so "cpu_moe" sends the expert tensors to system RAM (see
@@ -86,23 +101,8 @@ MODEL_REGISTRY: dict[str, dict] = {
     # Not downloaded by default: Q4_K_M is 22.66 GB, and it needs the RAM for the
     # offloaded experts on top of that. /health reports exists=false and the UI greys it
     # out until LLM_PATH_35B points at a real file.
-    # Bonsai 8B, ternary (1.58-bit) weights in Prism's PQ2_0 format. 8.2B parameters in
-    # 2.18 GB — and measured on the same zh corpus as the entries above, PPL 16.518
-    # against the 2B's 16.738 and the 4B's 13.027. So a ternary 8B lands roughly where a
-    # 2B Q8 does: the compression is real and so is the quality cost per parameter.
-    #
-    # Needs Prism's llama.cpp fork ("bin" below). Their Q2_0 reuses upstream's
-    # GGML_TYPE_Q2_0 id with a different block layout, so mainline refuses the file. Note
-    # the HF repo also ships a plain *-Q2_0.gguf which is their LEGACY group-128 layout
-    # and fails even on the fork; PQ2_0 is the current one.
-    "bonsai-8b-ternary": {
-        "label": "Bonsai 8B ternary PQ2_0",
-        "path": os.getenv("LLM_PATH_BONSAI_8B", "/home/user/llms/bonsai/Ternary-Bonsai-8B-PQ2_0.gguf"),
-        "alias": "bonsai-8b",
-        "bin": os.getenv("LLAMA_SERVER_BIN_PRISM", "/home/user/prism-llama/build/bin/llama-server"),
-    },
     "qwen3.6-35b-a3b-q4": {
-        "label": "Qwen3.6 35B-A3B UD-Q4_K_M (experts in RAM)",
+        "label": "Qwen3.6 35B-A3B · Q4_K_M",
         "path": os.getenv("LLM_PATH_35B", "/home/user/llms/mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"),
         "alias": "qwen3.6-35b-a3b",
         "cpu_moe": True,

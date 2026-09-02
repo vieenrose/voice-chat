@@ -545,13 +545,18 @@
         </div>
         <div class="model-picker">
           <label for="llm-select" class="subtle" style="display:block; margin-bottom:4px">語言模型（文字）</label>
-          <div style="display:flex; gap:8px">
-            <select id="llm-select" class="input" style="border-radius:8px" bind:value={selectedModelId} disabled={modelSwitching}>
+          <!-- min-width:0 on the select and flex-shrink:0 on the button: a flex item
+               defaults to min-width:auto, so a long option label ("Qwen3.6 35B-A3B
+               UD-Q4_K_M (experts in RAM)") widened the select past the row and pushed
+               the 載入 button out of view entirely. -->
+          <div style="display:flex; gap:8px; align-items:center">
+            <select id="llm-select" class="input" style="border-radius:8px; flex:1 1 auto; min-width:0"
+                    bind:value={selectedModelId} disabled={modelSwitching}>
               {#each llmModels as m}
                 <option value={m.id} disabled={!m.exists}>{m.label}{m.id===currentModelId ? '（已載入）' : ''}{!m.exists ? ' — 檔案不存在' : ''}</option>
               {/each}
             </select>
-            <button class="ghost" onclick={switchModel} disabled={modelSwitching || !selectedModelId || selectedModelId===currentModelId}>{modelSwitching ? '載入中…' : '載入'}</button>
+            <button class="ghost" style="flex:0 0 auto; white-space:nowrap" onclick={switchModel} disabled={modelSwitching || !selectedModelId || selectedModelId===currentModelId}>{modelSwitching ? '載入中…' : '載入'}</button>
           </div>
           {#if modelSwitchStatus}<div class="subtle" style="margin-top:6px">{modelSwitchStatus}</div>{/if}
           <div class="subtle" style="margin-top:6px">切換模型會重新啟動語言模型伺服器——語音／文字回覆會暫停數秒，直到新模型載入完成。</div>
