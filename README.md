@@ -12,7 +12,7 @@ was asked in, with English kept only for proper nouns and untranslatable terms.
 flowchart LR
     Mic["🎤 Mic"] -->|OpenAI Realtime<br/>WebSocket / WebRTC| RT["Realtime server<br/>:8765"]
     RT --> VAD["Silero VAD v5<br/>+ Smart Turn v3.2"]
-    VAD --> STT["STT<br/>Paraformer · zh"]
+    VAD --> STT["(no STT stage)"]
     STT --> AG["LLM stage<br/>Qwen-Agent harness"]
     AG <--> LLM["llama-server :11435<br/>Qwen3.5 4B Q8_K_XL"]
     AG -->|native tool call| T{{"web_search · get_weather<br/>get_current_datetime"}}
@@ -116,68 +116,51 @@ fabricate without it. What it costs on the 9B:
 | weather | 6.49 s | 8.19 s |
 | search | 8.55 s | 11.23 s |
 
-### Native audio input (variant), and why STT stays the default
+### Native audio input is the default; there is no STT stage
 
-Gemma 4 can take speech directly, and the framework supports dropping STT entirely. HF ship a
-worked example of exactly this with the 12B; `s2s/deploy/{llm-audio,pipeline-audio}.sh` are that
-recipe applied to E4B, and it works end to end here:
+Gemma 4 takes speech as the prompt, and our own loop carries it — so unlike the framework's
+audio path, the tools come too. `s2s/deploy/pipeline.sh` runs `--stt none`; `pipeline-stt.sh`
+keeps the Paraformer route.
 
-```bash
-backend/s2s/deploy/llm-audio.sh        # llama-server + --mmproj (audio projector)
-backend/s2s/deploy/pipeline-audio.sh   # --stt none, audio straight to the model
-```
+Spoken tool questions route from audio alone, with no text hint:
 
-| spoken input | reply | first audio after speech ended |
+| spoken | tool called | first audio after speech ended |
 |---|---|---|
-| 我想預約明天下午三點的會議室 | 好的我幫您預約明天下午三點的會議室 | 2.07 s |
-| 今天台北的天氣晴朗，氣溫大約二十八度 | 今天台北的天气晴朗气温大约是28度 | 0.87 s |
+| 請問現在是幾點鐘了呢？ | `get_current_datetime` | 4.3 s |
+| 今天台北天氣如何？ | `get_weather` | 5.6 s |
+| 今天有什麼新聞？ | `web_search` | — |
 
-It comprehends zh directly, transcribes it exactly (`欢迎大家来体验达摩院推出的语音识别模型。`
-verbatim on the ASR probe, 0.28 s for 5.5 s of audio with thinking off), keeps working under
-barge-in, and removes a real failure mode — in an exported session X-ASR heard "huggingface" as
-"huninface" and the model answered about Huawei.
+This is what the framework's own `--stt none` path cannot do: it delivers audio on
+`GenerateResponseRequest.audio`, which only its chat-completions stage reads, and that stage
+knows nothing about our tools. `agent_handler` converts the VAD segment to an `input_audio`
+content part and `native_loop` sends it with the tool schemas — the loop, the validation and the
+sanitising are identical whether the prompt is text or speech. Removing the framework meant
+removing this obstacle too.
 
-**The model can call tools from speech; this wiring cannot.** That distinction matters, so it is
-worth separating. Given audio as the whole prompt, no text hint, and the three tools declared,
-E4B routes them correctly:
+It also removes a real failure mode: X-ASR once heard "huggingface" as "huninface" and the model
+answered about Huawei. There is no transcription step left to corrupt.
 
-| spoken question | tool called | thinking off / on |
-|---|---|---|
-| 今天台北天氣如何？ | `get_weather` | 0.32 s / 0.45 s |
-| 今天有什麼新聞？ | `web_search` | 0.19 s / 0.55 s |
-| 請問現在是幾點鐘了呢？ | `get_current_datetime` | 0.22 s / 0.37 s |
+**One rule had to go for this to work.** A small-talk instruction — "if the user is greeting you
+or making small talk, reply conversationally, do NOT call a tool" — was added when a 2 B model
+answered "how are you?" by calling the clock. On Gemma it misfired precisely on speech, because
+polite phrasing looks like small talk and speech is full of it: a spoken 請問現在是幾點鐘了呢？ was
+answered 「是啊，時間過得真快呢」 with no clock call. Removed rather than tuned, and the model needs
+no substitute — 你好 / 謝謝你的幫忙 / 你今天過得如何？ / 早安 all correctly call nothing, while all
+three tool questions still route.
 
-(One earlier failure here was a bad test clip, not the model: a TTS rendering of 現在幾點？ came out
-at 3.6 s for five characters and was heard as `当 dual 都流從處不錯`. Re-recorded, it routes.)
-
-What loses the tools is the *plumbing*, not the model. `--stt none` delivers audio on
-`GenerateResponseRequest.audio`, which only the framework's own chat-completions stage reads, and
-the Qwen-Agent stage that owns our tools is text-only. So this variant runs with no `web_search`,
-`get_weather` or `get_current_datetime` — like the upstream example — and the result is
-immediate:
-
-| | native-audio variant | default pipeline |
-|---|---|---|
-| 現在幾點？ | 現在是下午兩點四十五分 — **fabricated**, actual 23:04 | correct, from the clock tool |
-| 今天台北天氣如何？ | 我會查一下台北的今天天氣 — an empty promise | a real forecast |
-
-A confidently wrong time is the exact failure this project spends most of its effort avoiding, so
-the tool-capable path stays default.
+**Known gap:** with no STT there is no user transcript, so the user's own bubble stays empty and
+the debug export has no `rawStt`. The assistant side is unaffected. `pipeline-stt.sh` is the
+fallback if the transcript matters more than the accuracy.
 
 Other limits, measured rather than assumed. The "30 seconds" in Google's card is **per utterance,
 not per session**: five consecutive audio turns worked fine, growing the prompt by ~185 tokens
 each, and a single clip produced no error at any length — 25 s and 40 s transcribed completely,
 while at 60 s the tail was silently dropped, which is worse than an error because nothing says so.
 Audio costs ~26 prompt tokens per second of speech against 27 for the same words as text, so
-~82 minutes of retained audio would fill E4B's 128 K window; `--responses_api_audio_history_turns`
-bounds that. And Google's own audio evaluation for the **12B excludes Chinese** (the footnote on
-its CoVoST and FLEURS figures) while E4B's — FLEURS 0.08, CoVoST 35.54 — carries no such
-exclusion, so for zh the smaller model is the better-evidenced one.
-
-Since the model handles audio *and* tools in a single call, the way to get both is to teach our
-LLM stage to forward `request.audio` with the tool schemas and run the call→observe loop on the
-result — dropping Paraformer and keeping the tools, with no separate ASR step. Untried;
-`s2s/checks/` has no coverage for the audio path, so that is where it should start.
+~82 minutes of retained audio would fill E4B's 128 K window. And Google's own audio evaluation for
+the **12B excludes Chinese** (the footnote on its CoVoST and FLEURS figures) while E4B's — FLEURS
+0.08, CoVoST 35.54 — carries no such exclusion, so for zh the smaller model is the better-evidenced
+one.
 
 ### Barge-in
 
@@ -286,7 +269,7 @@ The language instruction is stated once, in the system prompt, never appended to
 |---|---|---|
 | **Orchestrator** | `speech-to-speech` 0.2.12 | OpenAI Realtime server on `:8765`, WebSocket + WebRTC |
 | **Turn-taking** | Silero VAD v5 + Smart Turn v3.2 | local ONNX; speculative turns with revisions |
-| **STT** | Paraformer (FunASR) | Chinese-oriented; `pip install "speech-to-speech[paraformer]"` |
+| **STT** | none — Gemma 4 native audio | the model takes speech as the prompt; Paraformer available via `pipeline-stt.sh` |
 | **LLM** | OpenRouter (353 tool-capable models) or `Qwen3.5-9B-Q4_K_M` | provider chosen in the UI; local llama-server `:11435` with MTP is the offline fallback |
 | **Agent** | own loop (`agent/native_loop.py`) | custom s2s LLM stage, native tool calls, 3-step ceiling |
 | **TTS** | `Qwen3-TTS-12Hz CustomVoice` Q8_0 | stock s2s handler on GGML CUDA, ~20-80 ms TTFA |

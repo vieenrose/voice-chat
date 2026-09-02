@@ -34,7 +34,7 @@
 
   const PIPELINE = $derived([
     ['VAD', 'Silero v5 + Smart Turn v3.2'],
-    ['STT', 'Paraformer（FunASR）'],
+    ['STT', '無（Gemma 4 原生語音輸入）'],
     ['LLM', llmCfg ? llmCfg.model : '無法取得（伺服器未啟動？）'],
     ['Agent', '自建工具迴圈 · 原生工具呼叫（3 工具，上限 3 步）'],
     ['TTS', 'Qwen3-TTS 12Hz · GGML 24k'],

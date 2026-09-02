@@ -28,6 +28,7 @@ import threading
 from collections.abc import Iterator
 from typing import Any
 
+from agent.native_loop import audio_content
 from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.pipeline.handler_types import LLMIn, LLMOut
 from speech_to_speech.pipeline.messages import EndOfResponse, LLMResponseChunk
@@ -112,6 +113,16 @@ class AgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
             return True
         return not self._turn_output_allowed(req.turn_id, req.turn_revision)
 
+    @staticmethod
+    def _audio_prompt(audio, sample_rate: int):
+        """The spoken turn, as content parts the loop can pass straight through."""
+        import numpy as np
+
+        a = np.asarray(audio)
+        if a.dtype.kind == "f":                      # VAD hands over float32 in [-1, 1]
+            a = (np.clip(a, -1.0, 1.0) * 32767).astype(np.int16)
+        return [audio_content(a.astype("<i2").tobytes(), sample_rate)]
+
     # -- prompt / history ------------------------------------------------
     @staticmethod
     def _history_and_prompt(req: LLMIn) -> tuple[list[dict], str]:
@@ -163,6 +174,13 @@ class AgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
     def process(self, request: LLMIn) -> Iterator[LLMOut]:
         gen = self.cancel_scope.generation if self.cancel_scope is not None else None
         history, prompt = self._history_and_prompt(request)
+        # With --stt none there is no transcript: the turn arrives as audio on the
+        # request, and the model takes it as the prompt. Our own loop carries it, so
+        # unlike the framework's audio path this keeps the tools -- E4B routes one
+        # from speech alone in 0.2-0.6 s.
+        audio = getattr(request, "audio", None)
+        if audio is not None and not prompt.strip():
+            prompt = self._audio_prompt(audio, getattr(request, "audio_sample_rate", 16000))
 
         def chunk(text: str) -> LLMResponseChunk:
             return LLMResponseChunk(
@@ -176,7 +194,8 @@ class AgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
                 cancel_generation=gen,
             )
 
-        if not prompt.strip():
+        # A spoken turn's prompt is a list of content parts, which has no .strip().
+        if not (prompt if isinstance(prompt, list) else prompt.strip()):
             logger.warning("empty prompt; nothing to answer")
             yield EndOfResponse(
                 turn_id=request.turn_id, turn_revision=request.turn_revision, cancel_generation=gen

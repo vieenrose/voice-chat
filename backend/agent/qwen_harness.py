@@ -391,15 +391,19 @@ def _thinking_on() -> bool:
     return os.getenv("LLM_AGENT_THINKING", "1").strip().lower() in ("1", "true", "yes")
 
 
-def _smalltalk_rule() -> str:
-    """The 2 B router will happily answer "how are you?" by calling get_current_datetime
-    (observed: "今天好，星期二上午 2 點 52 分，天氣晴朗。"). A direct instruction is the
-    cheapest fix, and it is measurable: the greeting scored 1/3 correct before it."""
-    if os.getenv("LLM_AGENT_NO_TOOL_SMALLTALK", "1").strip().lower() in ("0", "false", "no"):
-        return ""
-    return (" If the user is greeting you or making small talk, just reply conversationally — "
-            "do NOT call a tool for that. Only call a tool when the answer depends on something "
-            "you cannot know: the current date/time, the weather, or a changing fact. ")
+# No small-talk rule. There used to be one -- "if the user is greeting you or making
+# small talk, just reply conversationally, do NOT call a tool" -- added because the 2 B
+# model answered "how are you?" by calling get_current_datetime. On Gemma 4 E4B it is
+# both unnecessary and harmful:
+#
+#   without it   你好 / 謝謝你的幫忙 / 你今天過得如何？ / 早安  -> no tool, correctly
+#                現在幾點？ / 今天台北天氣如何？ / 今天有什麼新聞？ -> the right tool
+#   with it      a spoken 請問現在是幾點鐘了呢？ was read as small talk and answered
+#                「是啊，時間過得真快呢」 with no clock call at all
+#
+# Polite phrasing looks like small talk, and speech is full of polite phrasing, so the
+# rule misfired precisely on the input this demo takes. Removed rather than tuned: it
+# is the same steering-by-instruction the guard layer was removed for.
 
 
 def _endpoint() -> tuple[str, str, str]:
@@ -455,7 +459,7 @@ AGENT_SYSTEM_MESSAGE = (
 
 
 def system_message() -> str:
-    return "You are a helpful voice assistant." + _smalltalk_rule() + AGENT_SYSTEM_MESSAGE
+    return "You are a helpful voice assistant. " + AGENT_SYSTEM_MESSAGE
 
 
 _TOOLS: dict = {}

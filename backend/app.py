@@ -91,7 +91,6 @@ def _agent_config() -> dict:
     try:
         from agent import qwen_harness as _qh
         return {
-            "smalltalk_rule": _qh._smalltalk_rule() != "",
             "thinking": _qh._thinking_on(),
         }
     except Exception as e:                                    # harness absent (light image)
