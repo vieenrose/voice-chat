@@ -42,6 +42,15 @@ _CJK = re.compile(r"[\u4e00-\u9fff]")
 _LATIN = re.compile(r"[A-Za-z]")
 
 
+def _squash(s: str) -> str:
+    """Collapse whitespace and punctuation for "has this already been said?".
+
+    The harness whitespace-collapses and leakage-strips its final text while the
+    live deltas are raw, so a literal comparison diverges at the first newline.
+    """
+    return re.sub(r"[\s\u3000]+", "", s)
+
+
 def _worth_speaking(chunk: str) -> bool:
     """Whether a candidate chunk carries speech, rather than punctuation noise.
 
@@ -219,9 +228,32 @@ class QwenAgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
 
         Yields ("delta"|"reset"|"error", payload). Only spoken text is forwarded;
         reasoning and tool traffic are logged, never sent to TTS.
+
+        A "reset" clears the caller's unspoken buffer. It CANNOT unspeak: anything
+        already flushed to TTS has been heard. So every delta is checked against
+        what has gone out -- emitting the authoritative final answer wholesale
+        after a partial stream is what made answers arrive twice.
         """
         agen = self.llm.generate_chat_with_tools(history, prompt, max_new_tokens=self.max_new_tokens)
         last = ""
+        emitted = ""
+
+        def novel(text: str) -> str:
+            """The part of `text` not already sent downstream."""
+            nonlocal emitted
+            if not text:
+                return ""
+            if _squash(text) in _squash(emitted):
+                return ""
+            common = 0
+            for a, b in zip(emitted, text, strict=False):
+                if a != b:
+                    break
+                common += 1
+            tail = text[common:]
+            if tail:
+                emitted += tail
+            return tail
         try:
             while True:
                 try:
@@ -233,25 +265,22 @@ class QwenAgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
                     # text_so_far is authoritative: the harness rewrites it when it
                     # retracts a span, so a delta computed from it stays correct.
                     so_far = ev.get("text_so_far") or ""
-                    if so_far.startswith(last):
-                        delta, last = so_far[len(last):], so_far
-                    else:
-                        yield "reset", ""
-                        delta, last = so_far, so_far
+                    if not so_far.startswith(last):
+                        yield "reset", ""      # drop the buffer; what was said stands
+                    last = so_far
+                    delta = novel(so_far)
                     if delta:
                         yield "delta", delta
                 elif t == "llm_reset":
                     last = ""
                     yield "reset", ""
                 elif t == "llm_done":
-                    final = ev.get("text") or ""
-                    if final.startswith(last):
-                        tail = final[len(last):]
-                        if tail:
-                            yield "delta", tail
-                    elif final and final != last:
-                        yield "reset", ""
-                        yield "delta", final
+                    # The authoritative answer can be a filtered SUBSET of what
+                    # streamed (reasoning sentences dropped), so it is not
+                    # necessarily an extension of it. novel() covers both.
+                    tail = novel(ev.get("text") or "")
+                    if tail:
+                        yield "delta", tail
                     return
                 elif t == "tool_call":
                     logger.info("tool -> %s", ev.get("name"))

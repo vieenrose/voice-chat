@@ -62,8 +62,50 @@ class _Handler(QwenAgentLanguageModelHandler):
         self._loop = None
 
     def _drive(self, history, prompt):
+        """Replays scripted harness events through the REAL novel()/reset logic.
+
+        ("delta", t) is a live token batch (t is the new text); ("final", t) is the
+        authoritative llm_done text.
+        """
         self.seen = (history, prompt)
-        yield from self._events
+        scripted = [(k, v) for k, v in self._events]
+        if not any(k == "final" for k, _ in scripted):
+            yield from scripted
+            return
+        so_far = ""
+        real = QwenAgentLanguageModelHandler._drive
+
+        def fake_stream(_self, _h, _p):
+            nonlocal so_far
+            for kind, payload in scripted:
+                if kind == "delta":
+                    so_far += payload
+                    yield {"type": "llm_token", "text_so_far": so_far}
+                elif kind == "final":
+                    yield {"type": "llm_done", "text": payload}
+                    return
+
+        class Agen:
+            def __init__(self): self.it = fake_stream(None, None, None)
+            async def __anext__(self):
+                try:
+                    return next(self.it)
+                except StopIteration:
+                    raise StopAsyncIteration from None
+            async def aclose(self): pass
+
+        class LLM:
+            def generate_chat_with_tools(self, *a, **k): return Agen()
+
+        import asyncio as _a
+        import threading as _t
+        loop = _a.new_event_loop()
+        _t.Thread(target=loop.run_forever, daemon=True).start()
+        self.llm, self._loop = LLM(), loop
+        try:
+            yield from real(self, history, prompt)
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
 
 
 def build(events, chat_turns, cancel_scope=None):
@@ -154,6 +196,37 @@ class TestRetraction(unittest.TestCase):
                        [("user", "x")])
         spoken = [o.text for o in h.process(req) if isinstance(o, LLMResponseChunk)]
         self.assertEqual(spoken, ["答案是七。"], "retracted text must never be spoken")
+
+
+class TestNoDuplication(unittest.TestCase):
+    """The whole answer must never be spoken twice.
+
+    The harness streams live deltas, then hands back an authoritative final text
+    that is whitespace-collapsed and may be a filtered SUBSET of what streamed.
+    Treating that as "not a prefix, so emit it all" replayed the entire answer
+    after the user had already heard it.
+    """
+
+    def _spoken(self, events):
+        h, req = build(events, [("user", "x")])
+        return [o.text for o in h.process(req) if isinstance(o, LLMResponseChunk)]
+
+    def test_final_identical_to_stream_is_not_repeated(self):
+        spoken = self._spoken([("delta", "台北是首都。"), ("final", "台北是首都。")])
+        self.assertEqual(spoken, ["台北是首都。"])
+
+    def test_final_differing_only_in_whitespace_is_not_repeated(self):
+        spoken = self._spoken([("delta", "台北是首都。\n\n很熱鬧。"),
+                               ("final", "台北是首都。 很熱鬧。")])
+        self.assertEqual("".join(spoken).count("很熱鬧"), 1)
+
+    def test_final_extending_the_stream_speaks_only_the_tail(self):
+        spoken = self._spoken([("delta", "台北是首都。"), ("final", "台北是首都。很熱鬧。")])
+        self.assertEqual(spoken, ["台北是首都。", "很熱鬧。"])
+
+    def test_final_that_is_a_filtered_subset_adds_nothing(self):
+        spoken = self._spoken([("delta", "Let me think. 答案是台北。"), ("final", "答案是台北。")])
+        self.assertEqual("".join(spoken).count("答案是台北"), 1)
 
 
 class TestPromptExtraction(unittest.TestCase):
