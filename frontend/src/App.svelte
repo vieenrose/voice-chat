@@ -4,6 +4,18 @@
   import { MicCapture, Playback } from './lib/audio.js'
   import { toTW, zhtwReady } from './lib/zhtw.js'
 
+  // What the pipeline card shows. The server leaves session.model null, so the
+  // client cannot learn the model from the protocol -- these are declared here, in
+  // one place. Keep the LLM line in step with llm_manager.MODEL_REGISTRY, which is
+  // the source of truth.
+  const PIPELINE = [
+    ['VAD', 'Silero v5 + Smart Turn v3.2'],
+    ['STT', 'Paraformer（FunASR）'],
+    ['LLM', 'Qwen3.5 9B · Q4_K_M · MTP'],
+    ['Agent', 'Qwen-Agent · 原生工具呼叫（3 工具）'],
+    ['TTS', 'Qwen3-TTS 12Hz · GGML 24k'],
+  ]
+
   const INSTRUCTIONS =
     '你是一個親切的語音助理。一律使用繁體中文（台灣用語）回答，' +
     '無論問題用什麼語言提出；只有專有名詞或無法翻譯的術語才保留英文。回答要口語、簡潔。'
@@ -361,10 +373,9 @@
       <div class="card">
         <h3>管線</h3>
         <div style="font-size:12px; line-height:1.7; opacity:0.85">
-          <div><b>VAD</b> Silero v5 + Smart Turn v3.2</div>
-          <div><b>STT</b> Paraformer（FunASR）</div>
-          <div><b>LLM</b> Qwen3.5 4B Q8 · Qwen-Agent（3 工具）</div>
-          <div><b>TTS</b> Qwen3-TTS 12Hz · GGML 24k</div>
+          {#each PIPELINE as [k, v]}
+            <div><b>{k}</b> {v}</div>
+          {/each}
           <div class="subtle" style="margin-top:6px">
             打斷由伺服器的 CancelScope 處理；瀏覽器同時清掉已排程的音訊。
           </div>
