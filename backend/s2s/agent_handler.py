@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import threading
 from collections.abc import Iterator
@@ -81,6 +82,9 @@ class AgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
         self.max_new_tokens = max_new_tokens
         self.api_base, self.model_name = api_base, model_name
         self.llm = LingStreaming(api_base=api_base, model_name=model_name)
+        # Set by serve.py after the pipeline is built; see _give_stage_the_event_queue.
+        self.text_output_queue = None
+        self._xasr = None
 
         # The harness is async; this stage is a thread. One long-lived loop in a
         # daemon thread avoids paying event-loop setup on every single turn.
@@ -99,6 +103,9 @@ class AgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
 
         self.api_base, self.model_name = api_base, model_name
         self.llm = LingStreaming(api_base=api_base, model_name=model_name)
+        # Set by serve.py after the pipeline is built; see _give_stage_the_event_queue.
+        self.text_output_queue = None
+        self._xasr = None
         logger.info("LLM stage repointed at %s (%s)", api_base, model_name)
 
     # -- turn gating ----------------------------------------------------
@@ -112,6 +119,72 @@ class AgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
         if self.cancel_scope is not None and gen is not None and self.cancel_scope.is_stale(gen):
             return True
         return not self._turn_output_allowed(req.turn_id, req.turn_revision)
+
+    def _caption(self, audio, sample_rate: int, request) -> None:
+        """Transcribe with X-ASR purely so the UI has something to show.
+
+        OFF THE CRITICAL PATH, on purpose. It runs on a daemon thread and the turn
+        does not wait for it: a caption arriving late is a caption arriving late,
+        while a caption that delays first audio is a regression in the thing this
+        pipeline exists to be good at. Nothing downstream reads its result.
+
+        The model understands the speech directly, so a mistake here is cosmetic
+        rather than a wrong answer -- which is the whole point of the split. X-ASR
+        once heard "huggingface" as "huninface" and the old pipeline answered about
+        Huawei, because the transcript *was* the prompt. Here it is only a caption.
+        """
+        q = self.text_output_queue
+        if q is None or os.getenv("S2S_CAPTION", "1").strip().lower() in ("0", "false", "no"):
+            return
+
+        def work() -> None:
+            try:
+                import numpy as np
+
+                if self._xasr is None:
+                    from stt.xasr_streaming import StreamingXASR
+
+                    # CPU on purpose. Nothing awaits this thread, so it cannot delay
+                    # the turn by blocking -- but on CUDA it would contend with the
+                    # LLM and TTS for the same SMs and VRAM on a 12 GB card, which is
+                    # a cost that does not show up as "waiting". The caption is a
+                    # 146 M encoder and this box has 20 idle cores.
+                    self._xasr = StreamingXASR(device=os.getenv("S2S_CAPTION_DEVICE", "cpu"))
+                    # Measured: a concurrent decode cost ~0.3 s of median
+                    # first-audio latency by competing for cores. A caption has no
+                    # deadline, so it is pinned to CPU and left at the recogniser's
+                    # own modest thread count rather than given the GPU.
+                rec = getattr(self._xasr, "recognizer", None)
+                if rec is None:
+                    return                      # no sherpa backend: skip silently
+                a = np.asarray(audio, dtype=np.float32)
+                if a.dtype.kind != "f" or a.max(initial=0) > 1.5:
+                    a = a.astype(np.float32) / 32768.0
+                # A fresh stream per utterance: the shared one carries decoder state
+                # across turns and would splice the previous caption onto this one.
+                stream = rec.create_stream()
+                stream.accept_waveform(sample_rate, a)
+                stream.input_finished()
+                while rec.is_ready(stream):
+                    rec.decode_stream(stream)
+                text = (rec.get_result(stream) or "").strip()
+                if not text:
+                    return
+                # PARTIAL, not completed. A completed transcription is handled by
+                # RealtimeService, which adds the text to the Chat as a user message
+                # -- i.e. it enters the main pipeline and reaches the model on the
+                # next turn. A partial is emitted to the client and mutates no state
+                # at all (handlers/conversation.py: on_partial_transcription touches
+                # the chat zero times), which is what "caption only" has to mean.
+                from speech_to_speech.pipeline.events import PartialTranscriptionEvent
+
+                q.put(PartialTranscriptionEvent(
+                    delta=text, turn_id=request.turn_id,
+                    turn_revision=request.turn_revision))
+            except Exception:
+                logger.exception("X-ASR caption failed (the turn is unaffected)")
+
+        threading.Thread(target=work, daemon=True, name="xasr-caption").start()
 
     @staticmethod
     def _audio_prompt(audio, sample_rate: int):
@@ -179,8 +252,17 @@ class AgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
         # unlike the framework's audio path this keeps the tools -- E4B routes one
         # from speech alone in 0.2-0.6 s.
         audio = getattr(request, "audio", None)
-        if audio is not None and not prompt.strip():
-            prompt = self._audio_prompt(audio, getattr(request, "audio_sample_rate", 16000))
+        if audio is not None:
+            sr = getattr(request, "audio_sample_rate", 16000)
+            # The caption lands in the Chat as a user text message, so overriding
+            # `prompt` with audio afterwards is what keeps the model on the speech.
+            # Without that, the caption would silently become the prompt and this
+            # would be an ordinary STT pipeline again -- and because the caption is
+            # published asynchronously, whether it arrived first would decide the
+            # behaviour. Overriding makes the outcome the same either way.
+            # Fire-and-forget: the caption must never delay the turn.
+            self._caption(audio, sr, request)
+            prompt = self._audio_prompt(audio, sr)
 
         def chunk(text: str) -> LLMResponseChunk:
             return LLMResponseChunk(

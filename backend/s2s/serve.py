@@ -153,6 +153,29 @@ def _install_vram_route() -> None:
     _wsr.create_app = create_app
 
 
+def _give_stage_the_event_queue() -> None:
+    """Let our LLM stage publish transcription events.
+
+    With --stt none there is no STT stage, so nothing produces the user transcript
+    the UI shows. Our stage can produce one -- it has the audio -- but publishing it
+    needs `text_output_queue`, which the builder passes only to LMOutputProcessor.
+    Wrapping the builder to hand the same queue to our stage is smaller than
+    threading it through get_llm_handler, whose signature is upstream's.
+    """
+    upstream = s2s_pipeline._build_pipeline_handlers
+
+    def build(*args, **kwargs):
+        handlers = upstream(*args, **kwargs)
+        q = kwargs.get("text_output_queue")
+        for h in handlers:
+            if isinstance(h, AgentLanguageModelHandler):
+                h.text_output_queue = q
+                logger.info("LLM stage can publish transcription events")
+        return handlers
+
+    s2s_pipeline._build_pipeline_handlers = build
+
+
 _upstream_get_llm_handler = s2s_pipeline.get_llm_handler
 
 
@@ -193,6 +216,7 @@ def _get_llm_handler(
 
 def main() -> None:
     _neutralize_mps_empty_cache()
+    _give_stage_the_event_queue()
     _install_vram_route()
     logger.info("LLM endpoint: %s (%s)", LLM_API_BASE, LLM_MODEL_NAME)
     s2s_pipeline.get_llm_handler = _get_llm_handler

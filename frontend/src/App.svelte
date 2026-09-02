@@ -170,8 +170,22 @@
       if (text.trim()) turns = [...turns, { role: 'user', text: toTW(text), raw: text }]
       scroll()
     },
+    // The caption arrives as a partial and never completes: it is produced off the
+    // pipeline by X-ASR purely for display, so no transcription.completed follows.
+    // Promote it to a real turn when the assistant starts answering, or it would sit
+    // as transient italic text and be overwritten by the next utterance.
+    promotePartial() {
+      const t = userPartial.trim()
+      if (!t) return
+      userPartial = ''
+      turns = [...turns, { role: 'user', text: t, raw: t, caption: true }]
+      scroll()
+    },
     onResponseStart() { responding = true; lastStatus = '' },
-    onAssistantText(t) { appendAssistant(t) },
+    onAssistantText(t) {
+      if (userPartial.trim()) handlers.promotePartial()
+      appendAssistant(t)
+    },
     onAudio(b64) {
       if (!firstAudioMs && tSpeechEnd) firstAudioMs = Math.round(performance.now() - tSpeechEnd)
       audioSeconds += play.push(b64)
@@ -452,7 +466,8 @@
         <h3>對話</h3>
         <div class="chat" bind:this={chatEl}>
           {#each turns as t}
-            <div class="bubble {t.role}" class:cancelled={t.cancelled}>{t.text}</div>
+            <div class="bubble {t.role}" class:cancelled={t.cancelled}
+                 title={t.caption ? 'X-ASR 字幕（僅供顯示，模型直接聽語音）' : null}>{t.text}</div>
           {/each}
           {#if userPartial}
             <div class="bubble user partial">{userPartial}</div>

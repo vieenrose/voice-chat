@@ -148,9 +148,25 @@ answered 「是啊，時間過得真快呢」 with no clock call. Removed rather
 no substitute — 你好 / 謝謝你的幫忙 / 你今天過得如何？ / 早安 all correctly call nothing, while all
 three tool questions still route.
 
-**Known gap:** with no STT there is no user transcript, so the user's own bubble stays empty and
-the debug export has no `rawStt`. The assistant side is unaffected. `pipeline-stt.sh` is the
-fallback if the transcript matters more than the accuracy.
+**The on-screen transcript comes from a side path.** X-ASR transcribes the same segment on a
+daemon thread purely so the UI has a caption; nothing downstream reads it, and the model never
+sees it. A mistake in it is cosmetic rather than a wrong answer — which is the point of the
+split, since X-ASR once heard "huggingface" as "huninface" and the old pipeline, where the
+transcript *was* the prompt, answered about Huawei.
+
+Two details make it genuinely free, and the second was measured the hard way:
+
+- It runs on **CPU** and nothing awaits the thread. Its result reaches the client at ~0.9 s after
+  speech ends, well before first audio.
+- It is published as a **partial** transcription, not a completed one. A completed transcription
+  is handled by `RealtimeService`, which adds the text to the `Chat` as a user message — so it
+  enters the main pipeline and reaches the model on the following turn. That cost **0.3 s of
+  median first-audio latency** (2.44 s against a 2.12 s baseline). A partial mutates no state at
+  all, and the cost disappears: 2.07 s median, i.e. the baseline. "Off the critical path" was not
+  enough; it had to be out of the pipeline's *state* too.
+
+`S2S_CAPTION=0` turns it off; `pipeline-stt.sh` is the older route where Paraformer feeds the
+model directly.
 
 Other limits, measured rather than assumed. The "30 seconds" in Google's card is **per utterance,
 not per session**: five consecutive audio turns worked fine, growing the prompt by ~185 tokens
@@ -269,7 +285,7 @@ The language instruction is stated once, in the system prompt, never appended to
 |---|---|---|
 | **Orchestrator** | `speech-to-speech` 0.2.12 | OpenAI Realtime server on `:8765`, WebSocket + WebRTC |
 | **Turn-taking** | Silero VAD v5 + Smart Turn v3.2 | local ONNX; speculative turns with revisions |
-| **STT** | none — Gemma 4 native audio | the model takes speech as the prompt; Paraformer available via `pipeline-stt.sh` |
+| **STT** | none on the main path | the model takes speech as the prompt; X-ASR runs beside it for the on-screen caption |
 | **LLM** | OpenRouter (353 tool-capable models) or `Qwen3.5-9B-Q4_K_M` | provider chosen in the UI; local llama-server `:11435` with MTP is the offline fallback |
 | **Agent** | own loop (`agent/native_loop.py`) | custom s2s LLM stage, native tool calls, 3-step ceiling |
 | **TTS** | `Qwen3-TTS-12Hz CustomVoice` Q8_0 | stock s2s handler on GGML CUDA, ~20-80 ms TTFA |
