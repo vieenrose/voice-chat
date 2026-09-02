@@ -154,6 +154,15 @@ answered 「是啊，時間過得真快呢」 with no clock call. Removed rather
 no substitute — 你好 / 謝謝你的幫忙 / 你今天過得如何？ / 早安 all correctly call nothing, while all
 three tool questions still route.
 
+**Endpointing is set for Mandarin, not for the example's English.** HF's example uses
+`--min_silence_ms 300`; at that setting an exported session showed VAD closing turns
+mid-question — segments of 0.75–2.04 s (mean 1.44) where the captions mark the cut exactly:
+喂，你好 arrived as 喂， 你 and 請問今天幾月幾號 as 請問今天幾月幾. The model then answered the
+fragment, so a date question came back as a Chongqing weather report — a routing failure that was
+really a truncation failure, since the same question typed routes to the clock every time.
+Mandarin has intra-sentence pauses longer than 300 ms. At **700 ms** the same utterance measures
+2.7 s and routes correctly. The cost is 400 ms of endpointing after the user stops speaking.
+
 **The on-screen transcript comes from a side path.** X-ASR transcribes the same segment on a
 daemon thread purely so the UI has a caption; nothing downstream reads it, and the model never
 sees it. A mistake in it is cosmetic rather than a wrong answer — which is the point of the
@@ -290,7 +299,7 @@ The language instruction is stated once, in the system prompt, never appended to
 | Layer | Model / Service | Notes |
 |---|---|---|
 | **Orchestrator** | `speech-to-speech` 0.2.12 | OpenAI Realtime server on `:8765`, WebSocket + WebRTC |
-| **Turn-taking** | Silero VAD v5 + Smart Turn v3.2 | local ONNX; speculative turns with revisions |
+| **Turn-taking** | Silero VAD v5 + Smart Turn v3.2 | local ONNX; speculative turns with revisions; `--min_silence_ms 700` for Mandarin |
 | **STT** | none on the main path | the model takes speech as the prompt; X-ASR runs beside it for the on-screen caption |
 | **LLM** | `gemma-4-E4B-it-qat-UD-Q4_K_XL` + MTP head | llama-server `:11435` with `--mmproj` for audio, `--jinja` for native tool calls |
 | **Agent** | own loop (`agent/native_loop.py`) | 3 tools, 3-step ceiling, arguments validated and results sanitised |

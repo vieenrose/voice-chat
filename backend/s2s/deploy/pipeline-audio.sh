@@ -24,7 +24,7 @@ exec python3 -m s2s.serve --mode realtime \
   --responses_api_api_key "none" \
   --responses_api_audio_content_type input_audio \
   --responses_api_stream \
-  --min_silence_ms 300 \
+  --min_silence_ms 700 \
   --tts qwen3 --qwen3_tts_backend ggml --qwen3_tts_language zh \
   --qwen3_tts_gguf_talker_path /tmp/qwen3_tts/talker_cv_q8.gguf \
   --qwen3_tts_gguf_codec_path  /tmp/qwen3_tts/codec.gguf \

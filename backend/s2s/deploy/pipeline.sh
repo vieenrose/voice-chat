@@ -14,6 +14,13 @@
 # Known gap: with --stt none there is no transcript, so the user's own bubble in
 # the UI stays empty and the debug export has no rawStt. The assistant side is
 # unaffected.
+# --min_silence_ms 700, not the 300 of HF's example. Measured from an exported
+# session, 300 ms ended turns mid-question on Mandarin: VAD segments came out at
+# 0.75-2.04 s (mean 1.44) and the captions show exactly where they were cut --
+# 喂，你好 became 喂， 你 and 請問今天幾月幾號 became 請問今天幾月幾. The model then
+# answered the fragment, so a date question got a Chongqing weather report.
+# Mandarin has intra-sentence pauses longer than 300 ms; this costs 400 ms of
+# endpointing after the user stops and buys whole utterances.
 export LLM_MODEL_ID=gemma-4-e4b-qat
 export LLM_API_BASE=http://127.0.0.1:11435/v1
 cd /home/user/voice-chat/backend
@@ -26,7 +33,7 @@ exec python3 -m s2s.serve --mode realtime \
   --responses_api_api_key "none" \
   --responses_api_audio_content_type input_audio \
   --responses_api_stream \
-  --min_silence_ms 300 \
+  --min_silence_ms 700 \
   --tts qwen3 --qwen3_tts_backend ggml --qwen3_tts_language zh \
   --qwen3_tts_gguf_talker_path /tmp/qwen3_tts/talker_cv_q8.gguf \
   --qwen3_tts_gguf_codec_path  /tmp/qwen3_tts/codec.gguf \
