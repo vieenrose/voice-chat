@@ -106,7 +106,10 @@ MODEL_REGISTRY: dict[str, dict] = {
 # (e.g. "qwen3.5-2b"), whereas this expects a MODEL_REGISTRY key (e.g. "qwen3.5-2b-q4");
 # reusing the same name would silently send the wrong "model" field to llama-server for
 # every tool-calling turn whenever this env var is set to pick a non-default boot model.
-DEFAULT_MODEL_ID = os.getenv("LLM_DEFAULT_MODEL_ID", "qwen3.5-2b-q4")
+# Bonsai 8B is the default by choice, not by metric: Qwen3.5 2B Q8 scores better on the
+# tokenizer-independent measure (0.9652 vs 1.0786 bits/byte) and uses half the VRAM.
+# Booting this entry also means booting Prism's llama.cpp fork (see its "bin").
+DEFAULT_MODEL_ID = os.getenv("LLM_DEFAULT_MODEL_ID", "bonsai-8b-ternary")
 
 
 def _alias_to_model_id(alias: str) -> Optional[str]:

@@ -1,6 +1,6 @@
 # Voice Chat — Streaming Speech-to-Speech with Tools
 
-**X-ASR-int8 → Qwen3.5-2B UD-Q8_K_XL+MTP (Qwen-Agent) → Qwen3-TTS.** Real models, no mocks, low latency.
+**X-ASR-int8 → Bonsai-8B ternary (Qwen-Agent) → Qwen3-TTS.** Real models, no mocks, low latency.
 
 A full-duplex voice chat demo: speak, interrupt it mid-sentence by voice *or* text, search the
 web, and hear the answer. **Traditional Chinese (Taiwan) by default** — input and output are
@@ -19,7 +19,7 @@ Mic 16k ─► endpoint detect ─► STT (X-ASR int8, 160ms) ─► LLM (Qwen3.
 |---|---|---|
 | **Turn-taking** | sherpa-onnx rule-based endpointing | trailing-silence rules drive `stt_final`; no separate VAD |
 | **STT** | `GilgameshWind/X-ASR-zh-en` int8 | Zipformer, 160 ms streaming, 146 M encoder, zh+en 16 k, CUDA |
-| **LLM** | `Qwen/Qwen3.5-2B` UD-Q8_K_XL + MTP (default) | llama-server `:11435`, `-c 16384`, thinking on, 3 tools. Switchable at runtime — see below |
+| **LLM** | `prism-ml/Ternary-Bonsai-8B` PQ2_0 (default) | llama-server `:11435`, `-c 16384`, thinking on, 3 tools. Switchable at runtime — see below |
 | **Embedding** | `granite-embedding-97m-multilingual` Q8_0 | 384 d, zh-TW+en, `:11434`, semantic rerank for paraphrases |
 | **TTS** | `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` Q8_0 | GGML CUDA via `qwentts-cpp-python`, true streaming, 24 k, ~20 ms TTFA |
 | **Search** | SearXNG `:8888` + wttr.in + Bing scrape | 180 engines, real results only — no curated mocks |
@@ -30,10 +30,14 @@ libraries installed; `/health` reports `mock` when a rung is reached.
 
 ### Switchable models
 
-`qwen3.5-2b-q4` (default), `qwen3.5-4b-q4` and `bonsai-8b-ternary`, selectable from the UI's
+`bonsai-8b-ternary` (default), `qwen3.5-2b-q4` and `qwen3.5-4b-q4`, selectable from the UI's
 Model card or `POST /api/model`. Only one is loaded at a time — VRAM on a 12 GB card is tight
 with embedding + TTS + STT resident. **Bare-metal only**: the compose setup runs the LLM in a
 fixed sibling container.
+
+**Bonsai 8B is the default, and that is a choice rather than a metric win** — Qwen3.5 2B at Q8
+scores better on the tokenizer-independent measure (0.9652 vs 1.0786 bits/byte) and uses half
+the VRAM. Switch to it if answer fidelity matters more than running a ternary model.
 
 **Bonsai 8B is ternary (1.58-bit)** — 8.2 B parameters in a 2.18 GB file, 118 tok/s, 3/4 on the
 UI prompts with all four tools routed correctly. Its raw perplexity of 16.518 appears to beat
@@ -43,14 +47,24 @@ this corpus into 131 k tokens against Qwen's 117 k. In bits per byte the 2B is c
 at Q8 — and pays for it in quality, rather than coming out ahead. The file size also oversells
 the footprint: 2.18 GB of weights still took 7.1 GB of VRAM at 16 k context.
 
-Bonsai 27B was measured and not registered — but not for the reason first reported. Its raw PPL
-of 24.214 looks disastrous next to the 8B's 16.518 and is mostly a tokenizer artifact; in bits
-per byte the two are near-tied (1.0917 vs 1.0786). Run through the real pipeline, where the
-agent's 200-token reasoning budget applies, it scores the same 3/4 as the 8B with all four tools
-routed correctly. What rules it out is latency and fit: **first audio 9.9-15.7 s** against the
-8B's 3.2-3.9 s, 34.9 tok/s, and 7.8 GB of VRAM that leaves ~1 GB of headroom once TTS and STT
-are resident. It also drifts into Simplified Chinese (总统, 帮, 吗). A model that answers well
-but takes fifteen seconds to start speaking is the wrong shape for a voice demo.
+**The rest of the Bonsai range was measured and rejected**, so the same ground isn't retrodden.
+All on the same zh corpus, bits per byte (lower is better):
+
+| Build | file | VRAM | bits/byte | tok/s | why not |
+|---|---|---|---|---|---|
+| **8B ternary** | 2.18 GB | 6.5 GB | 1.0786 | 118 | *the default* |
+| 4B ternary | 1.07 GB | 2.0 GB | 1.1787 | **184** | fastest and lightest of anything tested, and the quality floor — its sample answer invented 積極管 and leaked Simplified (晶体, 沉积) |
+| 27B ternary | 7.17 GB | 7.8 GB | 1.0917 | 34.9 | answers well (3/4, same as the 8B) but first audio runs **9.9–15.7 s**, and 7.8 GB leaves ~1 GB once TTS and STT are resident |
+| 27B 1-bit | 3.80 GB | 4.8 GB | 1.1653 | 36.7 | 2/4; answered a tech-news request with 今天是星期三。 and emitted raw deliberation as the answer |
+
+Two results worth carrying forward. **Halving the weights bought ~5 % throughput** (27B ternary
+→ 1-bit, 7.17 GB → 3.80 GB, 34.9 → 36.7 tok/s), not the ~2× a bandwidth-bound decoder would
+give: the 1-bit dequantization kernels are the bottleneck, so shrinking the file mostly costs
+quality without buying speed. And the 27B's raw PPL of 24.214 looks disastrous beside the 8B's
+16.518 but is **mostly a tokenizer artifact** — in bits per byte the two are near-tied.
+
+Bonsai also inverts the usual size/footprint intuition: the 8B's 2.18 GB of weights still take
+7.1 GB of VRAM at 16 k context, while the 27B 1-bit takes only 4.8 GB.
 
 It needs Prism's llama.cpp fork, which is why registry entries may carry a `"bin"` of their own:
 their `Q2_0` reuses upstream's `GGML_TYPE_Q2_0` type id with a different block layout, so
