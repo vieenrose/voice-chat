@@ -1,126 +1,198 @@
-# Voice Chat — Streaming Speech-to-Speech with Tools
+# Voice Chat — Streaming Speech-to-Speech with Tools, in zh-TW
 
-**X-ASR-int8 → Bonsai-8B ternary (Qwen-Agent) → Qwen3-TTS.** Real models, no mocks, low latency.
+**A fully local zh-TW voice agent on HuggingFace `speech-to-speech`.**
+Silero VAD + Smart Turn → Paraformer → Qwen3.5 4B (Qwen-Agent, real tools) → Qwen3-TTS,
+speaking the OpenAI Realtime protocol. No hosted API, no mocks, no cloud.
 
-Speak, interrupt it mid-sentence by voice *or* text, search the web, hear the answer.
-**Traditional Chinese (Taiwan) by default** — input and output are zh-TW whatever language the
-question was asked in, with English kept only for proper nouns and untranslatable terms.
+Speak, interrupt it mid-sentence, search the web, hear the answer.
+**Traditional Chinese (Taiwan) throughout** — replies are zh-TW whatever language the question
+was asked in, with English kept only for proper nouns and untranslatable terms.
 
 ```mermaid
 flowchart LR
-    Mic["🎤 Mic 16k"] --> EP["Endpoint detect<br/>sherpa-onnx"]
-    EP --> STT["STT<br/>X-ASR int8 · 160 ms"]
-    STT -->|stt_final| AG["Agent<br/>Qwen-Agent"]
-    AG <--> LLM["LLM :11435<br/>Bonsai-8B ternary"]
+    Mic["🎤 Mic"] -->|OpenAI Realtime<br/>WebSocket / WebRTC| RT["Realtime server<br/>:8765"]
+    RT --> VAD["Silero VAD v5<br/>+ Smart Turn v3.2"]
+    VAD --> STT["STT<br/>Paraformer · zh"]
+    STT --> AG["LLM stage<br/>Qwen-Agent harness"]
+    AG <--> LLM["llama-server :11435<br/>Qwen3.5 4B Q8_K_XL"]
     AG -->|tool call| T{{"web_search · get_weather<br/>get_current_datetime"}}
     T --> SX["SearXNG :8888<br/>+ wttr.in"]
     SX -.results.-> AG
-    AG -->|sentence| TTS["TTS<br/>Qwen3-TTS 24k"]
+    AG -->|sentence| TTS["Qwen3-TTS<br/>GGML · 24k"]
     TTS --> SPK["🔊 Speaker"]
-    STT -.->|"partial ⇒ barge-in"| CANCEL(["cancel turn"])
-    CANCEL -.-> TTS
+    VAD -.->|speech_started| CS(["CancelScope<br/>cancel + flush"])
+    CS -.-> AG
+    CS -.-> TTS
 
     classDef m fill:#1f2430,stroke:#7c5cff,color:#eee
     classDef s fill:#12281c,stroke:#3f9e6a,color:#eee
+    classDef f fill:#2a2033,stroke:#c07cff,color:#eee
     class STT,LLM,TTS,AG m
     class SX,T s
+    class RT,VAD,CS f
 ```
 
-Every reply carries a monotonic `turn_id`; a superseded turn's events are dropped client-side.
+## Built on HuggingFace speech-to-speech
+
+The orchestration is [`huggingface/speech-to-speech`](https://github.com/huggingface/speech-to-speech)
+(the pip package `speech-to-speech`), not hand-rolled. It owns the pipeline: VAD, endpointing,
+STT, TTS, the transport, and cancellation. Each stage is a `BaseHandler` in its own thread,
+joined by queues.
+
+Two things worth stating plainly, because both are easy to get wrong:
+
+- **`transformers.pipeline("speech-to-speech")` does not exist.** There is no such task
+  (v5 exposes `automatic-speech-recognition`, `text-to-audio`, `audio-classification`). The
+  framework here is the separate `speech-to-speech` package. An older orchestrator in
+  `backend/pipeline/` advertised a compatibility shim for that non-existent task; it is not
+  the live path.
+- **Every component is local.** HuggingFace supplies weights and the framework; nothing calls
+  a hosted API. The LLM runs on llama.cpp, TTS on GGML through `faster_qwen3_tts`, STT on
+  FunASR, VAD and Smart Turn on local ONNX.
+
+Components are kept **native to the framework** wherever one exists — Paraformer for Chinese
+STT, the stock Qwen3-TTS handler (pointed at GGUF weights already on disk), Silero VAD, Smart
+Turn. The single deliberate exception is the LLM stage.
+
+### Why the LLM stage is ours
+
+`speech-to-speech` can talk to any OpenAI-compatible server, including llama-server, and has
+its own tool-calling layer — so the stock `chat-completions` backend would work. The stage is
+replaced anyway (`backend/s2s/qwen_agent_handler.py`) so the turn is driven by **Qwen-Agent**,
+whose tool loop and prompt handling this project already depends on. Substituting the one
+factory function `s2s_pipeline.get_llm_handler` is enough; there is no fork to rebase.
+
+**Tools run server-side.** The Realtime protocol expects the *client* to execute a tool and
+post `function_call_output` back, which cannot work here: `web_search` talks to SearXNG on
+127.0.0.1 and the clock and weather tools are backend resources. Qwen-Agent's own
+call → observe loop stays intact and the browser receives ordinary assistant text.
+
+### Barge-in
+
+Handled by the framework's `CancelScope`, and it is structural rather than per-call-site: a
+generation counter that `BaseHandler.should_process_input` checks, so every stage inherits
+cancellation instead of each one remembering to. On `speech_started` the send loop cancels,
+flushes the queues, and drops output tagged with a superseded generation.
+
+Smart Turn v3.2 adds semantic endpointing on top: an ambiguous pause starts STT and the LLM
+speculatively, and if the user resumes, the turn is reopened as a new revision and the earlier
+work is discarded before it reaches the speaker.
+
+Measured: a 525-character answer (~40 s of speech) was cut **1.29 s** after the user started
+talking — `response.done status=cancelled reason=turn_detected` — which is Silero's detection
+window. Long answers were exactly the case the previous hand-written turn machine got wrong.
 
 ## Stack
 
 | Layer | Model / Service | Notes |
 |---|---|---|
-| **Turn-taking** | sherpa-onnx endpointing | trailing-silence rules drive `stt_final`; no separate VAD |
-| **STT** | `GilgameshWind/X-ASR-zh-en` int8 | Zipformer, 160 ms streaming, 146 M encoder, zh+en 16 k, CUDA |
-| **LLM** | `prism-ml/Ternary-Bonsai-8B` PQ2_0 (default) | llama-server `:11435`, `-c 16384`, thinking on, 3 tools |
-| **Embedding** | `granite-embedding-97m-multilingual` Q8_0 | 384 d, zh-TW+en, `:11434`, semantic rerank |
-| **TTS** | `Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice` Q8_0 | GGML CUDA, true streaming, 24 k, ~20 ms TTFA |
-| **Search** | SearXNG `:8888` + wttr.in + Bing scrape | 180 engines, real results only |
-| **Agent** | `qwen-agent` `Assistant` | `smolagents` / `PydanticAI` fallback harnesses |
-
-Every import ladder ends in a mock adapter, so `app.py --mock` starts with no model libraries
-installed; `/health` reports `mock` when a rung is reached.
-
-### HuggingFace speech-to-speech is NOT used by default
-
-Worth stating plainly, because the class name suggests otherwise. Nothing in the live path goes
-through HuggingFace's speech-to-speech abstraction:
-
-- **`HFSpeechToSpeechPipeline`** (`pipeline/speech_to_speech.py`) is the class the demo runs, but
-  only as *this project's* orchestrator — the STT pump, the `turn_id`/barge-in state machine,
-  sentence-level TTS flushing. The `HF` in the name is historical. It does expose an HF-style
-  one-shot `__call__(audio_array, sampling_rate)`, but nothing in the repo calls it, and it is
-  not equivalent to the live path: no streaming, no tools, no barge-in. Benchmark through it and
-  you are measuring a different system.
-- **`HF_OFFICIAL` mode** (`pipeline/hf_official.py`) is the real all-HF implementation —
-  Paraformer, transformers text-generation, `pipeline("text-to-speech")`, no llama.cpp or sherpa.
-  It is held to the same pump/`turn_id`/barge-in contract by `TestHFOfficialPipelineParity` and
-  is **off** (`HF_OFFICIAL = False`); the downloads are slow and buy nothing the faster runtimes
-  do not already give.
-
-What HuggingFace *does* provide here is **weights**: every model above is an HF Hub download,
-served through llama.cpp, sherpa-onnx and qwentts-cpp rather than through `transformers`. The
-`pipeline()` API appears only on fallback rungs — a whisper ASR fallback in `stt/xasr_streaming.py`
-and a SpeechT5 TTS fallback — which do not fire in a healthy deployment.
+| **Orchestrator** | `speech-to-speech` 0.2.12 | OpenAI Realtime server on `:8765`, WebSocket + WebRTC |
+| **Turn-taking** | Silero VAD v5 + Smart Turn v3.2 | local ONNX; speculative turns with revisions |
+| **STT** | Paraformer (FunASR) | Chinese-oriented; `pip install "speech-to-speech[paraformer]"` |
+| **LLM** | `Qwen3.5-4B-UD-Q8_K_XL` | llama-server `:11435`, MTP on, thinking on, 3 tools |
+| **Agent** | `qwen-agent` `Assistant` | custom s2s LLM stage; tools execute server-side |
+| **TTS** | `Qwen3-TTS-12Hz CustomVoice` Q8_0 | stock s2s handler on GGML CUDA, ~20-80 ms TTFA |
+| **Search** | SearXNG `:8888` + wttr.in | 180 engines, real results only |
+| **Embedding** | `granite-embedding-97m-multilingual` Q8_0 | 384 d, `:11434`, semantic rerank |
 
 ### Models
 
-Switchable from the UI's Model card or `POST /api/model`. One loads at a time — VRAM on a 12 GB
-card is tight with embedding + TTS + STT resident. **Bare-metal only**: compose runs the LLM in
-a fixed sibling container.
+One model, deliberately. `Qwen3.5 4B UD-Q8_K_XL` is the reference everything is validated
+against. Perplexity over 194 kB of non-repeating zh-TW Wikipedia prose — a deterministic
+measure, unlike the four-prompt UI matrix whose spread is noise:
 
-| Model | bits/byte | file | tok/s |
-|---|---|---|---|
-| Qwen3.5 4B UD-Q8_K_XL + MTP | **0.8793** | 6.07 GB | ~60 |
-| Qwen3.5 2B UD-Q8_K_XL + MTP | 0.9652 | 2.89 GB | 122 |
-| **Bonsai 8B ternary** (default) | 1.0786 | 2.18 GB | 118 |
+```
+2B  UD-Q8_K_XL 16.738   UD-Q4_K_XL 17.080   Q4_K_M 17.091
+4B  UD-Q8_K_XL 13.027   UD-Q4_K_XL 13.173
+```
 
-Bonsai is the default **by choice, not by metric** — the 2B scores better and uses half the
-VRAM. Switch to it if answer fidelity matters more than running a 1.58-bit model. Bonsai also
-inverts the usual size intuition: 2.18 GB of weights occupy 7.1 GB of VRAM at 16 k context.
+Dropped, all measured here: **Qwen3.5 2B** (the 4B is simply better and the VRAM is there);
+**Bonsai 8B ternary** (8.2 B params in 2.18 GB is real compression, but it lost to the 2B in
+tokenizer-independent bits/byte, 1.0786 vs 0.9652, and needed a second llama.cpp binary —
+Prism's fork — to load at all); **Ling 3.0 tiny** (no better, slower, more VRAM, and drifted
+into Simplified Chinese, which this demo must not do).
 
-**Bonsai needs Prism's llama.cpp fork**, which is why a registry entry may carry its own `"bin"`:
-their `Q2_0` reuses upstream's `GGML_TYPE_Q2_0` id with a different block layout, so mainline
-refuses the file. Build the `prism` branch with `-DGGML_CUDA=ON` (their README says CPU/Metal
-only — out of date) and point `LLAMA_SERVER_BIN_PRISM` at it. Set `TMPDIR` to a real disk first
-or nvcc hits the `/tmp` quota. The HF repo also ships a plain `*-Q2_0.gguf` in a *legacy*
-group-128 layout that fails even on the fork; `PQ2_0` is the current one.
+For integration convenience the framework also accepts `--llm_backend transformers`, which
+would run int8 safetensors in-process instead of llama.cpp.
+
+### A minimal harness
+
+The harness declares three real tools, a system prompt, and the agent loop. Nothing inspects
+the model's answer to decide what it "should" have done.
+
+It used to. A layer of hand-written Chinese regexes read each answer and then re-ran tools,
+spliced results in, rewrote sentences, or forced a tool before the model had spoken. Measured
+against the 4B it cost more than it bought — `現在幾點？` took **28.9 s** and the model read its
+own deliberation aloud, because it was narrating the tool result the pre-flight had injected
+rather than answering. Without the layer the same question is correct in **3.3 s**. Steering by
+regex also made the routing metric measure the guard instead of the model.
+
+The one behaviour worth keeping became a tool default rather than a guard:
+`get_current_datetime` defaulted to UTC, so an unargumented call — the common case — announced
+"早上 05:42 (UTC)" to a user for whom it was 13:42 in Taipei. It now defaults to `VOICE_TZ`.
+
 
 ## Quick Start
 
 ```bash
-# 1) Embedding
-llama-server -m granite-embedding-97M-multilingual-r2-Q8_0.gguf \
-  --host 127.0.0.1 --port 11434 -c 8192 --alias granite-embedding --embedding --pooling mean --n-gpu-layers 99
-
-# 2) LLM — optional; the backend spawns and owns this itself if :11435 is free, or adopts it.
-#    Note the binary: the default model is Bonsai, which mainline llama.cpp cannot read.
-/home/user/prism-llama/build/bin/llama-server -m /home/user/llms/bonsai/Ternary-Bonsai-8B-PQ2_0.gguf \
-  --host 127.0.0.1 --port 11435 -c 16384 --alias bonsai-8b --n-gpu-layers 99 --jinja \
-  --reasoning-format deepseek
-
-# 3) Search
+# 1) Search backend (tools)
 SEARXNG_SETTINGS_PATH=/tmp/searxng/settings.yml python3 -m searx.webapp   # :8888
 
-# 4) Backend + 5) Frontend
-cd backend && python3 app.py --port 8000        # http://127.0.0.1:8000/health
-cd frontend && npm install && npm run dev       # http://localhost:5173
-# prod: npm run build — the backend serves frontend/dist at /
+# 2) LLM
+llama-server -m /home/user/llms/mtp/Qwen3.5-4B-UD-Q8_K_XL.gguf \
+  --host 127.0.0.1 --port 11435 -c 8192 --alias qwen3.5-4b \
+  --n-gpu-layers 99 --jinja --reasoning-format deepseek
+
+# 3) The speech-to-speech pipeline, with Qwen-Agent as its LLM stage
+cd backend && python3 -m s2s.serve --mode realtime \
+  --ws_host 127.0.0.1 --ws_port 8765 \
+  --stt paraformer --language zh \
+  --model_name qwen3.5-4b \
+  --responses_api_base_url http://127.0.0.1:11435/v1 --responses_api_api_key none \
+  --tts qwen3 --qwen3_tts_backend ggml --qwen3_tts_language zh \
+  --qwen3_tts_gguf_talker_path /tmp/qwen3_tts/talker_cv_q8.gguf \
+  --qwen3_tts_gguf_codec_path  /tmp/qwen3_tts/codec.gguf \
+  --enable_live_transcription
 ```
 
-Model files: LLM `/home/user/llms/bonsai/Ternary-Bonsai-8B-PQ2_0.gguf` and
-`/home/user/llms/mtp/Qwen3.5-{2B,4B}-UD-Q8_K_XL.gguf` · Embedding `/tmp/granite-emb-gguf/…Q8_0.gguf` ·
-TTS `/tmp/qwen3_tts/talker_cv_q8.gguf` + `codec.gguf` · STT `/tmp/XASR/deployment/models/chunk-160ms-model/` ·
-SearXNG `/tmp/searxng/settings.yml`.
+Then talk to it — any OpenAI Realtime client works, including the framework's own:
+
+```bash
+speech-to-speech talk --url ws://127.0.0.1:8765/v1/realtime
+```
+
+Or check it without a microphone:
+
+```bash
+cd backend
+python3 -m s2s.checks.turn "台灣的首都是哪裡？"   # one turn: transcript + latencies
+python3 -m s2s.checks.bargein                     # interrupt a long answer with real audio
+```
+
+Dependencies beyond `requirements.txt`:
+
+```bash
+pip install "speech-to-speech[paraformer]"    # Paraformer STT through FunASR
+```
+
+Weights are pulled from the Hub on first use (Silero VAD, Smart Turn v3.2, Paraformer) except
+the two already on disk: LLM `/home/user/llms/mtp/Qwen3.5-4B-UD-Q8_K_XL.gguf`, TTS
+`/tmp/qwen3_tts/talker_cv_q8.gguf` + `codec.gguf`. Embedding
+`/tmp/granite-emb-gguf/…Q8_0.gguf` · SearXNG `/tmp/searxng/settings.yml`.
 
 > **`/tmp` here is tmpfs — it is RAM, and it enforces a quota.** A multi-GB write fails partway
 > with `Disk quota exceeded` even though `df` shows free space. Put new weights on a real disk
 > and point the matching `LLM_PATH_*` at them.
 
+### The earlier pipeline
+
+`backend/app.py` (`:8000`) still serves the hand-rolled FastAPI/WebSocket stack and the Svelte
+UI, on X-ASR streaming STT and its own turn machine. It is the thing the speech-to-speech
+pipeline replaces; keep it for comparison, not for new work.
+
 ```bash
-docker compose up -d --build     # UI at http://localhost:8000
+cd backend  && python3 app.py --port 8000
+cd frontend && npm install && npm run dev
 ```
 
 ## Features
@@ -137,6 +209,27 @@ docker compose up -d --build     # UI at http://localhost:8000
 - **Low latency.** Svelte 5 + AudioWorklet + binary WS, whole-sentence TTS flush, 0.6 s pre-roll.
 
 ## Measured (RTX 3060, live stack)
+
+### speech-to-speech pipeline · Qwen3.5 4B Q8 · minimal harness
+
+End to end over the Realtime protocol, fully local, cold client each time:
+
+| Prompt | First audio | Total |
+|---|---|---|
+| 台灣的首都是哪裡？ | 2.55 s | 2.94 s |
+| 現在幾點？ (clock tool) | 3.32 s | 4.24 s |
+| 你好 | 1.70 s | 2.18 s |
+| 今天台北天氣如何？ (search tool) | 7.1–10.2 s | 11.7–20.2 s |
+
+Qwen3-TTS time-to-first-audio is 0.02–0.08 s at RTF 0.2–0.25, so a tool turn's latency is the
+search round-trip, not synthesis. **Barge-in: a 525-character answer cancelled 1.29 s after the
+user started speaking** (`status=cancelled reason=turn_detected`), which is Silero's window.
+
+Removing the regex guard layer moved the clock turn from 28.9 s — with the model reading its
+own deliberation aloud — to 4.2 s and correct. Fixing the latin-centric `len > 2` candidate
+filter took short Chinese answers from 3-of-6 replaced by an apology to 8-of-8 answered.
+
+### Earlier pipeline (`app.py`, X-ASR + hand-rolled turn machine)
 
 | Metric | Value |
 |---|---|
@@ -241,7 +334,9 @@ rather than each waiting out its own timeout.
 | `WS_ALLOW_ANY_ORIGIN` | off | opt out of the WebSocket Origin gate |
 | `SEARXNG_URL` | `http://localhost:8888` | search backend |
 | `LLM_API_BASE`, `LLM_PORT`, `LLM_CTX`, `LLM_DEFAULT_MODEL_ID`, `LLM_PATH_*` | see `llm_manager.py` | LLM subprocess |
-| `LLAMA_SERVER_BIN_PRISM` | `/home/user/prism-llama/build/bin/llama-server` | fork the Bonsai entry runs on — **required for the default model** |
+| `VOICE_TZ` | `Asia/Taipei` | timezone `get_current_datetime` reports when the model passes none |
+| `S2S_LLM_API_BASE` / `S2S_LLM_MODEL_NAME` | `…:11435/v1` / `qwen3.5-4b` | which llama-server the speech-to-speech LLM stage talks to |
+| `S2S_USE_UPSTREAM_LLM` | unset | `1` runs the stock s2s LLM stage instead of Qwen-Agent |
 | `LLM_MTP` / `LLM_MTP_DRAFT_N` | `1` / `3` | self-speculative decoding on MTP weights |
 | `LLM_SEED` / `LLM_AGENT_SEED` | random / unset | reproducible runs |
 | `LLM_AGENT_TEMP`, `LLM_AGENT_TOP_P` | `0.7`, `0.9` | agent-turn sampling |
@@ -312,5 +407,6 @@ transcript.
 
 ## License
 
-Code Apache-2.0. Models: Qwen3.5, Qwen3-TTS, Granite-embedding-97M, X-ASR-int8, Bonsai
-(Apache-2.0); SearXNG AGPL-3.0.
+Code Apache-2.0. Models: Qwen3.5, Qwen3-TTS, Granite-embedding-97M, X-ASR-int8, Paraformer,
+Silero VAD, Smart Turn v3.2 (Apache-2.0/MIT); SearXNG AGPL-3.0.
+Orchestration: [huggingface/speech-to-speech](https://github.com/huggingface/speech-to-speech).
