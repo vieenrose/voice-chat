@@ -86,31 +86,34 @@ answer — which is safe because native calls cannot be crowded out.
 flag `--reasoning-budget` does work and is deliberately unused, because capping thinking takes the
 tool-call decision with it (5/12 weather turns at 200).
 
-### Thinking is off
+### Thinking is on, and that is model-dependent
 
-Thinking existed to protect tool routing. Without it the model answered from the weights, and its
-failures were not misses but **fabrications** — 「東京天氣晴朗，平均溫度約25°C」 with no
-`get_weather` call. An invented temperature is a confident lie nobody notices, so the latency was
-worth paying.
+Native tool calls stop the model emitting a *malformed* call, but they cannot make it decide to
+call at all. That decision is what the thinking pass buys — and the bigger model needs it more,
+not less. Measured on the same fabrication set (foreign-city weather, news, incumbency, the clock,
+plus greetings that must *not* trigger a tool):
 
-Native tool calls removed the trade-off: the call is generated under grammar constraints, so the
-model cannot quietly answer instead of calling. With thinking off, measured on Qwen3.5 4B —
-**20/20** turns across the five demo shapes with every tool correctly routed, and **18/18** on a
-fabrication set (foreign-city weather, news, incumbency, plus greetings that must *not* trigger a
-tool) with zero fabrications and zero misses.
+| | fabrications |
+|---|---|
+| **9B Q4, thinking on** | **0 of 18** |
+| 9B Q4, thinking off | 5 of 18 |
+| 4B Q8, thinking off | 0 of 18 |
 
-What it buys is the thing a voice turn is judged on:
+With thinking off the 9B answers 今天幾號？ straight from its weights —
+「現在是 2024 年 5 月 22 日，星期三」 — with no `get_current_datetime` call. A confidently wrong date
+is worse than a slow one, and nothing downstream can catch it: the guard layer that once did is
+gone, deliberately.
 
-| Shape | ttft on → off | total on → off |
+So `LLM_AGENT_THINKING` defaults on, and turning it off is only safe on a model measured not to
+fabricate without it. What it costs on the 9B:
+
+| Shape | ttft p50 | total p50 |
 |---|---|---|
-| chat | 0.64 s → **0.19 s** | 0.83 s → **0.38 s** |
-| plain | 2.33 s → **0.24 s** | 2.68 s → **0.65 s** |
-| clock | 2.21 s → **0.72 s** | 2.91 s → **1.35 s** |
-| weather | 7.03 s → **3.12 s** | 10.19 s → **5.98 s** |
-| search | 8.12 s → **4.11 s** | 12.59 s → **9.11 s** |
-
-Thinking also scales with context, so its cost grows through a conversation: a clock question
-measured 2.2 s cold and 8.8 s six turns into a live session. `LLM_AGENT_THINKING=1` restores it.
+| chat | 1.12 s | 1.25 s |
+| plain | 2.08 s | 2.39 s |
+| clock | 2.24 s | 2.63 s |
+| weather | 6.49 s | 8.19 s |
+| search | 8.55 s | 11.23 s |
 
 ### Barge-in
 
@@ -168,7 +171,7 @@ The language instruction is stated once, in the system prompt, never appended to
 | **Orchestrator** | `speech-to-speech` 0.2.12 | OpenAI Realtime server on `:8765`, WebSocket + WebRTC |
 | **Turn-taking** | Silero VAD v5 + Smart Turn v3.2 | local ONNX; speculative turns with revisions |
 | **STT** | Paraformer (FunASR) | Chinese-oriented; `pip install "speech-to-speech[paraformer]"` |
-| **LLM** | `Qwen3.5-4B-UD-Q8_K_XL` | llama-server `:11435`, MTP on, thinking off, 3 tools |
+| **LLM** | `Qwen3.5-9B-Q4_K_M` | llama-server `:11435`, MTP on, thinking on, 3 tools |
 | **Agent** | `qwen-agent` `Assistant` | custom s2s LLM stage, native tool calls |
 | **TTS** | `Qwen3-TTS-12Hz CustomVoice` Q8_0 | stock s2s handler on GGML CUDA, ~20-80 ms TTFA |
 | **Search** | SearXNG `:8888` + wttr.in | 180 engines, real results only |
@@ -368,7 +371,7 @@ Tool routing and reasoning leaks: 0 failures and 0 leaks over all five shapes.
 | `S2S_USE_UPSTREAM_LLM` | unset | `1` runs the stock s2s LLM stage instead of Qwen-Agent |
 | `QWEN_AGENT_USE_RAW_API` | `true` | native tool calls; `false` uses qwen-agent's prompt dialect |
 | `LLM_AGENT_MAX_TOKENS` | `2048` | per-turn generation cap (thinking + tool call + answer) |
-| `LLM_AGENT_THINKING` | `0` | thinking pass on agent turns; off because native tool calls made it unnecessary |
+| `LLM_AGENT_THINKING` | `1` | thinking pass; off only on a model measured not to fabricate without it |
 | `LLM_AGENT_TEMP` / `LLM_AGENT_TOP_P` | `0.7` / `0.9` | agent-turn sampling |
 | `LLM_AGENT_SEED` | unset | reproducible agent turns |
 | `LLM_AGENT_NO_TOOL_SMALLTALK` | `1` | greetings get a reply, not a tool call |
