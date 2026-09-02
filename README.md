@@ -1,8 +1,10 @@
 # Voice Chat — Streaming Speech-to-Speech with Tools, in zh-TW
 
 **A fully local zh-TW voice agent on HuggingFace `speech-to-speech`.**
-Silero VAD + Smart Turn → Paraformer → Qwen3.5 4B (Qwen-Agent, real tools) → Qwen3-TTS,
-speaking the OpenAI Realtime protocol. No hosted API, no mocks, no cloud.
+Silero VAD + Smart Turn → **Gemma 4 E4B hearing the speech directly** (own tool loop, real tools)
+→ Qwen3-TTS, speaking the OpenAI Realtime protocol. There is no speech-to-text model on the
+answering path; X-ASR runs beside it only to caption the screen. No hosted API, no mocks, no
+cloud.
 
 Speak, interrupt it mid-sentence, search the web, hear the answer.
 **Traditional Chinese (Taiwan) throughout** — replies are zh-TW whatever language the question
@@ -12,9 +14,10 @@ was asked in, with English kept only for proper nouns and untranslatable terms.
 flowchart LR
     Mic["🎤 Mic"] -->|OpenAI Realtime<br/>WebSocket / WebRTC| RT["Realtime server<br/>:8765"]
     RT --> VAD["Silero VAD v5<br/>+ Smart Turn v3.2"]
-    VAD --> STT["(no STT stage)"]
-    STT --> AG["LLM stage<br/>Qwen-Agent harness"]
-    AG <--> LLM["llama-server :11435<br/>Qwen3.5 4B Q8_K_XL"]
+    VAD -->|audio| AG["LLM stage<br/>own tool loop"]
+    VAD -.->|same audio| XA["X-ASR<br/>caption only"]
+    XA -.->|partial transcript| RT
+    AG <--> LLM["llama-server :11435<br/>Gemma 4 E4B QAT + MTP"]
     AG -->|native tool call| T{{"web_search · get_weather<br/>get_current_datetime"}}
     T --> SX["SearXNG :8888<br/>+ wttr.in"]
     SX -.results.-> AG
@@ -27,7 +30,9 @@ flowchart LR
     classDef m fill:#1f2430,stroke:#7c5cff,color:#eee
     classDef s fill:#12281c,stroke:#3f9e6a,color:#eee
     classDef f fill:#2a2033,stroke:#c07cff,color:#eee
-    class STT,LLM,TTS,AG m
+    classDef c fill:#2b2b1e,stroke:#a89b3f,color:#eee
+    class LLM,TTS,AG m
+    class XA c
     class SX,T s
     class RT,VAD,CS f
 ```
@@ -43,14 +48,15 @@ hosted API. The LLM runs on llama.cpp, TTS on GGML through `faster_qwen3_tts`, S
 and Smart Turn on local ONNX. (`transformers` has no `pipeline("speech-to-speech")` task — the
 framework is the standalone package.)
 
-Components stay **native to the framework** wherever one exists: Paraformer for Chinese STT, the
-stock Qwen3-TTS handler pointed at GGUF weights on disk, Silero VAD, Smart Turn. The LLM stage is
-the one deliberate exception.
+Components stay **native to the framework** wherever one exists: the stock Qwen3-TTS handler
+pointed at GGUF weights on disk, Silero VAD, Smart Turn. The LLM stage is the deliberate
+exception — and because it is ours, it can take the VAD segment as audio and keep the tools,
+which the framework's own audio path cannot.
 
 ### The LLM stage
 
 `backend/s2s/qwen_agent_handler.py` replaces what `s2s_pipeline.get_llm_handler` returns, so the
-turn is driven by **Qwen-Agent** while every other stage is upstream's. Substituting that one
+turn is driven by **our own tool loop** while every other stage is upstream's. Substituting that one
 factory function is the whole integration — there is no fork to rebase.
 
 Two constraints shape it:
@@ -60,7 +66,7 @@ Two constraints shape it:
   because 「好。」 is a whole sentence in Chinese while a bare `1.` in a list is not.
 - **Tools run server-side.** The Realtime protocol expects the *client* to execute a tool and post
   `function_call_output` back, which cannot work here: `web_search` talks to SearXNG on 127.0.0.1
-  and the clock and weather tools are backend resources. Qwen-Agent's call → observe loop stays
+  and the clock and weather tools are backend resources. Our own call → observe loop stays
   intact and the browser receives ordinary assistant text.
 
 ### Tool calls are native, not prompted
@@ -286,72 +292,72 @@ The language instruction is stated once, in the system prompt, never appended to
 | **Orchestrator** | `speech-to-speech` 0.2.12 | OpenAI Realtime server on `:8765`, WebSocket + WebRTC |
 | **Turn-taking** | Silero VAD v5 + Smart Turn v3.2 | local ONNX; speculative turns with revisions |
 | **STT** | none on the main path | the model takes speech as the prompt; X-ASR runs beside it for the on-screen caption |
-| **LLM** | OpenRouter (353 tool-capable models) or `Qwen3.5-9B-Q4_K_M` | provider chosen in the UI; local llama-server `:11435` with MTP is the offline fallback |
+| **LLM** | `gemma-4-E4B-it-qat-UD-Q4_K_XL` + MTP head | llama-server `:11435` with `--mmproj` for audio, `--jinja` for native tool calls |
+| **Agent** | own loop (`agent/native_loop.py`) | 3 tools, 3-step ceiling, arguments validated and results sanitised |
+| **Caption** | X-ASR (sherpa-onnx, CPU) | display only, published as a partial so it never enters the pipeline |
 | **Agent** | own loop (`agent/native_loop.py`) | custom s2s LLM stage, native tool calls, 3-step ceiling |
 | **TTS** | `Qwen3-TTS-12Hz CustomVoice` Q8_0 | stock s2s handler on GGML CUDA, ~20-80 ms TTFA |
 | **Search** | SearXNG `:8888` + wttr.in | 180 engines, real results only |
 | **Embedding** | `granite-embedding-97m-multilingual` Q8_0 | 384 d, `:11434`, semantic rerank |
 
-One model, deliberately: **Gemma 4 E4B at Q4_K_M**, 4.98 GB of weights and **79 tok/s** decode on
-the RTX 3060. It is also the model the framework's own docs use, so its defaults are tested
-against it. Measured here, same card, same prompts:
+One model, deliberately: **Gemma 4 E4B, the QAT release at UD-Q4_K_XL** — 4.22 GB and
+**106 tok/s** decode on the RTX 3060. Quantization-aware training makes it both smaller and
+better than the plain Q4_K_M, and the MTP (NextN) head ships as a separate 0.10 GB file that
+llama.cpp loads as a draft model, which is the difference between 106 and 79 tok/s. It is also
+the model the framework's own docs use, and it hears speech natively.
+
+Measured alternatives, same card, same prompts:
 
 | | weights | decode |
 |---|---|---|
 | **Gemma 4 E4B QAT UD-Q4_K_XL + MTP** | 4.22 GB | **106 tok/s** |
 | Gemma 4 E4B Q4_K_M (no MTP) | 4.98 GB | 79 tok/s |
-| Qwen3.5 9B Q4_K_M | 5.87 GB | 47 tok/s |
-| Qwen3.5 4B UD-Q8_K_XL | 6.07 GB | 52 tok/s |
 | Granite 4.2 3B Q8_0 | 3.89 GB | 78 tok/s |
 | Granite 4.2 3B Q4_K_M | 2.24 GB | 113 tok/s |
+| Qwen3.5 9B Q4_K_M | 5.87 GB | 47 tok/s |
+| Qwen3.5 4B UD-Q8_K_XL | 6.07 GB | 52 tok/s |
 | Qwen3.6 35B-A3B NVFP4 (FreeToken, experts in DRAM) | 22 GB | 41 tok/s |
 
-Granite 4.2 3B is the interesting near-miss. At Q4_K_M it is the fastest thing measured here by a
-wide margin — 113 tok/s from 2.24 GB — but its Chinese is visibly damaged: 很高养 for 很高興,
+Granite 4.2 3B Q4_K_M is the fastest thing measured here, and unusable: 很高养 for 很高興,
 Simplified vocabulary leaking through a zh-TW system prompt, and a news summary dated 2025-04-28
-on 2026-09-02. Q8_0 fixes the garbling (`以其活潑的文化、現代化的建築…而聞名` where Q4 produced
-`以美酒、街道文化和綠化空間而聞名`) and confirms quantization was the cause on a 3 B model — but at
-78 tok/s it gives up the entire speed advantage, still leaks Simplified characters into weather
-answers (多云, 湿度), and its search turns ran 39–84 s against Gemma's 25–31 s. So Gemma stays.
+on 2026-09-02. Its Q8_0 fixes the garbling — confirming quantization was the cause on a model
+that small — but lands at 78 tok/s, surrendering the whole advantage, and still leaks Simplified
+into weather answers.
 
-The 35B ran — 35 B of weights on a 12 GB card, because only ~3 B are active per token and
-FreeToken streams the routed experts from host RAM — but at 41 tok/s and 26 s for a weather turn
-it was slower than the 4 B it replaced, and it answered 台灣的首都 with
-「台湾是中国不可分割的一部分」 in Simplified. `s2s/deploy/` keeps the launch scripts if it is worth
-revisiting.
+Qwen3.6 35B-A3B ran too: 35 B of weights on a 12 GB card, because only ~3 B are active per token
+and FreeToken streams the routed experts from host RAM. At 41 tok/s and 26 s for a weather turn it
+was slower than the 4 B it replaced, and it answered 台灣的首都 with 「台湾是中国不可分割的一部分」
+in Simplified. `s2s/deploy/` keeps its launch script.
 
-The QAT release is both smaller and better than the plain Q4_K_M: quantization-aware training
-means the weights were trained to tolerate 4 bits, and it holds fluency in zh-TW with 0 Simplified
-characters on the probe set.
-
-`--jinja` is what enables native tool calls: without it the server does not apply the model's
-chat template, and no tool call is generated at all. The MTP (NextN) head ships as its own 0.10 GB file rather than inside the weights,
-so it is passed as the draft model — `--spec-draft-model` plus `--spec-type draft-mtp` — which is
-the difference between 106 and 79 tok/s. Accepted drafts are the tokens the target model would
-have produced anyway, so that is throughput, not a quality trade.
+A hosted option was tried and removed. OpenRouter's free router is non-deterministic — one call
+landed on a content-safety classifier that returned no text — free models rate-limit readily, and
+one routed model received `Wednesday 2026-09-02` from the clock tool and reported 2026年5月14日 週四.
 
 ## Quick Start
 
+The launch flags are the difference between working and not — `--mmproj` for audio, `--jinja` for
+native tool calls, the separate MTP head — so they live in checked-in scripts rather than in this
+file, where they would drift.
+
 ```bash
-# 1) Search backend (tools)
+# 1) Search backend, for the web_search tool
 SEARXNG_SETTINGS_PATH=/tmp/searxng/settings.yml python3 -m searx.webapp   # :8888
 
-# 2) LLM
-llama-server -m /home/user/llms/mtp/Qwen3.5-4B-UD-Q8_K_XL.gguf \
-  --host 127.0.0.1 --port 11435 -c 8192 --alias qwen3.5-4b \
-  --n-gpu-layers 99 --jinja --reasoning-format deepseek
+# 2) The model: Gemma 4 E4B QAT + MTP head + audio projector, on :11435
+backend/s2s/deploy/llm-audio.sh
 
-# 3) The speech-to-speech pipeline, with Qwen-Agent as its LLM stage
-cd backend && python3 -m s2s.serve --mode realtime \
-  --ws_host 127.0.0.1 --ws_port 8765 \
-  --stt paraformer --language zh \
-  --model_name qwen3.5-4b \
-  --responses_api_base_url http://127.0.0.1:11435/v1 --responses_api_api_key none \
-  --tts qwen3 --qwen3_tts_backend ggml --qwen3_tts_language zh \
-  --qwen3_tts_gguf_talker_path /tmp/qwen3_tts/talker_cv_q8.gguf \
-  --qwen3_tts_gguf_codec_path  /tmp/qwen3_tts/codec.gguf \
-  --enable_live_transcription
+# 3) The pipeline: no STT stage, speech goes straight to the model, on :8765
+backend/s2s/deploy/pipeline.sh
 ```
+
+Variants, same shape:
+
+| script | what it changes |
+|---|---|
+| `llm.sh` | no `--mmproj`: text only, ~1 GB less VRAM. Pair with `pipeline-stt.sh`. |
+| `pipeline-stt.sh` | Paraformer transcribes and the model gets text — the pre-audio route |
+| `pipeline-audio.sh` | HF's own `--stt none` example: native audio through the *framework's* stage, so **no tools** |
+| `freetoken.sh` | Qwen3.6 35B-A3B with experts in DRAM (needs its weights re-downloaded) |
 
 Then talk to it — any OpenAI Realtime client works, including the framework's own:
 
@@ -474,36 +480,40 @@ mic frames counted rather than listed, so a 300-chunk turn exports at ~48 kB ins
 - **Barge-in on speech detection**, not on end-of-utterance — the distinction is the whole
   feature on a long answer. Handled by the framework's `CancelScope`, with the client flushing
   its own queued audio.
+- **No speech-to-text on the answering path.** Gemma 4 hears the audio itself and routes tools
+  from speech alone; X-ASR captions the screen from a side path that never enters the pipeline.
 - **Real tools**, called natively by the model: `web_search`, `get_weather`,
-  `get_current_datetime`. No curated results, no fabricated forecasts.
-- **zh-TW throughout.** Replies default to Traditional Chinese whatever the input language; the
-  user's transcript is converted with OpenCC for display.
+  `get_current_datetime`, with arguments validated against their schemas and results fenced as
+  untrusted data. No curated results, no fabricated forecasts.
+- **zh-TW throughout.** Replies default to Traditional Chinese whatever the language spoken;
+  OpenCC converts both sides for display, by different rules — see [the frontend](#the-frontend).
 - **Thinking never spoken.** Deliberation stays in `reasoning_content`, out of both the audio and
   the transcript.
-- **Live partial transcripts** while you speak, a VRAM readout, and a debug export of the whole
-  session.
+- **Live captions** while you speak, a VRAM readout, and a debug export of the whole session.
 
 ## Measured (RTX 3060, live stack)
 
-End to end over the Realtime protocol, fully local, cold client each time
-(`s2s/checks/turn.py`):
+Spoken turns end to end over the Realtime protocol — no STT on the answering path, audio straight
+to the model, tools routed from speech alone. Latency is measured from the moment VAD reports
+end-of-speech:
+
+| spoken | tool routed | first audio |
+|---|---|---|
+| 請問現在是幾點鐘了呢？ | `get_current_datetime` | 2.1 s |
+| 今天台北天氣如何？ | `get_weather` | 3.6 s |
+| 今天有什麼新聞？ | `web_search` | — |
+
+The X-ASR caption reaches the client at **+0.89 s**, ahead of first audio, and costs nothing:
+2.07 s median with it against 2.12 s without. Published as a *completed* transcription instead of
+a partial it cost 0.3 s, because that path adds the text to the framework's `Chat`.
+
+Typed turns, for comparison (`s2s/checks/turn.py`):
 
 | Prompt | First audio | Total |
 |---|---|---|
 | 你好 | 1.4 s | 2.0 s |
-| 現在幾點？ (clock tool) | 3.6 s | 4.6 s |
-| 帮我查一下今天那个台北的天气 (weather tool) | 9.7 s | 15.6 s |
-
-Per-stage p50 over the five prompt shapes, measured at the harness
-(`ttft` is the model's first token, so it excludes TTS):
-
-| Shape | ttft p50 | total p50 | Answer |
-|---|---|---|---|
-| chat | 1.25 s | 1.44 s | 13 chars |
-| plain | 1.34 s | 1.59 s | 20 chars |
-| clock | 2.73 s | 3.48 s | 41 chars |
-| weather | 6.50 s | 9.11 s | 150 chars |
-| search | 7.34 s | 10.57 s | 225 chars |
+| 現在幾點？ (clock tool) | 2.2 s | 3.0 s |
+| 今天台北天氣如何？ (weather tool) | 6.0 s | 16.5 s |
 
 Generation on the RTX 3060, 4B at Q8_K_XL (6.07 GB of weights), greedy, thinking off:
 
@@ -530,8 +540,9 @@ Tool routing and reasoning leaks: 0 failures and 0 leaks over all five shapes.
 | Env | Default | Purpose |
 |---|---|---|
 | `S2S_LLM_API_BASE` / `S2S_LLM_MODEL_NAME` | `…:11435/v1` / `qwen3.5-4b` | which llama-server the LLM stage talks to |
-| `S2S_USE_UPSTREAM_LLM` | unset | `1` runs the stock s2s LLM stage instead of Qwen-Agent |
+| `S2S_USE_UPSTREAM_LLM` | unset | `1` runs the stock s2s LLM stage instead of ours (loses the tools) |
 | `LLM_AGENT_MAX_STEPS` | `3` | tool-loop ceiling: enough for tool → observe → answer |
+| `S2S_CAPTION` / `S2S_CAPTION_DEVICE` | `1` / `cpu` | the X-ASR display caption, and where it runs |
 | `LLM_AGENT_MAX_TOKENS` | `2048` | per-turn generation cap (thinking + tool call + answer) |
 | `LLM_AGENT_THINKING` | `1` | thinking pass; off only on a model measured not to fabricate without it |
 | `LLM_AGENT_TEMP` / `LLM_AGENT_TOP_P` | `0.7` / `0.9` | agent-turn sampling |
