@@ -73,9 +73,6 @@ _llm_stage = None
 # arbitrary base URL means a request from the page cannot aim the agent (and its
 # API key) at a host of the caller's choosing.
 PROVIDERS = {
-    # base/model None means "whatever this process was started with" -- see
-    # _provider_local(), so the local option follows the CLI rather than a copy of it.
-    "local": {"base": None, "model": None, "needs_key": False, "label": "本機 llama-server"},
     "openrouter": {
         "base": "https://openrouter.ai/api/v1",
         "model": "openrouter/free",      # the auto-router; any catalogue id may replace it
@@ -83,7 +80,20 @@ PROVIDERS = {
         "label": "OpenRouter",
         "catalogue": "https://openrouter.ai/api/v1/models",
     },
+    # Kept as the offline fallback: it is the only option that works with no key and
+    # no network. base/model None means "whatever this process was started with" --
+    # see _provider_local(), so it follows the CLI rather than a copy of it.
+    "local": {"base": None, "model": None, "needs_key": False, "label": "本機 llama-server"},
 }
+
+
+def _startup_key() -> str:
+    """An OpenRouter key from the environment, if the operator supplied one.
+
+    OPENROUTER_API_KEY is the conventional name; LLM_API_KEY is what the harness
+    itself reads. Either starts the demo on OpenRouter instead of the local server.
+    """
+    return (os.getenv("OPENROUTER_API_KEY") or os.getenv("LLM_API_KEY") or "").strip()
 
 
 def _install_llm_config_route(app) -> None:
@@ -125,7 +135,7 @@ def _install_llm_config_route(app) -> None:
         Proxied rather than fetched by the browser so the page needs no third-party
         origin, and cached because it is a 400-entry list that changes rarely.
 
-        Only tool-capable text models are returned. This demo's agent calls three
+        Only models that are text-capable in and out, and can call tools, are returned. This demo's agent calls three
         tools, and a model that cannot call them is never a valid choice here -- it
         answers weather and news questions from its weights instead, which is the
         fabrication failure this project spends most of its effort avoiding. 66 of
@@ -149,6 +159,12 @@ def _install_llm_config_route(app) -> None:
         out = []
         for m in raw:
             arch = m.get("architecture") or {}
+            # Text in AND text out. "Capable of", not "exclusively": a model that also
+            # accepts images still takes text, and requiring text-ONLY input would drop
+            # Claude Opus 5, GPT-5.6, Gemini 3.7 and Grok 4.6 -- 353 candidates down to
+            # 116 -- for no benefit to a voice pipeline that only ever sends text.
+            if "text" not in (arch.get("input_modalities") or []):
+                continue
             if "text" not in (arch.get("output_modalities") or []):
                 continue
             params = m.get("supported_parameters") or []
@@ -313,6 +329,20 @@ def _get_llm_handler(
 def main() -> None:
     _neutralize_mps_empty_cache()
     _install_vram_route()
+    # A key in the environment means start on OpenRouter; without one the demo would
+    # have no working model at all, so it falls back to the local server and the UI
+    # asks for a key.
+    key = _startup_key()
+    if key:
+        spec = PROVIDERS["openrouter"]
+        os.environ.setdefault("LLM_API_BASE", spec["base"])
+        os.environ.setdefault("LLM_MODEL_ID", spec["model"])
+        os.environ["LLM_API_KEY"] = key
+        logger.info("starting on %s (%s) -- key supplied by the environment",
+                    spec["label"], os.environ["LLM_MODEL_ID"])
+    else:
+        logger.info("no OPENROUTER_API_KEY -- starting on the local server; "
+                    "the UI can switch once a key is pasted")
     s2s_pipeline.get_llm_handler = _get_llm_handler
     # chat-completions' argument dataclass is the one carrying base_url/api_key,
     # and it is what the builder stamps cancel_scope onto.

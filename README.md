@@ -171,7 +171,7 @@ The language instruction is stated once, in the system prompt, never appended to
 | **Orchestrator** | `speech-to-speech` 0.2.12 | OpenAI Realtime server on `:8765`, WebSocket + WebRTC |
 | **Turn-taking** | Silero VAD v5 + Smart Turn v3.2 | local ONNX; speculative turns with revisions |
 | **STT** | Paraformer (FunASR) | Chinese-oriented; `pip install "speech-to-speech[paraformer]"` |
-| **LLM** | `Qwen3.5-9B-Q4_K_M` | llama-server `:11435`, MTP on, thinking on, 3 tools |
+| **LLM** | OpenRouter (353 tool-capable models) or `Qwen3.5-9B-Q4_K_M` | provider chosen in the UI; local llama-server `:11435` with MTP is the offline fallback |
 | **Agent** | `qwen-agent` `Assistant` | custom s2s LLM stage, native tool calls |
 | **TTS** | `Qwen3-TTS-12Hz CustomVoice` Q8_0 | stock s2s handler on GGML CUDA, ~20-80 ms TTFA |
 | **Search** | SearXNG `:8888` + wttr.in | 180 engines, real results only |
@@ -423,9 +423,18 @@ a request from the page cannot aim the agent (and the key) at a host of the call
 caller-supplied *model* is just a string forwarded to that fixed base URL.
 
 `GET /v1/llm-models` proxies OpenRouter's catalogue for the model dropdown, cached 15 minutes.
-**Only tool-capable text models are returned** — 355 of 421. The agent calls three tools, and a
-model that cannot call them answers weather and news questions from its weights instead, which is
-the fabrication failure this project spends most of its effort avoiding.
+**Only models that are text-capable in and out and can call tools are returned** — 353 of 421.
+
+Tool capability is not optional here: the agent calls three tools, and a model that cannot call
+them answers weather and news from its weights instead, which is the fabrication failure this
+project spends most of its effort avoiding. Text capability is "capable of", not "exclusively" —
+requiring text-*only* input would drop Claude Opus 5, GPT-5.6, Gemini 3.7 and Grok 4.6 (353
+candidates down to 116) because they also accept images, which costs a voice pipeline nothing.
+
+A refused turn says *which* refusal it was. Once the model is a hosted provider, refusals are
+routine and each needs a different action — a bad key (401), an empty balance (402), a
+rate-limited free model (429) — so `_provider_failure_zh()` speaks the cause category while the
+exception itself is only logged. One generic apology sent all of them to the same dead end.
 
 Switching to a hosted provider means the voice content leaves the machine, which the UI says
 plainly. It is also markedly slower: a clock turn measured 3.9 s locally against 28 s through

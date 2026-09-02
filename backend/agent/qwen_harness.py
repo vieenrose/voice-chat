@@ -173,6 +173,37 @@ class QwenDateTime(BaseTool):
 NO_ANSWER_ZH = "抱歉，我找不到相關的答案。"
 
 
+# HTTP status -> what the user should hear. Only the cause CATEGORY is spoken; the
+# exception itself is logged, never read aloud (a raw httpx or provider message gets
+# tokenized straight to TTS otherwise).
+_PROVIDER_FAILURE_ZH = {
+    401: "抱歉，API 金鑰無效，請重新填寫。",
+    403: "抱歉，這個金鑰沒有使用這個模型的權限。",
+    402: "抱歉，帳戶額度不足，請確認 OpenRouter 的餘額。",
+    404: "抱歉，找不到這個模型，請換一個。",
+    429: "抱歉，這個模型現在被限流了，請稍後再試或換一個模型。",
+}
+
+
+def _provider_failure_zh(exc: Exception) -> str:
+    """Name the failure category when the model endpoint refuses a turn.
+
+    Once the LLM can be a hosted provider, refusals are routine and each needs a
+    different action from the user: a bad key, an empty balance, a rate-limited free
+    model. "抱歉，這個問題我暫時無法回答" sent them all to the same dead end -- observed
+    with a 429 on google/gemma-4-31b-it:free, where the fix is simply another model.
+    """
+    code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    if not isinstance(code, int):
+        m = re.search(r"\b(40[1234]|429|5\d\d)\b", str(exc))
+        code = int(m.group(1)) if m else None
+    if code in _PROVIDER_FAILURE_ZH:
+        return _PROVIDER_FAILURE_ZH[code]
+    if isinstance(code, int) and 500 <= code < 600:
+        return "抱歉，模型供應者暫時故障，請稍後再試。"
+    return "抱歉，這個問題我暫時無法回答，請再試一次。"
+
+
 def _has_word(s: str) -> bool:
     """Whether a string carries actual content, as opposed to punctuation or list marks.
 
@@ -578,5 +609,5 @@ async def run_agent_task(task: str, event_q=None, history=None) -> str:
             # killing the server mid-request) would get read aloud verbatim. Log the real
             # detail server-side; return a clean, generic fallback for the user to hear.
             logger.exception(f"qwen agent failed: {e}")
-            return "抱歉，這個問題我暫時無法回答，請再試一次。"
+            return _provider_failure_zh(e)
     return await asyncio.to_thread(_run)
