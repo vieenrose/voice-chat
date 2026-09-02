@@ -43,21 +43,27 @@ Every reply carries a monotonic `turn_id`; a superseded turn's events are droppe
 Every import ladder ends in a mock adapter, so `app.py --mock` starts with no model libraries
 installed; `/health` reports `mock` when a rung is reached.
 
-### HuggingFace speech-to-speech
+### HuggingFace speech-to-speech is NOT used by default
 
-The name shows up in two places, with different jobs:
+Worth stating plainly, because the class name suggests otherwise. Nothing in the live path goes
+through HuggingFace's speech-to-speech abstraction:
 
-- **`HFSpeechToSpeechPipeline`** (`pipeline/speech_to_speech.py`) is the orchestrator the WS path
-  actually runs — the STT pump, turn/barge-in state machine and TTS flushing above. It also
-  exposes an HF `pipeline("speech-to-speech")`-style `__call__(audio_array, sampling_rate)` for
-  one-shot audio-in/audio-out use, which is convenient for scripted evaluation but bypasses
-  streaming, tools and barge-in entirely.
-- **`HF_OFFICIAL` mode** (`pipeline/hf_official.py`) is an alternative implementation built only
-  from HF pipelines — Paraformer STT, a transformers text-generation LLM, `pipeline("text-to-speech")`
-  for Qwen3-TTS — with no llama.cpp, sherpa or codec bindings. It implements the same
-  pump/`turn_id`/barge-in contract, and `TestHFOfficialPipelineParity` holds it to that. **Off by
-  default** (`HF_OFFICIAL = False`): the model downloads are slow and the production path is
-  already HF Hub weights, just served through faster runtimes.
+- **`HFSpeechToSpeechPipeline`** (`pipeline/speech_to_speech.py`) is the class the demo runs, but
+  only as *this project's* orchestrator — the STT pump, the `turn_id`/barge-in state machine,
+  sentence-level TTS flushing. The `HF` in the name is historical. It does expose an HF-style
+  one-shot `__call__(audio_array, sampling_rate)`, but nothing in the repo calls it, and it is
+  not equivalent to the live path: no streaming, no tools, no barge-in. Benchmark through it and
+  you are measuring a different system.
+- **`HF_OFFICIAL` mode** (`pipeline/hf_official.py`) is the real all-HF implementation —
+  Paraformer, transformers text-generation, `pipeline("text-to-speech")`, no llama.cpp or sherpa.
+  It is held to the same pump/`turn_id`/barge-in contract by `TestHFOfficialPipelineParity` and
+  is **off** (`HF_OFFICIAL = False`); the downloads are slow and buy nothing the faster runtimes
+  do not already give.
+
+What HuggingFace *does* provide here is **weights**: every model above is an HF Hub download,
+served through llama.cpp, sherpa-onnx and qwentts-cpp rather than through `transformers`. The
+`pipeline()` API appears only on fallback rungs — a whisper ASR fallback in `stt/xasr_streaming.py`
+and a SpeechT5 TTS fallback — which do not fire in a healthy deployment.
 
 ### Models
 

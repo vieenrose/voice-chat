@@ -1,12 +1,28 @@
 """
-HF Speech-to-Speech orchestrator — glue for X-ASR → Qwen3.5 (Qwen-Agent) → Qwen3-TTS.
-(The MiniCPM5/PrimeTTS names below are kept only as import-time fallbacks and aliases.)
+Speech-to-speech orchestrator — glue for X-ASR → LLM (Qwen-Agent) → Qwen3-TTS.
 
-Implements low-latency streaming pipeline:
-  audio Queue → STT → LLM tokens → TTS chunks
-All streaming, so TTS starts before LLM finishes.
+Low-latency streaming: audio Queue → STT → LLM tokens → TTS chunks, so TTS starts
+before the LLM finishes.
 
-Also exposes HF `pipeline("speech-to-speech")` style API for compatibility.
+The "HF" in HFSpeechToSpeechPipeline is historical and misleads: NOTHING here runs
+through HuggingFace's speech-to-speech abstraction. This is the project's own
+orchestrator (STT pump, turn_id/barge-in state machine, sentence flushing), and the
+models are HF Hub *weights* served by llama.cpp / sherpa-onnx / qwentts-cpp. The
+`transformers` pipeline() API appears only on fallback rungs that a healthy
+deployment never reaches.
+
+__call__() below is a one-shot convenience API. It was written to mimic a
+transformers pipeline("speech-to-speech") task, but no such task exists in
+transformers (v5.15 exposes automatic-speech-recognition, text-to-audio, and
+audio-classification — there is no speech-to-speech). Nothing in this repo calls
+__call__, and it is NOT the live path — no streaming, no tools, no barge-in — so
+measuring through it measures a different system. HF_OFFICIAL mode
+(pipeline/hf_official.py) is the genuine all-HF implementation and is off by
+default. HuggingFace's actual voice-agent framework is the separate
+`speech-to-speech` package (github.com/huggingface/speech-to-speech), which this
+project does not currently use.
+
+(The MiniCPM5/PrimeTTS names below are import-time fallbacks and aliases only.)
 """
 import asyncio
 import os as _os
