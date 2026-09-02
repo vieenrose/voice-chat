@@ -2,6 +2,7 @@
   import { onDestroy } from 'svelte'
   import { RealtimeClient } from './lib/realtime.js'
   import { MicCapture, Playback } from './lib/audio.js'
+  import { toTW, zhtwReady } from './lib/zhtw.js'
 
   const INSTRUCTIONS =
     '你是一個親切的語音助理。一律使用繁體中文（台灣用語）回答，' +
@@ -87,10 +88,14 @@
       responding = true
       lastStatus = ''
     },
-    onUserPartial(text) { userPartial = text; scroll() },  // cumulative: replace
+    // Cumulative: replace, never append. Converted for display only -- Paraformer
+    // emits Simplified, and this is a zh-TW demo.
+    onUserPartial(text) { userPartial = toTW(text); scroll() },
     onUserFinal(text) {
       userPartial = ''
-      if (text.trim()) turns = [...turns, { role: 'user', text }]
+      // Keep the raw STT output alongside the displayed form: the export is for
+      // debugging, and a converted transcript would hide what STT actually heard.
+      if (text.trim()) turns = [...turns, { role: 'user', text: toTW(text), raw: text }]
       scroll()
     },
     onResponseStart() { responding = true; lastStatus = '' },
@@ -133,6 +138,10 @@
   }
 
   function disconnect() {
+    // Snapshot everything the export needs BEFORE dropping the objects that hold
+    // it. Without this the log exported after a session was empty -- protocol: []
+    // with null rates and zero counters -- which is exactly when it gets clicked.
+    lastSession = snapshotSession()
     stopMic()
     client?.close(); client = null
     play?.close(); play = null
@@ -184,6 +193,7 @@
   // report of "it said the wrong thing" can be read back without guessing what
   // the browser saw. Audio payloads are elided in the client's own log.
   let clientEvents = $state([])   // things only the UI knows: flushes, mic errors
+  let lastSession = null          // survives disconnect, so the export still has it
 
   function note(what, detail = {}) {
     clientEvents.push({
@@ -195,7 +205,23 @@
     if (clientEvents.length > 500) clientEvents.shift()
   }
 
+  /** The parts of the log that live on objects disconnect() throws away. */
+  function snapshotSession() {
+    return {
+      audio: {
+        playbackRate: play?.sampleRate ?? null,
+        captureRate: mic?.sampleRate ?? null,
+        micFrames: client?.micFrames ?? 0,
+        micBase64Bytes: client?.micBytes ?? 0,
+        audioBase64BytesIn: client?.audioBytesIn ?? 0,
+      },
+      protocol: client?.log ? [...client.log] : [],
+    }
+  }
+
   function buildLog() {
+    // Live objects when connected; the disconnect snapshot afterwards.
+    const snap = client ? snapshotSession() : (lastSession ?? snapshotSession())
     return {
       exported: new Date().toISOString(),
       page: { url: location.href, protocol: location.protocol, hostname: location.hostname },
@@ -205,21 +231,18 @@
       audio: {
         firstAudioMs: firstAudioMs || null,
         secondsPlayed: +audioSeconds.toFixed(2),
-        playbackRate: play?.sampleRate ?? null,
-        captureRate: mic?.sampleRate ?? null,
-        micFrames: client?.micFrames ?? 0,
-        micBase64Bytes: client?.micBytes ?? 0,
-        audioBase64BytesIn: client?.audioBytesIn ?? 0,
+        ...snap.audio,
       },
       transcript: turns.map((t) => ({
         role: t.role,
         text: t.text,
+        ...(t.raw && t.raw !== t.text ? { rawStt: t.raw } : {}),
         cancelled: !!t.cancelled,
         done: !!t.done,
       })),
       clientEvents,
       // Mic frames are counted above rather than listed; everything else is here.
-      protocol: client?.log ?? [],
+      protocol: snap.protocol,
     }
   }
 
@@ -241,6 +264,19 @@
     theme = theme === 'dark' ? 'light' : 'dark'
     document.body.classList.toggle('light', theme === 'light')
   }
+
+  // The converter arrives asynchronously, so any turn captured before it landed
+  // is still Simplified. Re-render those from the raw STT text once it is live.
+  zhtwReady.then(() => {
+    let changed = false
+    for (const t of turns) {
+      if (t.raw) {
+        const conv = toTW(t.raw)
+        if (conv !== t.text) { t.text = conv; changed = true }
+      }
+    }
+    if (changed) turns = turns
+  })
 
   onDestroy(disconnect)
 </script>

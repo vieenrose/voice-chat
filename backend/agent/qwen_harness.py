@@ -37,6 +37,7 @@ _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 #     llama-server honours it) turns a benchmark run reproducible. Neither changes the
 #     defaults unless you set them.
 _DEFAULT_TZ = os.getenv("VOICE_TZ", "Asia/Taipei")
+LLM_AGENT_MAX_TOKENS = int(os.getenv("LLM_AGENT_MAX_TOKENS", "512"))
 LLM_AGENT_TEMP = float(os.getenv("LLM_AGENT_TEMP", "0.7"))
 LLM_AGENT_TOP_P = float(os.getenv("LLM_AGENT_TOP_P", "0.9"))
 LLM_AGENT_SEED = os.getenv("LLM_AGENT_SEED", "").strip()
@@ -322,7 +323,7 @@ def _make_agent(function_list=None):
         'model_server': _base,
         'api_key': 'none',
         'generate_cfg': {
-            'max_tokens': 512,
+            'max_tokens': LLM_AGENT_MAX_TOKENS,
             'temperature': LLM_AGENT_TEMP,
             'top_p': LLM_AGENT_TOP_P,
             # Thinking is expensive here in the literal sense: at enable_thinking True the
