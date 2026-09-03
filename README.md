@@ -10,6 +10,9 @@ Speak, interrupt it mid-sentence, search the web, hear the answer.
 **Traditional Chinese (Taiwan) throughout** — replies are zh-TW whatever language the question
 was asked in, with English kept only for proper nouns and untranslatable terms.
 
+![The extension-lookup demo: a spoken name matched to three colleagues, the lookup panel
+showing every match with its extension, and the assistant asking which department.](docs/demo-extension-lookup.png)
+
 ![The demo mid-conversation: a spoken weather question routed to the tool, answered in zh-TW,
 with the live VRAM readout and the pipeline card showing no STT stage.](docs/demo.png)
 
@@ -288,6 +291,19 @@ ask instead of guessing or reading the whole list aloud. Spoken, end to end:
 | 🗣 行銷部 | → `search_contacts{query:"陳怡君", department:"行銷部"}` → 1 match |
 | 🤖 | 好的，行銷部的陳怡君是行銷企劃，分機是 1102。 |
 
+**The extension is read from the panel as well as spoken**, because the model was getting it
+wrong. At the default sampling temperature of 0.7 the tool returned 分機 1102 every single time
+while the spoken answer said 3567, then 5522 — **one turn in three**. It mangled the name the same
+way (陳一君 / 陳宜君 for 陳怡君). Reciting an exact value back is the one thing an attendant must
+not improvise, so `pipeline.sh` pins `LLM_AGENT_TEMP=0.2`: eight runs, no wrong number. The model
+still paraphrases freely, it just stops inventing digits.
+
+The UI shows the lookup itself — query, department, and every match with its extension — read from
+`GET /v1/tool-trace`. The Realtime protocol has no server→client tool-result event (`ServerEvent`
+is a closed union of OpenAI types), so rather than fork the framework the trace is published on the
+same HTTP surface as `/v1/vram`. It doubles as the check on the spoken answer: the panel is the
+tool's own output, so a fabricated number is visible on screen.
+
 A miss is **authoritative**: the directory is the whole staff list, so 「查無此人」 is the answer.
 An exported session caught the alternative — asked to transfer to 王大明, who is not in the
 directory, the model called `search_contacts`, got nothing, then fell back to `web_search` for the
@@ -441,7 +457,7 @@ audio. Barge-in cancels **1.29 s** after speech starts.
 | `LLM_AGENT_MAX_STEPS` | `3` | tool-loop ceiling: tool → observe → answer |
 | `LLM_AGENT_MAX_TOKENS` | `2048` | per-turn cap (thinking + tool call + answer) |
 | `LLM_AGENT_THINKING` | `1` | thinking pass |
-| `LLM_AGENT_TEMP` / `LLM_AGENT_TOP_P` | `0.7` / `0.9` | agent-turn sampling |
+| `LLM_AGENT_TEMP` / `LLM_AGENT_TOP_P` | `0.7` / `0.9` | agent-turn sampling; `pipeline.sh` pins temp to `0.2` so extensions are not improvised |
 | `LLM_AGENT_SEED` | unset | reproducible agent turns |
 | `LLM_REQUEST_TIMEOUT` | `45` | a hung call must not hold the only pipeline slot |
 | `S2S_CAPTION` / `S2S_CAPTION_DEVICE` | `1` / `cpu` | the X-ASR caption, and where it runs |

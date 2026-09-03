@@ -22,6 +22,11 @@
 # Mandarin has intra-sentence pauses longer than 300 ms; this costs 400 ms of
 # endpointing after the user stops and buys whole utterances.
 export LLM_MODEL_ID=gemma-4-e4b-qat
+# Reciting an extension back is the one thing this demo must not get wrong, and at
+# the default 0.7 it did: the tool returned 分機 1102 every time while the spoken
+# answer said 3567 and 5522 -- 1 turn in 3. At 0.2, 8 runs produced no wrong number.
+# The model still paraphrases freely; it just stops improvising digits.
+export LLM_AGENT_TEMP="${LLM_AGENT_TEMP:-0.2}"
 export LLM_API_BASE=http://127.0.0.1:11435/v1
 cd /home/user/voice-chat/backend
 exec python3 -m s2s.serve --mode realtime \

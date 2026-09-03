@@ -735,7 +735,9 @@ class LingStreaming:
                     yield {"type": "tool_call", "name": ev["name"],
                            "arguments": ev.get("arguments", {}), "query": ev.get("query", "")}
                 elif ev["type"] == "tool_result":
+                    # `arguments` rides along so the UI panel can show what was asked.
                     yield {"type": "tool_result", "name": ev["name"], "result": ev.get("result"),
+                           "arguments": ev.get("arguments"),
                            "formatted": ev.get("formatted", ""), "latency_ms": ev.get("latency_ms", 0),
                            "source": ev.get("source", "")}
                 elif ev["type"] == "llm_delta" and ev.get("reset"):

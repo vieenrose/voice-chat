@@ -31,6 +31,7 @@
   let level = $state(0)            // mic peak, for the meter
   let vram = $state(null)          // {used_mib, total_mib, device} from the server
   let llmCfg = $state(null)        // {model, api_base, tools} -- read-only, for the card
+  let lookup = $state(null)        // newest search_contacts result, for the panel
 
   const PIPELINE = $derived([
     ['VAD', 'Silero v5 + Smart Turn v3.2'],
@@ -85,6 +86,22 @@
 
 
 
+  // The Realtime protocol has no server->client tool-result event (ServerEvent is a
+  // closed union of OpenAI types), so the directory result is read from
+  // GET /v1/tool-trace, the same HTTP surface as /v1/vram.
+  async function pollLookup() {
+    const target = serverUrl('/v1/tool-trace')
+    if (!target) return
+    try {
+      const r = await fetch(target, { cache: 'no-store' })
+      const { trace = [] } = await r.json()
+      const last = [...trace].reverse().find((e) => e.name === 'search_contacts')
+      lookup = last ? { ...last, matches: last.result?.matches ?? [] } : null
+    } catch {
+      /* server down or origin refuses the fetch; keep whatever is on screen */
+    }
+  }
+
   async function pollVram() {
     const target = vramUrl()
     if (!target) return
@@ -101,8 +118,10 @@
   $effect(() => {
     // Poll only while connected: the readout is for watching the model load and run.
     if (connected && !vramTimer) {
-      pollVram()
-      vramTimer = setInterval(pollVram, 3000)
+      pollVram(); pollLookup()
+      // The lookup panel is polled faster than VRAM: it should appear while the
+      // assistant is still speaking the question about which department.
+      vramTimer = setInterval(() => { pollVram(); pollLookup() }, 1000)
     } else if (!connected && vramTimer) {
       clearInterval(vramTimer)
       vramTimer = null
@@ -377,8 +396,8 @@
     <div class="brand">
       <div class="logo">🎙️</div>
       <div style="min-width:0">
-        <div class="title">Voice Chat · Realtime</div>
-        <div class="subtitle">HuggingFace speech-to-speech · 全本地 · 繁體中文</div>
+        <div class="title">語音分機查詢 · Extension Lookup by Voice</div>
+        <div class="subtitle">說出同事姓名，問到分機 · HuggingFace speech-to-speech · 全本地 · 繁體中文</div>
       </div>
     </div>
     <div class="header-actions">
@@ -448,6 +467,33 @@
         </div>
       </div>
 
+      {#if lookup}
+        <div class="card">
+          <h3>分機查詢
+            <span class="subtle" style="font-weight:400">
+              {lookup.arguments?.query ?? ''}{lookup.arguments?.department ? ` · ${lookup.arguments.department}` : ''}
+            </span>
+          </h3>
+          {#if lookup.matches.length === 0}
+            <div class="subtle" style="font-size:12px">查無此人</div>
+          {:else}
+            {#if lookup.matches.length > 1}
+              <div class="subtle" style="font-size:11px; margin-bottom:6px">
+                {lookup.matches.length} 位同名，待確認部門
+              </div>
+            {/if}
+            <table class="dir">
+              <thead><tr><th>姓名</th><th>部門</th><th>職稱</th><th>分機</th></tr></thead>
+              <tbody>
+                {#each lookup.matches as m}
+                  <tr><td>{m.name}</td><td>{m.dept}</td><td>{m.title}</td><td class="ext">{m.ext}</td></tr>
+                {/each}
+              </tbody>
+            </table>
+          {/if}
+        </div>
+      {/if}
+
       <div class="card">
         <h3>管線</h3>
         <div style="font-size:12px; line-height:1.7; opacity:0.85">
@@ -499,6 +545,10 @@
   .logo{width:36px; height:36px; border-radius:10px; background:#7c5cff; display:grid; place-items:center; font-size:18px; flex-shrink:0}
   .title{font-size:15px; font-weight:700; letter-spacing:-0.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
   .subtitle{font-size:11px; opacity:0.55; margin-top:2px}
+  table.dir{width:100%; border-collapse:collapse; font-size:12px}
+  table.dir th{text-align:left; font-weight:500; opacity:0.5; padding:2px 6px 4px 0}
+  table.dir td{padding:4px 6px 4px 0; border-top:1px solid rgba(128,128,128,0.18)}
+  table.dir td.ext{font-variant-numeric:tabular-nums; font-weight:600}
   .header-actions{display:flex; gap:8px; align-items:center; flex-wrap:wrap}
   .pill{font-size:11px; padding:5px 9px; border-radius:999px; border:1px solid #232332; background:#14141c}
   .pill.ok{border-color:#7c5cff; color:#b8a6ff}

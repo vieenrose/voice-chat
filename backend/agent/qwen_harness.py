@@ -202,6 +202,7 @@ class QwenSearchContacts(Tool):
             out = (f"找到 {len(matches)} 位同名同事，分別在：{depts}。"
                    f"請先問使用者是哪一個部門，不要直接唸出全部。明細：{people}")
         _emit({"type": "tool_result", "name": "search_contacts",
+               "arguments": {"query": query, "department": dept},
                "result": {"matches": matches}, "formatted": out})
         return sanitize_tool_output(out)
 

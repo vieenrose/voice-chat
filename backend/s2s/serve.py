@@ -96,6 +96,16 @@ def _install_llm_config_route(app) -> None:
         }
 
 
+def _install_tool_trace_route(app) -> None:
+    """GET /v1/tool-trace: what the tools returned this session, newest last."""
+
+    @app.get("/v1/tool-trace")
+    def get_tool_trace() -> dict:
+        from s2s.tool_trace import snapshot
+
+        return {"trace": snapshot()}
+
+
 def _install_vram_route() -> None:
     """Expose GPU memory on the Realtime server, for the UI's VRAM readout.
 
@@ -155,6 +165,7 @@ def _install_vram_route() -> None:
                     return {"available": False, "reason": f"{type(e).__name__}: {e}"}
 
             _install_llm_config_route(app)
+            _install_tool_trace_route(app)
             logger.info("GET /v1/vram and GET|POST /v1/llm-config registered")
         except Exception:
             logger.exception("could not register /v1/vram (continuing without it)")

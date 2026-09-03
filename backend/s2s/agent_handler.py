@@ -435,6 +435,15 @@ class AgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
                     return
                 elif t == "tool_call":
                     logger.info("tool -> %s", ev.get("name"))
+                elif t == "tool_result":
+                    # Published for the UI's lookup panel; see serve.record_tool_trace.
+                    try:
+                        from s2s.tool_trace import record
+
+                        record(ev.get("name") or "", ev.get("arguments") or {},
+                               ev.get("result"))
+                    except Exception:
+                        logger.exception("could not publish a tool trace")
                 elif t == "error":
                     yield "error", str(ev.get("message") or "llm error")
                     return
