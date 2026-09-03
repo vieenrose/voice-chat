@@ -346,6 +346,11 @@ movements between runs are noise. And the remaining `unique` failures are genuin
 蔡孟祥 heard as 蔡孟翔, 吳承倫 as 無成倫 — where the phonetic fallback can only help once the query
 reaches the directory at all.
 
+**Extensions are handed over digit by digit.** Qwen3-TTS reads a bare `2431` as a cardinal
+(兩千四百三十一), which is not how anyone says an extension, so the tool gives the model 二四三一 and
+tells it to keep that form. The structured result keeps the digits, so the on-screen panel and the
+trace stay readable, and the evaluation scores both spellings as the same number.
+
 A miss is **authoritative**: the directory is the whole staff list, so 「查無此人」 is the answer.
 An exported session caught the alternative — asked to transfer to 王大明, who is not in the
 directory, the model called `search_contacts`, got nothing, then fell back to `web_search` for the

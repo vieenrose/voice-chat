@@ -52,6 +52,20 @@ from tools.contact_db import CONTACTS  # noqa: E402
 WS = "ws://127.0.0.1:8765/v1/realtime"
 CACHE = Path("/tmp/claude-1000/ext_eval_clips")
 _EXT = re.compile(r"\b(\d{4})\b")
+_CN = {c: str(i) for i, c in enumerate("〇一二三四五六七八九")}
+_CN.update({"零": "0", "○": "0", "两": "2", "兩": "2"})
+_CN_RUN = re.compile(r"[〇零○一二三四五六七八九两兩]{4}")
+
+
+def _numbers(said: str) -> set[str]:
+    """4-digit extensions the caller heard, written either way.
+
+    The tool now hands the model 一一〇二 rather than 1102, because TTS reads a
+    bare 1102 as a cardinal. Both spellings have to score the same.
+    """
+    out = set(_EXT.findall(said))
+    out |= {"".join(_CN[c] for c in run) for run in _CN_RUN.findall(said)}
+    return out
 def _homophones() -> dict[str, list[str]]:
     """Characters that sound alike, learned from the directory's own names.
 
@@ -278,7 +292,7 @@ def main() -> int:
                 asyncio.run(_synth_edge(c["spoken"], clip, args.voice))
         _wait_slot()
         said, first, total = asyncio.run(_ask([clip]))
-        nums = set(_EXT.findall(said))
+        nums = _numbers(said)
         if c["want"] is None:
             # Right behaviour: ask, and do not read an extension out.
             ok = not nums

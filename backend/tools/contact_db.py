@@ -129,6 +129,20 @@ def search(query: str = "", department: str = "", title: str = "") -> list[dict]
     return []
 
 
+_DIGITS = "〇一二三四五六七八九"
+
+
+def spoken_ext(ext: str) -> str:
+    """An extension read digit by digit: 2431 -> 二四三一.
+
+    TTS reads a bare 2431 as a cardinal (兩千四百三十一), which is not how anyone
+    says an extension. The tool hands the model the spoken form so the spoken
+    answer is right; the structured result keeps the digits, so the on-screen
+    panel and the trace stay readable.
+    """
+    return "".join(_DIGITS[int(ch)] if ch.isdigit() else ch for ch in ext)
+
+
 def departments_of(matches: list[dict]) -> list[str]:
     """The distinct departments among matches -- the choices to offer the user."""
     seen: list[str] = []
