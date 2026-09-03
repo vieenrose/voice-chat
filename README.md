@@ -68,6 +68,30 @@ design depends on. Measured alternatives on the same card: Granite 4.2 3B Q4_K_M
 Q4_K_M runs at 47; Qwen3.6 35B-A3B with experts streamed from DRAM manages 41 and answered
 台灣的首都 with mainland boilerplate.
 
+**Speech-in tool-callers were evaluated too, on the same three spoken clips and the same three
+tools.** Routing from audio alone, E4B scores 18/18:
+
+| | clock | weather | news | notes |
+|---|---|---|---|---|
+| **Gemma 4 E4B QAT** | 8/8 | 3/3 | 3/3 | current |
+| Gemma 4 E2B QAT | 2/8 | 3/3 | 3/3 | mishears 幾點鐘 as 幾度中午; text routing is 8/8, so it is the audio path |
+| [Qwen3-ASR-0.6B-Agent](https://huggingface.co/Luigi/Qwen3-ASR-0.6B-Agent) | 1/2 | 0/2 | 2/2 | 0.5–0.8 s to a complete call, and it generalises to tools it never saw |
+| [Step-Audio 2 mini](https://huggingface.co/stepfun-ai/Step-Audio-2-mini) 8B | 0/3 | 3/3 | 3/3 | fabricates the time; speech-to-speech, no llama.cpp path |
+
+Two of those are more interesting than the scores suggest. **Qwen3-ASR-0.6B-Agent** was
+LoRA-tuned on a single `search_contacts` tool for a phone-attendant task, yet emits well-formed
+calls to tools it has never seen — it even used the `recency` field added here. Its failure is the
+disqualifying kind, though: unrecognised intents fall back to `web_search`, so the weather question
+became `web_search{query:"台北"}` — a plausible call returning a search page instead of a forecast
+— and it is worse on VAD-trimmed audio, which is what the pipeline actually feeds. Right model for
+a narrow attendant demo, wrong one for a general assistant.
+
+**Step-Audio 2 mini** answers in its own voice (no TTS stage at all) and its Chinese ASR is
+excellent, but it invents the time rather than calling the clock, and quantisation is not the
+cause — int8 with the audio encoder left in bf16 fails the same way. Native audio output also
+removes the text stage where zh-TW is normalised, so mainland wording (特朗普 for 川普) reaches the
+speaker with nothing in between.
+
 ### Native audio input, and no STT stage
 
 `pipeline.sh` runs `--stt none`. `agent_handler` converts the VAD segment to an `input_audio`
