@@ -56,7 +56,7 @@ tools.
 | **STT** | **none on the answering path** | the model hears the speech; X-ASR only captions the screen |
 | **LLM** | `gemma-4-E4B-it-qat-UD-Q4_K_XL` + MTP head | llama-server `:11435`, `--mmproj` for audio, `--jinja` for native tool calls |
 | **Agent** | own loop (`agent/native_loop.py`) | 3 tools, 3-step ceiling, arguments validated, results sanitised |
-| **TTS** | `Qwen3-TTS-12Hz-0.6B-CustomVoice` Q8_0 | stock s2s handler on GGML CUDA, speaker `Serena` |
+| **TTS** | `Qwen3-TTS-12Hz-0.6B-CustomVoice` Q8_0 | stock s2s handler on GGML CUDA, speaker `Vivian`, fed Simplified glyphs |
 | **Search** | SearXNG `:8888` + wttr.in | real results only |
 | **Embedding** | `granite-embedding-97m-multilingual` Q8_0 | `:11434`, semantic rerank |
 
@@ -128,21 +128,51 @@ speaking. Three properties keep it free, and each was got wrong first:
 
 `S2S_CAPTION=0` turns it off.
 
-### The voice
+### The voice, and why the TTS reads Simplified
 
 `Qwen3-TTS-12Hz-0.6B-CustomVoice` has nine preset speakers, and the handler's default is
-**`Aiden` — an American English male voice**, which the pipeline was using to speak Mandarin.
-`pipeline.sh` now sets `--qwen3_tts_speaker Serena` (Chinese female) with a
-`--qwen3_tts_instruct` line asking for a Taiwanese accent and a conversational register.
-Corroboration beyond listening: X-ASR heard Aiden's 傘喔 as 闪光, the only variant it mangled that
-way.
+**`Aiden` — a sunny American male voice**, which the pipeline was using to speak Mandarin.
+`pipeline.sh` now sets `--qwen3_tts_speaker Vivian`, measured best of the Chinese presets.
 
-**There is no zh-TW voice in the model.** All Chinese presets are mainland-trained, and two
-(`Dylan`, `Eric`) are explicitly Beijing and Sichuan dialects. So the text is zh-TW (OpenCC) and
-the prosody can be steered, but the pronunciation habits are not Taiwanese. The only real fix is
-voice cloning with the `Base` variant, which needs a different GGUF —
-`Serveurperso/Qwen3-TTS-GGUF` is the repo the runtime itself resolves against, and its Q4 talker
-segfaults, so Q8 is the working quant.
+**The TTS is fed Simplified characters; the screen keeps zh-TW.** 「記得帶把傘喔」 was read with
+the wrong syllable in 5 of 6 runs — 扇, 散, 線, 三, 山 — while the identical sentence written
+记得带把伞哦 was correct 6 of 6:
+
+| TTS input | 傘 correct |
+|---|---|
+| Traditional 記得帶把傘喔 | 1/6 |
+| Simplified 记得带把伞哦 | **6/6** |
+
+The failure is the **glyph**, not the voice. Vivian, Serena and Uncle_Fu all miss it; the
+`instruct` line does not move it (2/6 vs 1/6, noise); and OmniVoice misses it too. Qwen3-TTS is
+mainland-trained, so Traditional-only characters are rare tokens.
+
+`serve.py` wraps the TTS stage and converts `TTSInput.text` with `zhconv` `zh-hans` before
+synthesis. `LLMResponseChunk.text` is untouched, so the transcript the client renders stays
+Traditional. The conversion is **character-level on purpose**, the same principle as the
+frontend's `tw`-vs-`twp` split: 軟體 becomes 软体, *not* the mainland word 软件, and 網路/程式 are
+left alone — it changes which glyphs are read, never the Mandarin that is said. Scope is modest
+and worth stating: across six ordinary replies five were already perfect either way (mean CER
+1.9% → 0.9%); the win is concentrated on rare glyphs, which is where it was audibly wrong.
+
+**There is still no zh-TW voice in the model.** All Chinese presets are mainland-trained, and two
+(`Dylan`, `Eric`) are explicitly Beijing and Sichuan dialects. Prosody can be steered and the
+glyphs are now right, but the accent is not Taiwanese.
+
+Two routes to a genuinely Taiwanese voice were evaluated and neither is adopted:
+
+- **Voice cloning with the `Base` variant.** Works — the reference timbre transfers — but it
+  garbles *short* sentences, which is all this demo produces: 「記得帶把鑰匙喔」 came back as
+  记得代表真实哦. Needs a different GGUF; `Serveurperso/Qwen3-TTS-GGUF` is the repo the runtime
+  itself resolves against, and its Q4 talker segfaults, so Q8 is the working quant. 0.6B and 1.7B
+  were indistinguishable.
+- **[OmniVoice](https://github.com/k2-fsa/OmniVoice)**, which upstream supports via
+  `--tts omnivoice`. Its handler is on the framework's `main` but **not in the released 0.2.12**
+  we run, and `main` has since dropped `get_tts_handler`, which `serve.py` substitutes — so
+  adopting it means porting those hooks, not changing a flag. It also **does not stream**
+  (upstream: "does not currently expose incremental audio through `generate()`"), runs at RTF
+  0.56 against Qwen3-TTS's 0.17, and its weights are **CC-BY-NC**, where Qwen3-TTS is Apache-2.0.
+  It missed 傘 as well.
 
 ### Tool calls are native, not prompted
 
@@ -259,7 +289,9 @@ Applying `twp` to the transcript would put words in it the user never said — �
   (「那明天呢？」 keeps the city), with past speech replayed as audio.
 - **Real tools**, called natively: `web_search`, `get_weather`, `get_current_datetime`, with
   arguments validated and results fenced as untrusted data.
-- **zh-TW throughout**, whatever language the question was asked in.
+- **zh-TW throughout**, whatever language the question was asked in — and the TTS is fed
+  Simplified glyphs so Traditional-only characters are pronounced correctly, while the
+  transcript on screen stays Traditional.
 - **Answers sized for speech** — one or two spoken sentences, no markdown.
 - **Thinking never spoken.** Deliberation stays in `reasoning_content`.
 - **Live captions**, a VRAM readout, and a debug export of the whole session.
@@ -304,6 +336,8 @@ audio. Barge-in cancels **1.29 s** after speech starts.
 | `LLM_PATH_GEMMA` / `LLM_PATH_GEMMA_MTP` | see `llm_manager.py` | weights and MTP draft head |
 | `LLM_MTP` / `LLM_MTP_DRAFT_N` | `1` / `3` | self-speculative decoding |
 | `TTS_MODEL_DIR` | `/tmp/qwen3_tts` | TTS GGUF location |
+
+The TTS speaker and instruct are set in `s2s/deploy/pipeline.sh`, not by env.
 
 ## API
 
