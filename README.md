@@ -346,7 +346,14 @@ movements between runs are noise. And the remaining `unique` failures are genuin
 蔡孟祥 heard as 蔡孟翔, 吳承倫 as 無成倫 — where the phonetic fallback can only help once the query
 reaches the directory at all.
 
-**Extensions are read digit by digit — normalised at the TTS input, not in the tool.**
+**Years and extensions are read digit by digit.** 2026年 is 二〇二六年 in Mandarin, never
+兩千零二十六年. The year rule needs no lookup — the 年 that follows identifies it, so 共 2026 元 keeps
+its cardinal reading. Extensions do need one, and that grounding is only as good as the directory:
+extensions originally started at 2000, so 2026 was *both* a year and someone's extension. The
+generator now starts them at 3000 and a test pins that none falls in 1900–2100, which removes the
+ambiguity at the source rather than teaching the normaliser to guess what a number means.
+
+**Extensions are normalised at the TTS input, not in the tool.**
 Qwen3-TTS reads a bare `1102` as 一千一百零二, which is not how anyone gives an extension. This was
 first tried inside `search_contacts`, handing the model 一一〇二 and asking it to keep that form;
 an exported session shows it re-rendering `1102` regardless, and pronunciation is not the tool's

@@ -89,7 +89,12 @@ def main() -> None:
     for r in rows:                       # fixtures already carry theirs
         if r[4] in english:
             english.remove(r[4])
-    ext = 2000
+    # Extensions start above the year range on purpose. The TTS normaliser spells
+    # out a 4-digit run when it matches an extension this session looked up, and
+    # with extensions at 2000+ that rule also caught the year 2026 -- 101 of them
+    # fell between 1900 and 2100. Keeping the directory clear of year-like numbers
+    # removes the collision at the source instead of adding a rule about years.
+    ext = 3000
     while len(rows) < N:
         name = rng.choice(pool) + rng.choice(GIVEN_1) + rng.choice(GIVEN_2)
         dept = rng.choice(DEPARTMENTS)

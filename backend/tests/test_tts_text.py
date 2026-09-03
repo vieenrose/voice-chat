@@ -5,7 +5,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from s2s.tts_text import normalize, spell_extensions, to_simplified  # noqa: E402
+from s2s.tts_text import (  # noqa: E402
+    normalize,
+    spell_extensions,
+    spell_years,
+    to_simplified,
+)
 
 
 class TestExtensions(unittest.TestCase):
@@ -27,6 +32,21 @@ class TestExtensions(unittest.TestCase):
         self.assertEqual(spell_extensions("11021 和 011102", {"1102"}), "11021 和 011102")
 
 
+class TestYears(unittest.TestCase):
+    def test_a_year_is_read_digit_by_digit(self):
+        """2026年 is 二〇二六年 in Mandarin, never 兩千零二十六年."""
+        self.assertEqual(spell_years("今年是 2026 年"), "今年是 二〇二六 年")
+        self.assertEqual(spell_years("2026年9月3日"), "二〇二六年9月3日")
+
+    def test_a_bare_amount_keeps_its_cardinal_reading(self):
+        """共 2026 元 is 兩千零二十六元; only the following 年 makes it a year."""
+        self.assertEqual(spell_years("共 2026 元"), "共 2026 元")
+
+    def test_a_year_needs_no_lookup(self):
+        """Unlike an extension: the 年 identifies it, so no directory is involved."""
+        self.assertEqual(normalize("西元2026年", set()), "西元二〇二六年")
+
+
 class TestGlyphs(unittest.TestCase):
     def test_traditional_becomes_simplified(self):
         self.assertEqual(to_simplified("記得帶把傘喔"), "记得带把伞喔")
@@ -38,8 +58,10 @@ class TestGlyphs(unittest.TestCase):
 
 
 class TestTogether(unittest.TestCase):
-    def test_both_rules_apply(self):
+    def test_all_rules_apply(self):
         self.assertEqual(normalize("她的分機是 1102。", {"1102"}), "她的分机是 一一〇二。")
+        self.assertEqual(normalize("2026年的分機是 1102。", {"1102"}),
+                         "二〇二六年的分机是 一一〇二。")
 
 
 if __name__ == "__main__":

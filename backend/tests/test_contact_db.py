@@ -44,6 +44,17 @@ class TestSearch(unittest.TestCase):
         exts = [c.ext for c in CONTACTS]
         self.assertEqual(len(exts), len(set(exts)))
 
+    def test_no_extension_looks_like_a_year(self):
+        """The TTS normaliser spells out any 4-digit run that is an extension.
+
+        With extensions starting at 2000, that rule also caught the year 2026 --
+        101 of them fell in 1900-2100. The directory keeps clear of that range so
+        the ambiguity cannot arise, rather than the normaliser guessing what a
+        number means.
+        """
+        yearish = [c.ext for c in CONTACTS if "1900" <= c.ext <= "2100"]
+        self.assertEqual(yearish, [], "extensions must not look like years")
+
 
 if __name__ == "__main__":
     unittest.main()
