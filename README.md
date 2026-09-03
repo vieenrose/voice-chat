@@ -154,6 +154,28 @@ answered 「是啊，時間過得真快呢」 with no clock call. Removed rather
 no substitute — 你好 / 謝謝你的幫忙 / 你今天過得如何？ / 早安 all correctly call nothing, while all
 three tool questions still route.
 
+**Turns are remembered by this stage, because nothing else does it.** The
+framework populates its shared `Chat` from a completed transcription — and with `--stt none`
+there is no STT stage to raise one, while captions are deliberately *partial* events that mutate
+nothing. So the `Chat` stayed empty for the whole session and every turn was answered in
+isolation. An exported session shows what that costs: asked 「我想請教一下啊」 the model offered a
+weather lookup, and when the user said 「呃我不查天氣」 it asked *again* which region's weather —
+not stubbornness but amnesia, since the utterance contains the word 天氣 and there was no previous
+turn for 不 to negate. `agent_handler` now records each finished turn into the `Chat` itself:
+
+| spoken | reply |
+|---|---|
+| 今天台北天氣如何？ | 今天台北的天氣預報是多雲，氣溫在攝氏 25 到 30 度之間。 |
+| 那明天呢？ | 明天台北的天氣預報是…濕度為 90% — `get_weather`, 台北 carried over |
+| 我剛剛問的是哪個城市？ | 我上一個回答是針對台北的氣象預報。 — from memory, no tool |
+
+Three details are load-bearing. The user's past turns are replayed **as audio**, not as caption
+text, so X-ASR stays purely cosmetic and no ASR error can enter the model's context. Only the last
+three spoken turns keep their audio — at ~26 prompt tokens per second of speech, an unbounded
+history would re-prefill minutes of sound on every turn — and older ones keep the assistant's text.
+And a **barged-in turn is never recorded**: it never reached the user, so storing it would leave
+the model answering a question they interrupted.
+
 **Endpointing is set for Mandarin, not for the example's English.** HF's example uses
 `--min_silence_ms 300`; at that setting an exported session showed VAD closing turns
 mid-question — segments of 0.75–2.04 s (mean 1.44) where the captions mark the cut exactly:
@@ -503,6 +525,10 @@ mic frames counted rather than listed, so a 300-chunk turn exports at ~48 kB ins
   untrusted data. No curated results, no fabricated forecasts.
 - **zh-TW throughout.** Replies default to Traditional Chinese whatever the language spoken;
   OpenCC converts both sides for display, by different rules — see [the frontend](#the-frontend).
+- **Multi-turn memory on the audio path.** Follow-ups resolve against earlier turns
+  (「那明天呢？」 keeps the city), with past speech replayed as audio rather than as caption text.
+- **Answers sized for speech.** Replies are one or two spoken sentences with no markdown: the
+  same three questions dropped from 33/275/358 audio chunks to 18/51/87.
 - **Thinking never spoken.** Deliberation stays in `reasoning_content`, out of both the audio and
   the transcript.
 - **Live captions** while you speak, a VRAM readout, and a debug export of the whole session.

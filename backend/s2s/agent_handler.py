@@ -128,6 +128,95 @@ class AgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
         return [audio_content(a.astype("<i2").tobytes(), sample_rate)]
 
     # -- prompt / history ------------------------------------------------
+    # How many past spoken turns keep their audio. Each second of speech is ~26
+    # prompt tokens, so a handful of short turns is affordable; beyond that the
+    # audio is dropped and only the assistant's own replies remain, which keeps
+    # the thread of the conversation without re-prefilling minutes of sound.
+    _AUDIO_TURNS = 3
+
+    @staticmethod
+    def _api_audio_part(part: dict) -> dict | None:
+        """Chat stores an audio part as {type, audio}; the API wants input_audio."""
+        if part.get("type") != "input_audio" or not part.get("audio"):
+            return None
+        return {"type": "input_audio",
+                "input_audio": {"data": part["audio"], "format": "wav"}}
+
+    @classmethod
+    def _spoken_history(cls, req: LLMIn) -> list[dict]:
+        """Every past turn, with the user's speech kept as audio.
+
+        The text path drops the newest user message because it is the prompt.
+        Here the prompt is the audio on the request itself, so nothing in the
+        Chat is the current turn and all of it is history.
+        """
+        chat = getattr(req.runtime_config, "chat", None)
+        if chat is None:
+            return []
+        try:
+            items = chat.to_transformers_chat()
+        except Exception:
+            logger.exception("could not read chat history")
+            return []
+
+        out: list[dict] = []
+        for m in items:
+            role = m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
+            if role not in ("user", "assistant"):
+                continue
+            body = m.get("content") if isinstance(m, dict) else getattr(m, "content", None)
+            if isinstance(body, list):
+                parts = [q for q in (cls._api_audio_part(p) for p in body if isinstance(p, dict))
+                         if q]
+                text = " ".join(str(p.get("text") or "") for p in body
+                                if isinstance(p, dict) and p.get("text")).strip()
+                if text:
+                    parts.append({"type": "text", "text": text})
+                if parts:
+                    out.append({"role": role, "content": parts})
+            elif isinstance(body, str) and body.strip():
+                out.append({"role": role, "content": body})
+
+        # Drop audio from all but the most recent turns; keep their text.
+        spoken = [i for i, m in enumerate(out) if isinstance(m["content"], list)]
+        for i in spoken[:-cls._AUDIO_TURNS] if len(spoken) > cls._AUDIO_TURNS else []:
+            kept = [p for p in out[i]["content"] if p.get("type") == "text"]
+            out[i]["content"] = kept or "（先前的語音提問）"
+        return out
+
+    @staticmethod
+    def _record_turn(req: LLMIn, wav_b64: str | None, answer: str) -> None:
+        """Write the finished turn into the shared Chat.
+
+        With --stt none nothing else does: there is no STT stage to raise a
+        completed transcription, and captions are deliberately partial events
+        that mutate no state. Without this the model is handed an empty history
+        on every turn, so it cannot resolve "and tomorrow?" -- or even notice
+        that the user just said they did NOT want the weather.
+        """
+        chat = getattr(req.runtime_config, "chat", None)
+        if chat is None:
+            return
+        try:
+            from speech_to_speech.LLM.chat import (
+                RealtimeConversationItemAssistantMessage,
+                RealtimeConversationItemUserMessage,
+            )
+
+            if wav_b64:
+                chat.add_item(RealtimeConversationItemUserMessage(
+                    role="user", type="message",
+                    content=[{"type": "input_audio", "audio": wav_b64}]))
+            if answer:
+                chat.add_item(RealtimeConversationItemAssistantMessage(
+                    role="assistant", type="message",
+                    content=[{"type": "output_text", "text": answer}]))
+            trim = getattr(chat, "trim_if_needed", None)
+            if callable(trim):
+                trim()
+        except Exception:
+            logger.exception("could not record the turn into the chat")
+
     @staticmethod
     def _history_and_prompt(req: LLMIn) -> tuple[list[dict], str]:
         """Read the conversation out of the shared Chat on the runtime config.
@@ -195,6 +284,10 @@ class AgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
             # audio tee, so it appears while the user is still talking rather than
             # after the segment closes. This stage only has to answer.
             prompt = self._audio_prompt(audio, sr)
+            # The Chat holds no user message on this path (no STT stage), so the
+            # newest-message-is-the-prompt rule of the text path does not apply:
+            # every stored turn is history, and the audio here is the prompt.
+            history = self._spoken_history(request)
 
         def chunk(text: str) -> LLMResponseChunk:
             return LLMResponseChunk(
@@ -217,6 +310,7 @@ class AgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
             return
 
         pending, spoken, error = "", False, None
+        answered = ""      # what actually reached the user, for the history
         try:
             for kind, payload in self._drive(history, prompt):
                 if self._stale(gen, request):
@@ -239,9 +333,11 @@ class AgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
                     head, pending = pending[:cut].strip(), pending[cut:]
                     if head:
                         spoken = True
+                        answered += head
                         yield chunk(head)
             if pending.strip() and not self._stale(gen, request):
                 spoken = True
+                answered += pending.strip()
                 yield chunk(pending.strip())
         except Exception as e:  # a dead LLM must not wedge the pipeline
             logger.exception("Qwen-Agent turn failed")
@@ -251,6 +347,14 @@ class AgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
             from agent.qwen_harness import NO_ANSWER_ZH
 
             yield chunk(NO_ANSWER_ZH)
+
+        # Only a turn that actually reached the user belongs in the history; a
+        # superseded (barged-in) one never happened as far as the user is
+        # concerned, and recording it would answer a question they interrupted.
+        if audio is not None and answered.strip() and not self._stale(gen, request):
+            part = prompt[0] if isinstance(prompt, list) and prompt else {}
+            self._record_turn(request, (part.get("input_audio") or {}).get("data"),
+                              answered.strip())
 
         yield EndOfResponse(
             turn_id=request.turn_id,
