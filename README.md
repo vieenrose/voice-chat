@@ -288,6 +288,12 @@ ask instead of guessing or reading the whole list aloud. Spoken, end to end:
 | 🗣 行銷部 | → `search_contacts{query:"陳怡君", department:"行銷部"}` → 1 match |
 | 🤖 | 好的，行銷部的陳怡君是行銷企劃，分機是 1102。 |
 
+A miss is **authoritative**: the directory is the whole staff list, so 「查無此人」 is the answer.
+An exported session caught the alternative — asked to transfer to 王大明, who is not in the
+directory, the model called `search_contacts`, got nothing, then fell back to `web_search` for the
+name and answered as if asked about a public figure (「政治人物、軍方英雄還是其他領域？」). The tool
+now says so in its own output and its description.
+
 This only works because the audio path now keeps history — the second turn is the word 「行銷部」
 on its own, which means nothing without the first. Matching is phonetic as well as literal, since
 the name arrives from speech: 程怡君 finds 陳怡君 through toneless pinyin and rapidfuzz, while an

@@ -103,6 +103,7 @@ def run_turn(messages: list[dict], tools: dict, *, api_base: str, model: str,
     cfg = dict(generate_cfg or {})
     schemas = _tool_schemas(tools)
     convo = list(messages)
+    spoke_preamble = False   # at most one spoken acknowledgement per turn
     answer = ""
 
     for _step in range(MAX_STEPS):
@@ -169,7 +170,12 @@ def run_turn(messages: list[dict], tools: dict, *, api_base: str, model: str,
         # model that starts deliberating simply exceeds it and is dropped.
         if streamed:
             ack = content.strip()
-            if PREAMBLE_MAX_CHARS and 0 < len(ack) <= PREAMBLE_MAX_CHARS:
+            # Only the first tool step may speak. A turn that calls two tools
+            # otherwise says it twice -- an exported session shows
+            # 「好的，我查一下。好的，我查一下。」 before a single answer.
+            if (PREAMBLE_MAX_CHARS and not spoke_preamble
+                    and 0 < len(ack) <= PREAMBLE_MAX_CHARS):
+                spoke_preamble = True
                 logger.debug("keeping tool preamble: %r", ack)
             else:
                 _emit({"type": "llm_delta", "text": "", "reset": True})

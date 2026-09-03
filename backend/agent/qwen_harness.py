@@ -159,7 +159,7 @@ class QwenSearchContacts(Tool):
     description = ('Look up a colleague in the company directory by spoken name, and get their '
                    'extension. Names collide, so this often returns SEVERAL people: when it '
                    'does, do not guess and do not read the whole list out - ask the user which '
-                   'department, then call again with that department.')
+                   'department, then call again with that department. This directory is the complete staff list: if it finds nobody, that is the answer - do NOT fall back to web_search for a colleague.')
     parameters = {
         'type': 'object',
         'properties': {
@@ -188,7 +188,8 @@ class QwenSearchContacts(Tool):
 
         matches = search(query, dept)
         if not matches:
-            out = f"找不到「{query}」這個人。"
+            out = (f"公司通訊錄裡沒有「{query}」這個人。這份通訊錄就是公司同事的完整名單，"
+                   f"所以直接告訴使用者查無此人，不要改用網路搜尋去找同事。")
         elif len(matches) == 1:
             m = matches[0]
             out = f"找到 1 位：{m['name']}，{m['dept']}，{m['title']}，分機 {m['ext']}。"
