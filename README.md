@@ -270,6 +270,29 @@ deliberation is a paragraph. There is no phrase list — a model that starts del
 exceeds `LLM_TOOL_PREAMBLE_MAX` (40 chars) and is dropped as before. Set it to `0` to restore the
 old behaviour.
 
+### The attendant flow: one name, several people
+
+`search_contacts` looks a colleague up in a zh-TW staff directory and returns their extension.
+The directory is built so that **names collide on purpose** — 陳怡君 sits in three departments,
+林建宏 in two, and 張志強/張志祥 differ by one easily-misheard syllable. A directory of unique
+names would never exercise the turn that matters.
+
+When several people match, the tool **hands the ambiguity back** rather than resolving it: it
+reports how many matched and which departments they are in, and its description tells the model to
+ask instead of guessing or reading the whole list aloud. Spoken, end to end:
+
+| | |
+|---|---|
+| 🗣 幫我轉接陳怡君 | → `search_contacts{query:"陳怡君"}` → 3 matches |
+| 🤖 | 好的，我幫你找一下。您要找的是研發部、行銷部還是客服部的陳怡君？ |
+| 🗣 行銷部 | → `search_contacts{query:"陳怡君", department:"行銷部"}` → 1 match |
+| 🤖 | 好的，行銷部的陳怡君是行銷企劃，分機是 1102。 |
+
+This only works because the audio path now keeps history — the second turn is the word 「行銷部」
+on its own, which means nothing without the first. Matching is phonetic as well as literal, since
+the name arrives from speech: 程怡君 finds 陳怡君 through toneless pinyin and rapidfuzz, while an
+exact 王小華 still beats the homophone 黃小華.
+
 ### Tool safety
 
 Tool output is **untrusted input**. `agent/tool_guard.py`:

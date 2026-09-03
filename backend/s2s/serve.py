@@ -80,9 +80,19 @@ def _install_llm_config_route(app) -> None:
 
     @app.get("/v1/llm-config")
     def get_llm_config() -> dict:
+        # The tool list is reported, not hardcoded in the page: the card read
+        # "3 工具" for a while after a fourth was added, which is the same way the
+        # model label went stale before it was derived from here.
+        try:
+            from agent.qwen_harness import _tools
+            tools = sorted(_tools())
+        except Exception:
+            logger.exception("could not read the tool list")
+            tools = []
         return {
             "model": os.getenv("LLM_MODEL_ID", LLM_MODEL_NAME),
             "api_base": os.getenv("LLM_API_BASE", LLM_API_BASE),
+            "tools": tools,
         }
 
 

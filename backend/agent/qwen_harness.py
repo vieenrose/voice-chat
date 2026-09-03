@@ -154,6 +154,57 @@ class QwenWebSearch(Tool):
         _emit({"type": "tool_result", "name": "web_search", "result": res, "formatted": formatted, "latency_ms": res.get("latency_ms", 0), "source": res.get("source","")})
         return sanitize_tool_output(formatted)
 
+class QwenSearchContacts(Tool):
+    name = 'search_contacts'
+    description = ('Look up a colleague in the company directory by spoken name, and get their '
+                   'extension. Names collide, so this often returns SEVERAL people: when it '
+                   'does, do not guess and do not read the whole list out - ask the user which '
+                   'department, then call again with that department.')
+    parameters = {
+        'type': 'object',
+        'properties': {
+            'query': {'type': 'string',
+                      'description': 'the name as heard, e.g. 陳怡君. A near-miss is fine; '
+                                     'the lookup matches phonetically.'},
+            'department': {'type': 'string',
+                           'description': 'narrow to one department, e.g. 研發部. Use this on '
+                                          'the second call, after the user has said which.'},
+        },
+        'required': ['query'],
+    }
+
+    def call(self, params, **kwargs):
+        try:
+            params = validate_args(params, self.parameters, "search_contacts")
+        except ToolArgumentError as e:
+            logger.warning("rejected tool arguments: %s", e)
+            return f"tool argument error: {e}"
+        query = (params.get('query') or '').strip() if isinstance(params, dict) else ''
+        dept = (params.get('department') or '').strip() if isinstance(params, dict) else ''
+        _emit({"type": "tool_call", "name": "search_contacts",
+               "arguments": {"query": query, "department": dept}, "query": query})
+
+        from tools.contact_db import departments_of, search
+
+        matches = search(query, dept)
+        if not matches:
+            out = f"找不到「{query}」這個人。"
+        elif len(matches) == 1:
+            m = matches[0]
+            out = f"找到 1 位：{m['name']}，{m['dept']}，{m['title']}，分機 {m['ext']}。"
+        else:
+            # Hand back the ambiguity rather than resolving it: the model is told
+            # in the description to ask which department, and the departments are
+            # listed here so it can offer them.
+            depts = "、".join(departments_of(matches))
+            people = "；".join(f"{m['name']}（{m['dept']}，分機 {m['ext']}）" for m in matches)
+            out = (f"找到 {len(matches)} 位同名同事，分別在：{depts}。"
+                   f"請先問使用者是哪一個部門，不要直接唸出全部。明細：{people}")
+        _emit({"type": "tool_result", "name": "search_contacts",
+               "result": {"matches": matches}, "formatted": out})
+        return sanitize_tool_output(out)
+
+
 class QwenGetWeather(Tool):
     name = 'get_weather'
     description = 'Get weather forecast for a location (today/tomorrow/day_after_tomorrow). Wraps wttr.in + SearXNG.'
@@ -499,7 +550,7 @@ _TOOLS: dict = {}
 def _tools() -> dict:
     """The three tools, instantiated once. Plain objects, no registry."""
     if not _TOOLS:
-        for cls in (QwenWebSearch, QwenGetWeather, QwenDateTime):
+        for cls in (QwenWebSearch, QwenGetWeather, QwenDateTime, QwenSearchContacts):
             t = cls()
             _TOOLS[t.name] = t
     return _TOOLS

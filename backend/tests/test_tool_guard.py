@@ -94,9 +94,18 @@ class TestValidateArgs(unittest.TestCase):
 
 class TestToolsUseTheGuard(unittest.TestCase):
     def test_every_tool_validates_and_sanitizes(self):
+        """Counted against the registry, not a literal.
+
+        This asserted "3" and broke the moment a fourth tool was added, which
+        makes it a chore rather than a guard -- the invariant is that EVERY tool
+        validates and sanitises, however many there are.
+        """
+        from agent.qwen_harness import _tools
+
+        n = len(_tools())
         src = (Path(__file__).resolve().parents[1] / "agent" / "qwen_harness.py").read_text()
-        self.assertEqual(src.count("validate_args(params"), 3, "all three tools validate")
-        self.assertEqual(src.count("return sanitize_tool_output("), 3, "all three sanitize")
+        self.assertEqual(src.count("validate_args(params"), n, "every tool validates")
+        self.assertEqual(src.count("return sanitize_tool_output("), n, "every tool sanitises")
 
     def test_the_system_prompt_marks_tool_output_untrusted(self):
         from agent.qwen_harness import AGENT_SYSTEM_MESSAGE
