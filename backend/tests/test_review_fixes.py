@@ -569,12 +569,18 @@ class TestWebSearch(unittest.TestCase):
         saved = ws._SYNC_LOOP, ws._SYNC_THREAD
         ws._SYNC_LOOP = ws._SYNC_THREAD = None
         try:
-            async def fake(query, count=5):
+            seen = {}
+
+            async def fake(query, count=5, recency="any"):
+                seen["recency"] = recency
                 return {"query": query, "results": [], "source": "fake", "latency_ms": 0}
             real = ws.web_search
             ws.web_search = fake
             try:
                 ws.web_search_sync("a", 1)
+                ws.web_search_sync("b", 1, recency="day")
+                self.assertEqual(seen["recency"], "day",
+                                 "web_search_sync must forward the caller's recency")
                 loop_a = ws._SYNC_LOOP
                 ws.web_search_sync("b", 1)
                 self.assertIs(loop_a, ws._SYNC_LOOP, "sync wrapper is recreating the event loop")

@@ -210,7 +210,8 @@ def _entity_first_query(q: str) -> str:
         return [f"台灣{base}"]
     return [base]
 
-async def _try_searxng(query: str, count: int, engine: str | None = None) -> List[Dict] | None:
+async def _try_searxng(query: str, count: int, engine: str | None = None,
+                       recency: str = "any") -> List[Dict] | None:
     """Try local self-hosted SearXNG on 8888. engine=None -> aggregate; else single engine by name."""
     try:
         import httpx
@@ -219,11 +220,15 @@ async def _try_searxng(query: str, count: int, engine: str | None = None) -> Lis
             # zh-TW (not zh-CN) is this app's default region/phrasing for bare Chinese queries too —
             # not just ones that explicitly mention Taiwan — since zh-TW is the app's primary language.
             _lang = "zh-TW" if _is_chinese(query) else "en"
-            # Generic news detection (no hard-coded outlet list) — use SearXNG news category for news queries
-            _is_news = bool(re.search(r"(news|headlines|頭條|新聞|breaking|latest.*news|news.*today)", query.lower()))
-            _cat = "news" if _is_news else "general"
+            # Whether this is a news question is the CALLER's to state, not something
+            # to infer from the words: 「今天台灣發生什麼大事」 is news and contains no
+            # news keyword, while a question about 新聞自由 contains one and is not.
+            # `recency` comes from the tool schema, so the model declares it.
+            _cat = "general" if recency == "any" else "news"
             params = {"q": query, "format": "json", "categories": _cat, "pageno": 1,
                       "language": _lang, "safesearch": 1}
+            if recency != "any":
+                params["time_range"] = recency
             if engine:
                 params["engines"] = engine
             resp = await client.get(f"{_searxng_base()}/search", params=params)
@@ -522,7 +527,7 @@ def _sanitize_query(q: str) -> str:
     return q.strip(" \t\n，。、；：")
 
 
-async def web_search(query: str, count: int = 5) -> Dict:
+async def web_search(query: str, count: int = 5, recency: str = "any") -> Dict:
     """
     Tool function: web_search
     Returns {"query": str, "results": List[Dict], "source": str, "latency_ms": int}
@@ -558,14 +563,13 @@ async def web_search(query: str, count: int = 5) -> Dict:
         if results and len(results) >= 1:
             # Enrich when snippet is thin or query asks for news/details
             thin = any(len(r.get("content","")) < 300 for r in results[:2])
-            is_detailed = bool(re.search(r"(news|headlines|details|explain|summary|full|article|新闻|头条)", query.lower()))
-            if thin or is_detailed:
+            if thin or recency != "any":
                 await _fetch_full_content(results, max_pages=2, max_chars=1200)
     # 0) direct weather source (wttr.in) — zh+en weather queries get real forecast numbers,
     #    avoiding generic bing pages (baike/attractions) that make the LLM refuse to answer.
     wttr = await _wttr_weather(query)
     if wttr:
-        results = await _try_searxng(query, count)
+        results = await _try_searxng(query, count, recency=recency)
         if results:
             results.insert(0, wttr)
         else:
@@ -579,7 +583,13 @@ async def web_search(query: str, count: int = 5) -> Dict:
         logger.info(f"web_search '{query}' source={source} (wttr+searxng) {len(results)} results")
         return payload
     # 1) aggregate SearXNG (auto language)
-    results = await _try_searxng(query, count)
+    results = await _try_searxng(query, count, recency=recency)
+    # Measured on this instance: categories=news with time_range=day returned 0 results
+    # where week returned 3. Widen rather than hand back nothing.
+    if not results and recency == "day":
+        results = await _try_searxng(query, count, recency="week")
+    if not results and recency != "any":
+        results = await _try_searxng(query, count, recency="any")
     source = "searxng"
     best_score = _score(results)
     logger.info(f"SearXNG relevance for '{query}' = {best_score:.2f}")
@@ -599,7 +609,7 @@ async def web_search(query: str, count: int = 5) -> Dict:
         done = False
         for alt_q in _entity_first_query(query)[:1]:
             for qq, tag in (("!bing " + alt_q, "bing"), (alt_q, "agg")):
-                r2 = await _try_searxng(qq, count, engine=None)
+                r2 = await _try_searxng(qq, count, engine=None, recency=recency)
                 s2 = _score(r2)
                 if r2 and s2 > best_score:
                     results, source, best_score = r2, f"searxng:{tag}", s2
@@ -628,7 +638,7 @@ async def web_search(query: str, count: int = 5) -> Dict:
                 results, source, best_score = r, name, s
     if not results:
         latency = int((time.time()-t0)*1000)
-        payload = {"query": query, "results": [], "source": "no_results", "latency_ms": latency, "cached": False}
+        payload = {"query": query, "results": [], "source": "no_results", "latency_ms": latency, "cached": False, "relevance": 0.0}
         _cache_put(ck, payload)
         logger.info(f"web_search '{query}' source=no_results 0 results in {latency}ms — no mock")
         return payload
@@ -646,7 +656,7 @@ async def web_search(query: str, count: int = 5) -> Dict:
             pass
 
     latency = int((time.time()-t0)*1000)
-    payload = {"query": query, "results": results[:count], "source": source, "latency_ms": latency, "cached": False}
+    payload = {"query": query, "results": results[:count], "source": source, "latency_ms": latency, "cached": False, "relevance": round(best_score, 2)}
     _cache_put(ck, payload)
     logger.info(f"web_search '{query}' source={source} {len(results)} results in {latency}ms")
     return payload
@@ -657,7 +667,7 @@ _SYNC_LOOP: asyncio.AbstractEventLoop | None = None
 _SYNC_THREAD = None
 
 
-def web_search_sync(query: str, count: int = 5) -> Dict:
+def web_search_sync(query: str, count: int = 5, recency: str = "any") -> Dict:
     """Run web_search() from sync code.
 
     Uses one persistent background event loop instead of asyncio.run() per call:
@@ -671,7 +681,7 @@ def web_search_sync(query: str, count: int = 5) -> Dict:
         _SYNC_LOOP = asyncio.new_event_loop()
         _SYNC_THREAD = threading.Thread(target=_SYNC_LOOP.run_forever, daemon=True, name="web-search-loop")
         _SYNC_THREAD.start()
-    fut = asyncio.run_coroutine_threadsafe(web_search(query, count=count), _SYNC_LOOP)
+    fut = asyncio.run_coroutine_threadsafe(web_search(query, count=count, recency=recency), _SYNC_LOOP)
     return fut.result(timeout=45)
 
 if __name__ == "__main__":

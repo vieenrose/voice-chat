@@ -185,6 +185,41 @@ the speaker.
 Answers are shaped for speech: the system message asks for one or two spoken sentences with no
 markdown. The same three questions dropped from 33/275/358 audio chunks to 18/51/87.
 
+### Searching: the query is the whole problem
+
+A news question failed in an exported session — 「幫我查一下今天最重要的三條新聞」 came back with
+「抱歉，我無法從目前搜尋結果中找到」. `web_search` **had** been called; it returned five results in
+5.7 s. The query was the user's question repeated back, and that retrieves a Wikinews front page
+from **2025-10-01**, scoring 0.00 relevance. The model then declined honestly rather than
+inventing headlines.
+
+| query | top result |
+|---|---|
+| `今天最重要的三條新聞` (what the model sent) | Wikinews 2025-10-01 |
+| `台灣 今日 頭條新聞` | that morning's real headlines |
+
+Two changes, both structural rather than keyword rules:
+
+- **The schema carries query guidance.** `query` now asks for keywords rather than the whole
+  question, with a worked example. Measured over 4 samples per question, 今天有什麼新聞？ went from
+  `今日新聞`/`今天新聞` to `台灣 今日 頭條新聞` three times in four.
+- **The model declares `recency` (`any` | `day` | `week`)**, and `_try_searxng` uses it to pick
+  `categories=news` and `time_range`. This **deleted** two regexes that guessed intent from words
+  — one for news, one for "detailed" — which were wrong in both directions: 「今天台灣發生什麼大事」
+  is a news question matching neither, while 新聞自由 is a durable fact matching both. The model
+  sets it correctly and consistently: `day` for 今天有什麼新聞？, `any` for 台灣的首都是哪裡？ and
+  光合作用是什麼？. `day` returns 0 results on this SearXNG instance where `week` returns 3, so it
+  widens rather than returning nothing.
+
+`agent/search_agent.py` takes it one step further — searching in its own bounded loop, with its
+own message list, so failed queries never enter the voice turn's context. **It is off by default
+(`SEARCH_AGENT_MAX_SEARCHES=1`)**, and the reason is measured: enabling the retry moved median
+first-audio from 4.9 s to 8.6 s over three spoken news turns and produced no better answers. Once
+the schema fix landed, the first search was already good. Note also what the retry is triggered by
+— the relevance score `web_search` already computes, not an LLM opinion: asking the model "are
+these good?" costs a prose generation, measured at 4.1–7.6 s here against 0.6 s for a step that
+only emits a tool call.
+
 ### Tool safety
 
 Tool output is **untrusted input**. `agent/tool_guard.py`:
@@ -333,6 +368,8 @@ audio. Barge-in cancels **1.29 s** after speech starts.
 | `S2S_CAPTION` / `S2S_CAPTION_DEVICE` | `1` / `cpu` | the X-ASR caption, and where it runs |
 | `VOICE_TZ` | `Asia/Taipei` | timezone `get_current_datetime` reports by default |
 | `SEARXNG_URL` | `http://localhost:8888` | search backend for `web_search` |
+| `SEARCH_AGENT_MAX_SEARCHES` | `1` | `2` lets the search sub-agent rewrite a failed query and retry |
+| `SEARCH_AGENT_MIN_RELEVANCE` | `0.2` | below this a search counts as failed; news legitimately scores ~0.33 |
 | `LLM_PATH_GEMMA` / `LLM_PATH_GEMMA_MTP` | see `llm_manager.py` | weights and MTP draft head |
 | `LLM_MTP` / `LLM_MTP_DRAFT_N` | `1` / `3` | self-speculative decoding |
 | `TTS_MODEL_DIR` | `/tmp/qwen3_tts` | TTS GGUF location |

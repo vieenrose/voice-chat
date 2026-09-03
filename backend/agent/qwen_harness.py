@@ -81,11 +81,25 @@ except ImportError as _e:                              # search stack broken/uni
 
 class QwenWebSearch(Tool):
     name = 'web_search'
-    description = 'Search the web for current information (weather, news, facts).'
+    description = ('Search the web for current information (weather, news, facts). '
+                   'Queries are matched against a live index, so keywords rank far better '
+                   'than the question repeated back.')
+    # Query wording decides whether this returns today's headlines or a stale
+    # encyclopaedia page: 今天最重要的三條新聞 returned a Wikinews front page from
+    # 2025-10-01 and scored 0.00 relevance, while 台灣 今日 頭條新聞 returned that
+    # morning's actual headlines. The guidance lives in the schema the model
+    # reads, so the model still writes the query -- nothing here rewrites it.
     parameters = {
         'type': 'object',
         'properties': {
-            'query': {'type': 'string', 'description': 'search query 3-8 words'}
+            'query': {'type': 'string',
+                      'description': ('search keywords, 3-8 words -- not the whole question. '
+                                      'For anything time-sensitive name the place and recency, '
+                                      "e.g. '台灣 今日 頭條新聞' rather than '今天有什麼新聞'.")},
+            'recency': {'type': 'string', 'enum': ['any', 'day', 'week'],
+                        'description': ("'day' or 'week' for anything about now -- news, "
+                                        "prices, live events. 'any' for durable facts. "
+                                        'Selects the news index and a time window.')},
         },
         'required': ['query']
     }
@@ -122,10 +136,20 @@ class QwenWebSearch(Tool):
         except Exception:
             if "（請一律使用繁體中文" in query:
                 query = query.split("（請一律使用繁體中文")[0].strip()
-        _emit({"type": "tool_call", "name": "web_search", "arguments": {"query": query}, "query": query})
-        # Use sync version for Qwen-Agent (which is sync)
-        from tools.web_search import web_search_sync, format_results
-        res = web_search_sync(query, count=5)
+        recency = params.get('recency', 'any') if isinstance(params, dict) else 'any'
+        if recency not in ('any', 'day', 'week'):
+            recency = 'any'
+        _emit({"type": "tool_call", "name": "web_search",
+               "arguments": {"query": query, "recency": recency}, "query": query})
+        # Delegated to a sub-agent with its own message list: if this query scores
+        # badly it rewrites it and searches again, without the failed attempts or
+        # the discarded result dumps ever entering the voice turn's context.
+        from agent.search_agent import search as _search
+        from tools.web_search import format_results
+        base, model_id, key = _endpoint()
+        res = _search(kwargs.get("question") or query, query, recency, count=5,
+                      api_base=base, model=model_id, api_key=key,
+                      generate_cfg=_generate_cfg())
         formatted = format_results(res.get("results", [])) if res.get("results") else "No results"
         _emit({"type": "tool_result", "name": "web_search", "result": res, "formatted": formatted, "latency_ms": res.get("latency_ms", 0), "source": res.get("source","")})
         return sanitize_tool_output(formatted)
