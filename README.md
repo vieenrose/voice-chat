@@ -304,6 +304,46 @@ is a closed union of OpenAI types), so rather than fork the framework the trace 
 same HTTP surface as `/v1/vram`. It doubles as the check on the spoken answer: the panel is the
 tool's own output, so a fabricated number is visible on screen.
 
+#### Measured: 500 people, spoken queries
+
+`python3 -m s2s.checks.extension_eval --n 30` runs real spoken turns over the Realtime
+protocol — the question is synthesised by this demo's own TTS, played into the pipeline, and
+scored on **what the caller hears**: the right extension must be spoken and no wrong 4-digit
+number may appear. 29 cases against a 500-person directory:
+
+| shape | | |
+|---|---|---|
+| `ambiguous` | **5/5** | a shared name → asks which department, reads no extension |
+| `too_broad` | **5/5** | 「法務部的法務專員」 (28 people) → asks to narrow |
+| `unique` | **3/10** | one person has the name → speak their extension |
+| `english` | **1/5** | 「請問 Vicky 的分機是多少」 |
+| `by_title` | **1/2** | 「研發部的資深工程師分機是多少」 |
+| `misheard` | **1/2** | a homophone swapped into the name |
+| **overall** | **16/29 (55 %)** | |
+
+Latency, same run: **first sound 0.17 s median** (p90 0.61) and **answer complete 3.17 s
+median**. Those are different things and conflating them flatters the demo — the first sound is
+the acknowledgement, spoken before the tool runs; the extension arrives at the second number.
+
+**The demo is reliable at knowing what it does not know, and unreliable at hearing.** Every
+ambiguous and over-broad case passed: it asks rather than guessing, and never reads an extension
+it should not. The lookups fail, and the cause is not the directory — it is the word 分機 itself:
+
+| asked | heard as |
+|---|---|
+| 林心廷…分機 | 林星庭**分歧** |
+| 林淑宏…分機 | 林書紅的**分店**數量 |
+| 黃柏宏…分機 | 黃百紅的**薪資** |
+
+Once 分機 is misheard the turn is no longer a directory question, and **15 of 39 tool calls went
+to `web_search`** — one answered with London opera ticket prices, another with exchange rates. The
+names degrade too (黃家慧 → 皇家, 楊冠廷 → 楊冠廷分歧), which the phonetic fallback can only fix
+once the query reaches the directory at all.
+
+One confound, stated because it matters: the eval speaks with Qwen3-TTS, so it measures
+**synthetic** speech through the pipeline, not a human caller. Rare given names and 分機 are
+exactly where that TTS is weakest, so this is a lower bound rather than a user-facing accuracy.
+
 A miss is **authoritative**: the directory is the whole staff list, so 「查無此人」 is the answer.
 An exported session caught the alternative — asked to transfer to 王大明, who is not in the
 directory, the model called `search_contacts`, got nothing, then fell back to `web_search` for the

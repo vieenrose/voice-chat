@@ -164,13 +164,17 @@ class QwenSearchContacts(Tool):
         'type': 'object',
         'properties': {
             'query': {'type': 'string',
-                      'description': 'the name as heard, e.g. 陳怡君. A near-miss is fine; '
-                                     'the lookup matches phonetically.'},
+                      'description': 'the name as heard, in Chinese or English - 陳怡君 or Stella. '
+                                     'A near-miss is fine; the lookup matches phonetically. '
+                                     'Omit it to search by department and/or title alone.'},
             'department': {'type': 'string',
                            'description': 'narrow to one department, e.g. 研發部. Use this on '
                                           'the second call, after the user has said which.'},
+            'title': {'type': 'string',
+                      'description': 'narrow by job title, e.g. 架構師. Use with department for '
+                                     '「研發部的架構師是誰」.'},
         },
-        'required': ['query'],
+        'required': [],
     }
 
     def call(self, params, **kwargs):
@@ -181,12 +185,14 @@ class QwenSearchContacts(Tool):
             return f"tool argument error: {e}"
         query = (params.get('query') or '').strip() if isinstance(params, dict) else ''
         dept = (params.get('department') or '').strip() if isinstance(params, dict) else ''
+        role = (params.get('title') or '').strip() if isinstance(params, dict) else ''
         _emit({"type": "tool_call", "name": "search_contacts",
-               "arguments": {"query": query, "department": dept}, "query": query})
+               "arguments": {"query": query, "department": dept, "title": role},
+               "query": query})
 
         from tools.contact_db import departments_of, search
 
-        matches = search(query, dept)
+        matches = search(query, dept, role)
         if not matches:
             out = (f"公司通訊錄裡沒有「{query}」這個人。這份通訊錄就是公司同事的完整名單，"
                    f"所以直接告訴使用者查無此人，不要改用網路搜尋去找同事。")
@@ -194,15 +200,24 @@ class QwenSearchContacts(Tool):
             m = matches[0]
             out = f"找到 1 位：{m['name']}，{m['dept']}，{m['title']}，分機 {m['ext']}。"
         else:
-            # Hand back the ambiguity rather than resolving it: the model is told
-            # in the description to ask which department, and the departments are
-            # listed here so it can offer them.
-            depts = "、".join(departments_of(matches))
-            people = "；".join(f"{m['name']}（{m['dept']}，分機 {m['ext']}）" for m in matches)
-            out = (f"找到 {len(matches)} 位同名同事，分別在：{depts}。"
-                   f"請先問使用者是哪一個部門，不要直接唸出全部。明細：{people}")
+            # Hand back the ambiguity rather than resolving it -- but say what
+            # actually separates these people. A name shared across departments is
+            # answered by naming a department; 23 colleagues in one department are
+            # not, and telling the model to ask for a department there sent it in
+            # circles.
+            depts = departments_of(matches)
+            shown = matches[:8]
+            people = "；".join(f"{m['name']}（{m['dept']}，{m['title']}，分機 {m['ext']}）"
+                              for m in shown)
+            more = f"（僅列出前 {len(shown)} 位，共 {len(matches)} 位）" if len(shown) < len(matches) else ""
+            if len(depts) > 1:
+                ask = f"請先問使用者是哪一個部門：{'、'.join(depts)}。"
+            else:
+                ask = "請先問使用者要找的人叫什麼名字，或提供更明確的條件。"
+            out = (f"找到 {len(matches)} 位符合條件。{ask}不要直接唸出全部。"
+                   f"明細：{people}{more}")
         _emit({"type": "tool_result", "name": "search_contacts",
-               "arguments": {"query": query, "department": dept},
+               "arguments": {"query": query, "department": dept, "title": role},
                "result": {"matches": matches}, "formatted": out})
         return sanitize_tool_output(out)
 
