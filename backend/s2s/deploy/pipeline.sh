@@ -35,6 +35,8 @@ exec python3 -m s2s.serve --mode realtime \
   --responses_api_stream \
   --min_silence_ms 700 \
   --tts qwen3 --qwen3_tts_backend ggml --qwen3_tts_language zh \
+  --qwen3_tts_speaker Vivian \
+  --qwen3_tts_instruct "用台灣人的口音說話，語氣親切自然，像在跟朋友聊天" \
   --qwen3_tts_gguf_talker_path /tmp/qwen3_tts/talker_cv_q8.gguf \
   --qwen3_tts_gguf_codec_path  /tmp/qwen3_tts/codec.gguf \
   --log_level info

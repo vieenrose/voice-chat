@@ -283,11 +283,57 @@ def _get_llm_handler(
     )
 
 
+def _speak_simplified() -> None:
+    """Hand the TTS Simplified characters, while the screen keeps zh-TW.
+
+    Qwen3-TTS is mainland-trained and mispronounces Traditional-only glyphs:
+    「記得帶把傘喔」 was read with the wrong syllable in 5 of 6 runs (扇/散/線/三),
+    while the identical sentence written 记得带把伞哦 was correct 6 of 6. The
+    failure is the glyph, not the speaker or the instruct -- Vivian, Serena and
+    Uncle_Fu all miss it, and OmniVoice misses it too.
+
+    Conversion is `zh-hans`, which is character-level: 軟體 becomes 软体, not the
+    mainland word 软件, and 網路/程式 are left alone. That matters, because a
+    vocabulary conversion would change which words are spoken -- the same reason
+    the frontend uses `tw` for the user transcript and `twp` only for the reply.
+    So this changes the glyphs the model reads, never the Mandarin it says.
+
+    Applied to the TTS stage alone: `LLMResponseChunk.text` is untouched, so the
+    transcript the client renders stays Traditional.
+    """
+    try:
+        import zhconv
+    except ImportError:
+        logger.warning("zhconv missing; TTS will read Traditional glyphs directly")
+        return
+
+    upstream = s2s_pipeline.get_tts_handler
+
+    def get_tts_handler(*args, **kwargs):
+        handler = upstream(*args, **kwargs)
+        original = handler.process
+
+        def process(tts_input):
+            text = getattr(tts_input, "text", None)
+            if text:
+                hans = zhconv.convert(text, "zh-hans")
+                if hans != text:
+                    tts_input = tts_input.model_copy(update={"text": hans})
+            yield from original(tts_input)
+
+        handler.process = process
+        logger.info("TTS reads Simplified glyphs; the transcript stays zh-TW")
+        return handler
+
+    s2s_pipeline.get_tts_handler = get_tts_handler
+
+
 def main() -> None:
     _neutralize_mps_empty_cache()
     _give_stage_the_event_queue()
     _tee_audio_to_captions()
     _install_vram_route()
+    _speak_simplified()
     logger.info("LLM endpoint: %s (%s)", LLM_API_BASE, LLM_MODEL_NAME)
     s2s_pipeline.get_llm_handler = _get_llm_handler
     # chat-completions' argument dataclass is the one carrying base_url/api_key,

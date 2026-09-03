@@ -59,3 +59,6 @@ kokoro-onnx==0.4.*
 
 # --- web_search backends ---
 duckduckgo_search==8.1.*
+# Character-level zh-TW -> zh-CN for the TTS stage only; Qwen3-TTS is
+# mainland-trained and mispronounces Traditional-only glyphs (s2s/serve.py).
+zhconv
