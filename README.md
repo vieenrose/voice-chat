@@ -220,6 +220,29 @@ the schema fix landed, the first search was already good. Note also what the ret
 these good?" costs a prose generation, measured at 4.1–7.6 s here against 0.6 s for a step that
 only emits a tool call.
 
+### Saying something before the search
+
+A tool turn is several seconds of silence, which reads as broken rather than busy. The model is
+now asked, in the system message, to say one short clause before calling a tool — and
+`native_loop` speaks it instead of discarding it:
+
+| | first audio after speech ended |
+|---|---|
+| before | 3.9–6.5 s (median 4.9) |
+| with the acknowledgement | **0.92 s / 1.13 s** when it lands before the call |
+
+The catch is that it does not always land before the call. Across four weather turns the
+acknowledgement was produced 4/4 but first-audio was 0.99 / 5.58 / 1.13 / 3.55 s — on some turns
+the model emits it only in the final step, after the tool has returned, which is also where an
+occasional duplicated 好的 comes from (1 in 4).
+
+**The bound is on length, not wording.** `native_loop` used to discard everything streamed before
+a tool call, which is what stopped reasoning being read aloud as an answer (829baf1). Keeping a
+*short* utterance and dropping a long one preserves that: an acknowledgement is a clause,
+deliberation is a paragraph. There is no phrase list — a model that starts deliberating simply
+exceeds `LLM_TOOL_PREAMBLE_MAX` (40 chars) and is dropped as before. Set it to `0` to restore the
+old behaviour.
+
 ### Tool safety
 
 Tool output is **untrusted input**. `agent/tool_guard.py`:
@@ -368,6 +391,7 @@ audio. Barge-in cancels **1.29 s** after speech starts.
 | `S2S_CAPTION` / `S2S_CAPTION_DEVICE` | `1` / `cpu` | the X-ASR caption, and where it runs |
 | `VOICE_TZ` | `Asia/Taipei` | timezone `get_current_datetime` reports by default |
 | `SEARXNG_URL` | `http://localhost:8888` | search backend for `web_search` |
+| `LLM_TOOL_PREAMBLE_MAX` | `40` | longest pre-tool utterance that is spoken; `0` discards all of it |
 | `SEARCH_AGENT_MAX_SEARCHES` | `1` | `2` lets the search sub-agent rewrite a failed query and retry |
 | `SEARCH_AGENT_MIN_RELEVANCE` | `0.2` | below this a search counts as failed; news legitimately scores ~0.33 |
 | `LLM_PATH_GEMMA` / `LLM_PATH_GEMMA_MTP` | see `llm_manager.py` | weights and MTP draft head |

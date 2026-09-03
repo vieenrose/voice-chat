@@ -42,6 +42,11 @@ from agent.tool_guard import ToolArgumentError, sanitize_tool_output, validate_a
 # bounding it here rather than in an env var read at import time is the point: the
 # old ceiling was 20, which is how an 8-call loop once happened.
 MAX_STEPS = int(os.getenv("LLM_AGENT_MAX_STEPS", "3"))
+
+# Longest pre-tool utterance that is spoken rather than discarded. An
+# acknowledgement is a clause; deliberation is a paragraph. 0 restores the old
+# behaviour of dropping everything before a tool call.
+PREAMBLE_MAX_CHARS = int(os.getenv("LLM_TOOL_PREAMBLE_MAX", "40"))
 HTTP_TIMEOUT = float(os.getenv("LLM_REQUEST_TIMEOUT", "45"))
 
 
@@ -151,10 +156,23 @@ def run_turn(messages: list[dict], tools: dict, *, api_base: str, model: str,
             break
 
         # The model wants tools, so whatever it streamed this step was preamble,
-        # not the answer. Tell the consumer to drop it -- nothing spoken can be
-        # recalled, only what is still buffered.
+        # not the answer. Two kinds turn up there and they need opposite handling.
+        #
+        # A short acknowledgement -- 「好的，我查一下台北的天氣」 -- is worth speaking:
+        # a tool turn is several seconds of silence otherwise, and saying something
+        # immediately is the difference between "thinking" and "broken". The model
+        # is asked for one in the system message.
+        #
+        # Anything longer is the failure 829baf1 fixed: reasoning or scaffolding
+        # leaking into content and being read out as if it were the answer. The
+        # bound is on LENGTH, not on wording -- there is no phrase list here, and a
+        # model that starts deliberating simply exceeds it and is dropped.
         if streamed:
-            _emit({"type": "llm_delta", "text": "", "reset": True})
+            ack = content.strip()
+            if PREAMBLE_MAX_CHARS and 0 < len(ack) <= PREAMBLE_MAX_CHARS:
+                logger.debug("keeping tool preamble: %r", ack)
+            else:
+                _emit({"type": "llm_delta", "text": "", "reset": True})
 
         assistant_msg: dict = {"role": "assistant", "content": content or ""}
         assistant_msg["tool_calls"] = [
