@@ -272,6 +272,11 @@
   }
 
   function stopMic() {
+    // Hand the VAD its silence before the audio stops arriving, or an utterance
+    // that was still open when the user hit 停止收音 never closes and never gets
+    // answered. Only worth doing while the socket is still up -- on disconnect the
+    // turn is being abandoned anyway.
+    if (connected) client?.flushSilence()
     mic?.stop(); mic = null
     listening = false; level = 0
   }

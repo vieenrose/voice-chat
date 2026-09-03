@@ -194,6 +194,23 @@ export class RealtimeClient {
     this.send({ type: 'input_audio_buffer.append', audio: b64 })
   }
 
+  /** Send a tail of silence so the server's VAD can close an open utterance.
+   *
+   * Stopping the microphone stops sending audio altogether, which is NOT the same
+   * as sending quiet: the VAD closes a turn after ~700 ms of silent frames, so a
+   * turn muted mid-sentence stayed open forever and the model was never asked.
+   * The user sees a bot that simply never answers. Resolved on the client because
+   * `input_audio_buffer.commit` is only bookkeeping server-side -- the VAD decides.
+   */
+  flushSilence(ms = 900, samplesPerChunk = 512, rate = 16000) {
+    const chunkMs = (samplesPerChunk / rate) * 1000
+    const quiet = new Uint8Array(samplesPerChunk * 2)          // PCM16 zeros
+    let bin = ''
+    for (const b of quiet) bin += String.fromCharCode(b)
+    const b64 = btoa(bin)
+    for (let sent = 0; sent < ms; sent += chunkMs) this.appendAudio(b64)
+  }
+
   sendText(text) {
     this.send({
       type: 'conversation.item.create',
