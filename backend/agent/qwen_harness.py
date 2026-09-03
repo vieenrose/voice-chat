@@ -190,7 +190,7 @@ class QwenSearchContacts(Tool):
                "arguments": {"query": query, "department": dept, "title": role},
                "query": query})
 
-        from tools.contact_db import departments_of, search, spoken_ext
+        from tools.contact_db import departments_of, search
 
         matches = search(query, dept, role)
         if not matches:
@@ -198,10 +198,7 @@ class QwenSearchContacts(Tool):
                    f"所以直接告訴使用者查無此人，不要改用網路搜尋去找同事。")
         elif len(matches) == 1:
             m = matches[0]
-            # Digit-by-digit, and say so: the model must not re-render it as 2431,
-            # which the TTS reads as a cardinal (兩千四百三十一).
-            out = (f"找到 1 位：{m['name']}，{m['dept']}，{m['title']}，"
-                   f"分機 {spoken_ext(m['ext'])}。回答時分機號碼要照這樣一個數字一個數字唸。")
+            out = f"找到 1 位：{m['name']}，{m['dept']}，{m['title']}，分機 {m['ext']}。"
         else:
             # Hand back the ambiguity rather than resolving it -- but say what
             # actually separates these people. A name shared across departments is
@@ -210,8 +207,8 @@ class QwenSearchContacts(Tool):
             # circles.
             depts = departments_of(matches)
             shown = matches[:8]
-            people = "；".join(f"{m['name']}（{m['dept']}，{m['title']}，"
-                              f"分機 {spoken_ext(m['ext'])}）" for m in shown)
+            people = "；".join(f"{m['name']}（{m['dept']}，{m['title']}，分機 {m['ext']}）"
+                              for m in shown)
             more = f"（僅列出前 {len(shown)} 位，共 {len(matches)} 位）" if len(shown) < len(matches) else ""
             if len(depts) > 1:
                 ask = f"請先問使用者是哪一個部門：{'、'.join(depts)}。"

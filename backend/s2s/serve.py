@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -305,62 +304,13 @@ def _get_llm_handler(
     )
 
 
-_FOUR = re.compile(r"(?<!\d)(\d{4})(?!\d)")
-_CN_DIGITS = "〇一二三四五六七八九"
-
-
-def _say_extensions_as_digits(text: str) -> str:
-    """Read a number digit by digit when it is an extension we just looked up.
-
-    Qwen3-TTS says 1102 as 一千一百零二. The tool already hands the model 一一〇二 and
-    asks it to keep that form, and measured, the model re-renders it as 1102 anyway.
-
-    So the decision is grounded in data rather than in the wording: a 4-digit run is
-    rewritten only when it matches an extension `search_contacts` actually returned
-    in this session. A year (2026) or a temperature is left alone because it is not
-    in the directory.
-    """
-    try:
-        from s2s.tool_trace import snapshot
-
-        seen = {m.get("ext") for e in snapshot()
-                for m in ((e.get("result") or {}).get("matches") or []) if m.get("ext")}
-    except Exception:
-        logger.exception("could not read the tool trace for extension speech")
-        return text
-    if not seen:
-        return text
-
-    def sub(m: "re.Match[str]") -> str:
-        d = m.group(1)
-        return "".join(_CN_DIGITS[int(c)] for c in d) if d in seen else d
-
-    return _FOUR.sub(sub, text)
-
-
 def _speak_simplified() -> None:
-    """Hand the TTS Simplified characters, while the screen keeps zh-TW.
+    """Normalise the text the TTS reads; the transcript on screen is untouched.
 
-    Qwen3-TTS is mainland-trained and mispronounces Traditional-only glyphs:
-    「記得帶把傘喔」 was read with the wrong syllable in 5 of 6 runs (扇/散/線/三),
-    while the identical sentence written 记得带把伞哦 was correct 6 of 6. The
-    failure is the glyph, not the speaker or the instruct -- Vivian, Serena and
-    Uncle_Fu all miss it, and OmniVoice misses it too.
-
-    Conversion is `zh-hans`, which is character-level: 軟體 becomes 软体, not the
-    mainland word 软件, and 網路/程式 are left alone. That matters, because a
-    vocabulary conversion would change which words are spoken -- the same reason
-    the frontend uses `tw` for the user transcript and `twp` only for the reply.
-    So this changes the glyphs the model reads, never the Mandarin it says.
-
-    Applied to the TTS stage alone: `LLMResponseChunk.text` is untouched, so the
-    transcript the client renders stays Traditional.
+    The rules live in s2s/tts_text.py -- how a string should be pronounced is a
+    TTS concern, not something for the tools to encode in their output.
     """
-    try:
-        import zhconv
-    except ImportError:
-        logger.warning("zhconv missing; TTS will read Traditional glyphs directly")
-        return
+    from s2s.tts_text import normalize
 
     upstream = s2s_pipeline.get_tts_handler
 
@@ -371,14 +321,13 @@ def _speak_simplified() -> None:
         def process(tts_input):
             text = getattr(tts_input, "text", None)
             if text:
-                text = _say_extensions_as_digits(text)
-                hans = zhconv.convert(text, "zh-hans")
-                if hans != getattr(tts_input, "text", None):
-                    tts_input = tts_input.model_copy(update={"text": hans})
+                spoken = normalize(text)
+                if spoken != text:
+                    tts_input = tts_input.model_copy(update={"text": spoken})
             yield from original(tts_input)
 
         handler.process = process
-        logger.info("TTS reads Simplified glyphs; the transcript stays zh-TW")
+        logger.info("TTS text normalised (glyphs + extensions); transcript unchanged")
         return handler
 
     s2s_pipeline.get_tts_handler = get_tts_handler

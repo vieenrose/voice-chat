@@ -164,7 +164,7 @@ speaking. Three properties keep it free, and each was got wrong first:
 **`Aiden` — a sunny American male voice**, which the pipeline was using to speak Mandarin.
 `pipeline.sh` now sets `--qwen3_tts_speaker Vivian`, measured best of the Chinese presets.
 
-**The TTS is fed Simplified characters; the screen keeps zh-TW.** 「記得帶把傘喔」 was read with
+**The TTS is fed Simplified characters; the screen keeps zh-TW.** (Also in `tts_text.py`.) 「記得帶把傘喔」 was read with
 the wrong syllable in 5 of 6 runs — 扇, 散, 線, 三, 山 — while the identical sentence written
 记得带把伞哦 was correct 6 of 6:
 
@@ -346,14 +346,14 @@ movements between runs are noise. And the remaining `unique` failures are genuin
 蔡孟祥 heard as 蔡孟翔, 吳承倫 as 無成倫 — where the phonetic fallback can only help once the query
 reaches the directory at all.
 
-**Extensions are handed over digit by digit**, in two layers because one was not enough.
-Qwen3-TTS reads a bare `1102` as a cardinal (一千一百零二), which is not how anyone gives an
-extension, so the tool hands the model 一一〇二 and asks it to keep that form. Measured, the model
-re-renders it as `1102` anyway, so `serve.py` also rewrites 4-digit runs at the TTS boundary —
-**only when the number matches an extension `search_contacts` actually returned this session**.
-Grounding it in the trace rather than in a digit rule is what keeps 2026年 and temperatures alone.
-The structured result keeps the digits, so the panel and the trace stay readable, and the
-evaluation scores both spellings as the same number.
+**Extensions are read digit by digit — normalised at the TTS input, not in the tool.**
+Qwen3-TTS reads a bare `1102` as 一千一百零二, which is not how anyone gives an extension. This was
+first tried inside `search_contacts`, handing the model 一一〇二 and asking it to keep that form;
+an exported session shows it re-rendering `1102` regardless, and pronunciation is not the tool's
+job anyway. `s2s/tts_text.py` now owns it: a 4-digit run is rewritten **only when it matches an
+extension the directory actually returned this session**, read from the tool trace. Grounding it
+in what was looked up, rather than in a rule about digits, is what leaves 2026年 and temperatures
+alone. The screen still shows `1102`.
 
 A miss is **authoritative**: the directory is the whole staff list, so 「查無此人」 is the answer.
 An exported session caught the alternative — asked to transfer to 王大明, who is not in the
