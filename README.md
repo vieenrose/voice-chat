@@ -307,42 +307,44 @@ tool's own output, so a fabricated number is visible on screen.
 #### Measured: 500 people, spoken queries
 
 `python3 -m s2s.checks.extension_eval --n 30` runs real spoken turns over the Realtime
-protocol — the question is synthesised by this demo's own TTS, played into the pipeline, and
-scored on **what the caller hears**: the right extension must be spoken and no wrong 4-digit
-number may appear. 29 cases against a 500-person directory:
+protocol. Questions are synthesised with **edge-tts** (zh-TW neural), played into the pipeline,
+and scored on **what the caller hears**: the right extension must be spoken and no wrong 4-digit
+number may appear. 29 cases against the 500-person directory:
 
 | shape | | |
 |---|---|---|
 | `ambiguous` | **5/5** | a shared name → asks which department, reads no extension |
 | `too_broad` | **5/5** | 「法務部的法務專員」 (28 people) → asks to narrow |
-| `unique` | **3/10** | one person has the name → speak their extension |
-| `english` | **1/5** | 「請問 Vicky 的分機是多少」 |
+| `english` | **4/5** | 「請問 Vicky 的分機是多少」 |
+| `misheard` | **2/2** | a homophone swapped into the name |
+| `unique` | **6/10** | |
 | `by_title` | **1/2** | 「研發部的資深工程師分機是多少」 |
-| `misheard` | **1/2** | a homophone swapped into the name |
-| **overall** | **16/29 (55 %)** | |
+| **overall** | **23/29 (79 %)** | |
 
-Latency, same run: **first sound 0.17 s median** (p90 0.61) and **answer complete 3.17 s
-median**. Those are different things and conflating them flatters the demo — the first sound is
-the acknowledgement, spoken before the tool runs; the extension arrives at the second number.
+**Answer complete: 1.98 s median, 5.83 s p90** — end of the question to end of the spoken answer.
+Time-to-first-sound is deliberately not reported: the acknowledgement arrives while the harness is
+still feeding the trailing silence that closes the turn, so the number collapses to 0.00 and means
+nothing.
 
-**The demo is reliable at knowing what it does not know, and unreliable at hearing.** Every
-ambiguous and over-broad case passed: it asks rather than guessing, and never reads an extension
-it should not. The lookups fail, and the cause is not the directory — it is the word 分機 itself:
+Getting there took two fixes, and the first hypothesis was wrong:
 
-| asked | heard as |
-|---|---|
-| 林心廷…分機 | 林星庭**分歧** |
-| 林淑宏…分機 | 林書紅的**分店**數量 |
-| 黃柏宏…分機 | 黃百紅的**薪資** |
+- **It was not the TTS.** The first run spoke with the demo's own Qwen3-TTS, 分機 came out as
+  分歧 / 分店 / 薪資, and that looked like the whole story. Re-running with edge-tts moved the score
+  from 16/29 to 17/29 — the input was cleaner and almost nothing changed.
+- **It was tool routing.** The system message named `get_weather`, `web_search` and
+  `get_current_datetime` and never mentioned `search_contacts`, so an unfamiliar name went to the
+  web: 「Sandy」 came back as SanDisk's stock price, 「Vicky」 as a salary range. Naming the directory
+  tool first, and saying a name you do not recognise is still a colleague rather than a company,
+  took it to **23/29**. Answer latency dropped with it, from 2.81 s to 1.98 s, because the turn
+  stopped web-searching.
+- A structural fallback handles the rest of the `by_title` shape: when a misheard word lands in
+  `query` and the name matches nothing while the filters do, the filters answer rather than
+  returning 查無此人.
 
-Once 分機 is misheard the turn is no longer a directory question, and **15 of 39 tool calls went
-to `web_search`** — one answered with London opera ticket prices, another with exchange rates. The
-names degrade too (黃家慧 → 皇家, 楊冠廷 → 楊冠廷分歧), which the phonetic fallback can only fix
-once the query reaches the directory at all.
-
-One confound, stated because it matters: the eval speaks with Qwen3-TTS, so it measures
-**synthetic** speech through the pipeline, not a human caller. Rare given names and 分機 are
-exactly where that TTS is weakest, so this is a lower bound rather than a user-facing accuracy.
+Two caveats worth stating. At n=29 an 79 % point estimate carries roughly ±15 pp, so single-shape
+movements between runs are noise. And the remaining `unique` failures are genuinely hard audio —
+蔡孟祥 heard as 蔡孟翔, 吳承倫 as 無成倫 — where the phonetic fallback can only help once the query
+reaches the directory at all.
 
 A miss is **authoritative**: the directory is the whole staff list, so 「查無此人」 is the answer.
 An exported session caught the alternative — asked to transfer to 王大明, who is not in the

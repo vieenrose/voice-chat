@@ -1,9 +1,17 @@
 """Measured accuracy and latency for extension-lookup-by-voice.
 
 Every case is a real spoken turn over the Realtime protocol: the question is
-synthesised by this demo's own TTS, played into the pipeline, and scored against
-the directory. Nothing is mocked, so the numbers include VAD endpointing, Gemma's
-audio encoder, the tool call, and TTS.
+synthesised, played into the pipeline, and scored against the directory. Nothing
+is mocked, so the numbers include VAD endpointing, Gemma's audio encoder, the tool
+call, and TTS.
+
+The questions are spoken by **edge-tts** (zh-TW neural voices), not by this demo's
+own Qwen3-TTS. That is deliberate: an earlier run used Qwen3-TTS and the word 分機
+came out as 分歧 / 分店 / 薪資, so the eval was largely measuring its own input.
+Generating the audio with a different, stronger voice keeps the measurement about
+the pipeline. It is the one part of this repo that touches a network service, and
+it touches it only to make test fixtures -- the demo itself stays fully local.
+`--voice` picks another; `--own-tts` restores the old behaviour for comparison.
 
 Three case shapes, because they fail differently:
 
@@ -82,6 +90,18 @@ def _talk(pcm: bytes, rate: int) -> bytes:
         w.setframerate(rate)
         w.writeframes(pcm)
     return buf.getvalue()
+
+
+async def _synth_edge(sentence: str, path: Path, voice: str) -> None:
+    """Speak a sentence with edge-tts, resampled to the 16 kHz the pipeline wants."""
+    import edge_tts
+
+    mp3 = path.with_suffix(".mp3")
+    await edge_tts.Communicate(sentence, voice).save(str(mp3))
+    import subprocess
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(mp3),
+                    "-ac", "1", "-ar", "16000", str(path)], check=True)
+    mp3.unlink(missing_ok=True)
 
 
 async def _synth(sentence: str, path: Path) -> None:
@@ -235,18 +255,27 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=24)
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--voice", default="zh-TW-HsiaoChenNeural",
+                    help="edge-tts voice for the spoken questions")
+    ap.add_argument("--own-tts", action="store_true",
+                    help="speak the questions with the demo's own Qwen3-TTS instead")
     args = ap.parse_args()
     CACHE.mkdir(parents=True, exist_ok=True)
 
     cases = _cases(args.n, args.seed)
-    print(f"directory: {len(CONTACTS)} people · cases: {len(cases)}\n", flush=True)
+    voice = "own Qwen3-TTS" if args.own_tts else args.voice
+    print(f"directory: {len(CONTACTS)} people · cases: {len(cases)} · voice: {voice}\n",
+          flush=True)
 
     rows, lat_first, lat_total = [], [], []
     for i, c in enumerate(cases, 1):
         clip = CACHE / f"{c['shape']}_{abs(hash(c['spoken'])) % 10**10}.wav"
         if not clip.exists():
-            _wait_slot()
-            asyncio.run(_synth(c["spoken"], clip))
+            if args.own_tts:
+                _wait_slot()
+                asyncio.run(_synth(c["spoken"], clip))
+            else:
+                asyncio.run(_synth_edge(c["spoken"], clip, args.voice))
         _wait_slot()
         said, first, total = asyncio.run(_ask([clip]))
         nums = set(_EXT.findall(said))
@@ -272,14 +301,16 @@ def main() -> int:
     print(f"  {'overall':9s} {ok}/{len(rows)}  ({100*ok/len(rows):.0f}%)")
     good = [x for x in lat_first if x == x]
     if good:
-        # Two different things, and conflating them flatters the demo: the first
-        # sound is the acknowledgement ("好的，我查一下。"), spoken before the tool
-        # runs. What the caller waits for is the extension.
-        print(f"\n  first sound (acknowledgement)  median {st.median(good):.2f}s  "
-              f"p90 {sorted(good)[int(0.9*len(good))-1]:.2f}s")
+        # Only one latency is reported, on purpose. Time-to-first-sound is not
+        # measurable here: the acknowledgement often arrives while this harness is
+        # still feeding the trailing silence that makes VAD close the turn, so the
+        # number collapses to 0.00 and means nothing. What the caller actually
+        # waits for is the extension, and that is what this measures -- from the
+        # end of their question to the end of the spoken answer.
         tot = [x for x in lat_total if x == x]
-        print(f"  answer complete                median {st.median(tot):.2f}s  "
-              f"p90 {sorted(tot)[int(0.9*len(tot))-1]:.2f}s")
+        print(f"\n  answer complete  median {st.median(tot):.2f}s  "
+              f"p90 {sorted(tot)[int(0.9 * len(tot)) - 1]:.2f}s  "
+              f"(from end of question to end of spoken answer)")
     out = CACHE / "results.json"
     out.write_text(json.dumps(rows, ensure_ascii=False, indent=1))
     print(f"\n  detail: {out}")

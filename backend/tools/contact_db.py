@@ -116,10 +116,17 @@ def search(query: str = "", department: str = "", title: str = "") -> list[dict]
     qp = _pinyin(q)
     scored = [(fuzz.ratio(qp, _PINYIN[c.name]), c) for c in pool]
     ranked = sorted((sc for sc in scored if sc[0] >= PHONETIC_FLOOR), key=lambda sc: -sc[0])
-    if not ranked:
-        return []
-    cutoff = max(PHONETIC_FLOOR, ranked[0][0] - TOP_MARGIN)
-    return [c.as_dict() for score, c in ranked if score >= cutoff]
+    if ranked:
+        cutoff = max(PHONETIC_FLOOR, ranked[0][0] - TOP_MARGIN)
+        return [c.as_dict() for score, c in ranked if score >= cutoff]
+
+    # The name matched nothing, but the filters did. That combination happens when
+    # a misheard word lands in `query`: asked for 「研發部的資深工程師分機」 the model
+    # searched name=分基地 title=資深工程師 and got nothing, when the title alone
+    # answers the question. Falling back to the filters beats saying 查無此人.
+    if dept or role:
+        return [c.as_dict() for c in pool]
+    return []
 
 
 def departments_of(matches: list[dict]) -> list[str]:
