@@ -346,10 +346,14 @@ movements between runs are noise. And the remaining `unique` failures are genuin
 蔡孟祥 heard as 蔡孟翔, 吳承倫 as 無成倫 — where the phonetic fallback can only help once the query
 reaches the directory at all.
 
-**Extensions are handed over digit by digit.** Qwen3-TTS reads a bare `2431` as a cardinal
-(兩千四百三十一), which is not how anyone says an extension, so the tool gives the model 二四三一 and
-tells it to keep that form. The structured result keeps the digits, so the on-screen panel and the
-trace stay readable, and the evaluation scores both spellings as the same number.
+**Extensions are handed over digit by digit**, in two layers because one was not enough.
+Qwen3-TTS reads a bare `1102` as a cardinal (一千一百零二), which is not how anyone gives an
+extension, so the tool hands the model 一一〇二 and asks it to keep that form. Measured, the model
+re-renders it as `1102` anyway, so `serve.py` also rewrites 4-digit runs at the TTS boundary —
+**only when the number matches an extension `search_contacts` actually returned this session**.
+Grounding it in the trace rather than in a digit rule is what keeps 2026年 and temperatures alone.
+The structured result keeps the digits, so the panel and the trace stay readable, and the
+evaluation scores both spellings as the same number.
 
 A miss is **authoritative**: the directory is the whole staff list, so 「查無此人」 is the answer.
 An exported session caught the alternative — asked to transfer to 王大明, who is not in the

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -304,6 +305,39 @@ def _get_llm_handler(
     )
 
 
+_FOUR = re.compile(r"(?<!\d)(\d{4})(?!\d)")
+_CN_DIGITS = "〇一二三四五六七八九"
+
+
+def _say_extensions_as_digits(text: str) -> str:
+    """Read a number digit by digit when it is an extension we just looked up.
+
+    Qwen3-TTS says 1102 as 一千一百零二. The tool already hands the model 一一〇二 and
+    asks it to keep that form, and measured, the model re-renders it as 1102 anyway.
+
+    So the decision is grounded in data rather than in the wording: a 4-digit run is
+    rewritten only when it matches an extension `search_contacts` actually returned
+    in this session. A year (2026) or a temperature is left alone because it is not
+    in the directory.
+    """
+    try:
+        from s2s.tool_trace import snapshot
+
+        seen = {m.get("ext") for e in snapshot()
+                for m in ((e.get("result") or {}).get("matches") or []) if m.get("ext")}
+    except Exception:
+        logger.exception("could not read the tool trace for extension speech")
+        return text
+    if not seen:
+        return text
+
+    def sub(m: "re.Match[str]") -> str:
+        d = m.group(1)
+        return "".join(_CN_DIGITS[int(c)] for c in d) if d in seen else d
+
+    return _FOUR.sub(sub, text)
+
+
 def _speak_simplified() -> None:
     """Hand the TTS Simplified characters, while the screen keeps zh-TW.
 
@@ -337,8 +371,9 @@ def _speak_simplified() -> None:
         def process(tts_input):
             text = getattr(tts_input, "text", None)
             if text:
+                text = _say_extensions_as_digits(text)
                 hans = zhconv.convert(text, "zh-hans")
-                if hans != text:
+                if hans != getattr(tts_input, "text", None):
                     tts_input = tts_input.model_copy(update={"text": hans})
             yield from original(tts_input)
 
