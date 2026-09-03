@@ -441,6 +441,14 @@ state and calls no HTTP API beyond the two read-only routes below.
 client-only events, and latency counters. Audio payloads are elided, so a 300-chunk turn exports at
 ~48 KB instead of ~3.5 MB.
 
+**Stopping the mic sends silence first.** Stopping capture stops sending audio, which is not the
+same as sending quiet: the server's VAD closes a turn after ~700 ms of silent *frames*, so an
+utterance still open when the user hits 停止收音 never closed and was never answered — a bot that
+just sits there, still holding the single pipeline slot. `stopMic()` now flushes ~900 ms of
+silence. Measured on the same clip muted mid-utterance: **answered in 3.8 s with the flush, no
+response in 60 s without it.** Client-side on purpose — `input_audio_buffer.commit` is only
+bookkeeping in the framework's audio handler, so it cannot close a turn; the VAD does.
+
 **Both sides are converted for display, by different rules.** OpenCC runs on each, but not the same
 preset:
 
