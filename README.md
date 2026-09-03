@@ -10,6 +10,9 @@ Speak, interrupt it mid-sentence, search the web, hear the answer.
 **Traditional Chinese (Taiwan) throughout** — replies are zh-TW whatever language the question
 was asked in, with English kept only for proper nouns and untranslatable terms.
 
+![The demo mid-conversation: a spoken weather question routed to the tool, answered in zh-TW,
+with the live VRAM readout and the pipeline card showing no STT stage.](docs/demo.png)
+
 ```mermaid
 flowchart LR
     Mic["🎤 Mic"] -->|OpenAI Realtime<br/>WebSocket / WebRTC| RT["Realtime server<br/>:8765"]
