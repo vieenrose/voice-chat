@@ -56,6 +56,11 @@ ours, it can take the VAD segment as *audio* and still call tools, which the fra
 path cannot — that path hands audio to its chat-completions stage, which knows nothing about our
 tools.
 
+Two `llama-server` processes run side by side, not one: `:11435` runs Gemma 4 E4B and answers the
+conversation; `:11436` runs a second, smaller Gemma 4 E2B and only captions the screen (see
+[The on-screen caption](#the-on-screen-caption)). They never share a request — a caption call
+cannot add latency to a turn, and a slow turn cannot make the caption late.
+
 | | choice | notes |
 |---|---|---|
 | **Orchestrator** | `speech-to-speech` 0.2.12 | OpenAI Realtime server on `:8765`, WebSocket + WebRTC |
@@ -82,7 +87,7 @@ tools.** Routing from audio alone, E4B scores 18/18:
 | | clock | weather | news | notes |
 |---|---|---|---|---|
 | **Gemma 4 E4B QAT** | 8/8 | 3/3 | 3/3 | current |
-| Gemma 4 E2B QAT | 2/8 | 3/3 | 3/3 | mishears 幾點鐘 as 幾度中午; text routing is 8/8, so it is the audio path |
+| Gemma 4 E2B QAT | 2/8 | 3/3 | 3/3 | mishears 幾點鐘 as 幾度中午; text routing is 8/8, so it is the audio path. Not used to answer — but its weaker audio path is exactly why it now [captions the screen](#the-on-screen-caption) instead: a caption should show what a smaller model actually heard, mishears included, not paper over them with an unrelated model's guess |
 | [Qwen3-ASR-0.6B-Agent](https://huggingface.co/Luigi/Qwen3-ASR-0.6B-Agent) | 1/2 | 0/2 | 2/2 | 0.5–0.8 s to a complete call, and it generalises to tools it never saw |
 | [Step-Audio 2 mini](https://huggingface.co/stepfun-ai/Step-Audio-2-mini) 8B | 0/3 | 3/3 | 3/3 | fabricates the time; speech-to-speech, no llama.cpp path |
 
@@ -439,9 +444,16 @@ than in this file, where they would drift.
 
 ```bash
 SEARXNG_SETTINGS_PATH=/tmp/searxng/settings.yml python3 -m searx.webapp   # :8888
-backend/s2s/deploy/llm-audio.sh      # Gemma 4 E4B QAT + MTP + audio projector, :11435
-backend/s2s/deploy/pipeline.sh       # no STT stage, speech straight to the model, :8765
+backend/s2s/deploy/llm-audio.sh          # Gemma 4 E4B QAT + MTP + audio projector, :11435
+backend/s2s/deploy/llm-e2b-caption.sh    # Gemma 4 E2B QAT + MTP + audio projector, :11436
+backend/s2s/deploy/pipeline.sh           # no STT stage, speech straight to the model, :8765
 ```
+
+`llm-e2b-caption.sh` is optional in the sense that the pipeline starts without it, but with it down
+`S2S_CAPTION_BACKEND=gemma` (the default) fails every caption call silently — the turn still
+answers, the screen just shows nothing while the user is talking. Run it, or set
+`S2S_CAPTION_BACKEND=xasr` to fall back to the original streaming-transducer engine, which needs
+no second `llama-server`.
 
 | variant | what it changes |
 |---|---|
@@ -457,9 +469,9 @@ speech-to-speech talk --url ws://127.0.0.1:8765/v1/realtime
 cd frontend && npm install && npm run dev     # http://localhost:5173
 ```
 
-Weights not pulled from the Hub on first use: LLM `/home/user/llms/gemma-qat/`, TTS
-`/tmp/qwen3_tts/talker_cv_q8.gguf` + `codec.gguf`, embedding `/tmp/granite-emb-gguf/`,
-SearXNG `/tmp/searxng/settings.yml`.
+Weights not pulled from the Hub on first use: LLM `/home/user/llms/gemma-qat/`, caption LLM
+`/home/user/llms/gemma-qat-e2b/`, TTS `/tmp/qwen3_tts/talker_cv_q8.gguf` + `codec.gguf`,
+embedding `/tmp/granite-emb-gguf/`, SearXNG `/tmp/searxng/settings.yml`.
 
 > **`/tmp` here is tmpfs — it is RAM, with a quota.** A multi-GB write fails partway with
 > `Disk quota exceeded` even though `df` shows free space. Put new weights on a real disk.
@@ -607,8 +619,6 @@ rejects the entire `session.update`. Output declares 24000, the rate Qwen3-TTS p
 One session at a time by default (`--num_pipelines 1`); further connections are rejected. Each
 extra pipeline has its own STT/TTS handlers and costs VRAM.
 
-Three routes are added by `s2s/serve.py`, not upstream:
-
 Two read-only routes are added by `s2s/serve.py`, not upstream:
 
 - `GET /v1/llm-config` — which model is serving, so the UI's pipeline card is derived rather than
@@ -637,7 +647,7 @@ PEP 668 distro (`externally-managed-environment`) install it into a venv:
 `python3 -m venv --system-site-packages .venv && .venv/bin/pip install pytest`.
 
 ```bash
-cd backend && python3 -m pytest tests/ -q       # 152 tests, no GPU or network
+cd backend && python3 -m pytest tests/ -q       # 182 tests, no GPU or network
 ruff check backend --config ruff.toml           # gate: E4, E7, E9, F, B
 
 # the whole stack against a running pipeline; exits non-zero on failure
