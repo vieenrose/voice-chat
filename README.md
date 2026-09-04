@@ -65,7 +65,7 @@ text-only one) or runs its own STT stage first but loses the tools on the way ou
 | **Orchestrator** | `speech-to-speech` 0.2.12 | OpenAI Realtime server on `:8765`, WebSocket + WebRTC |
 | **Turn-taking** | Silero VAD v5 + Smart Turn v3.2 | local ONNX; `--min_silence_ms 700` for Mandarin |
 | **STT** | `Qwen3-ASR-0.6B-hf` | **local**, via `transformers` directly (`s2s/stt_qwen3_asr.py`) — see below |
-| **LLM** | a model on **OpenCode Go** | **hosted**, chosen + keyed from the UI (`POST /v1/llm-config`); default `muse-spark-1.3-contributor` |
+| **LLM** | a model on **OpenCode Go** | **hosted**, chosen + keyed from the UI (`POST /v1/llm-config`); default `deepseek-v4-flash`, picked by measurement — see [Measured](#measured-rtx-3060-live-stack) |
 | **Agent** | own loop (`agent/native_loop.py`) | 4 tools, 3-step ceiling, arguments validated, results sanitised |
 | **TTS** | `Qwen3-TTS-12Hz-0.6B-CustomVoice` | Q8_0 talker + BF16/F32 codec, stock s2s handler on GGML CUDA, speaker `Vivian`, fed Simplified glyphs |
 | **Search** | SearXNG `:8888` + wttr.in | real results only |
@@ -107,9 +107,11 @@ call shape, none of the upstream plumbing, and no need to move off the pinned re
 **Why a hosted LLM at all** is this branch's own premise rather than a measured conclusion: it
 trades "fully local" for access to a much larger catalogue of models (OpenCode Go currently lists
 ~35) without needing the VRAM to run one locally. What that costs in latency and privacy is
-described in [Measured](#measured) and [Security](#security) — both sections are honest that this
-has not been measured end-to-end against a real answer, since doing so needs an API key only you
-can provide.
+described in [Measured](#measured-rtx-3060-live-stack) and [Security](#security). The latency half
+is now measured rather than assumed — `s2s/checks/model_latency.py` prices and times the catalogue,
+`s2s/checks/accuracy.py` grades the answers — and the catalogue turned out to vary by **6×** on
+first-token time, so which hosted model you pick matters more than anything local on this branch.
+Both scripts need an OpenCode Go key, which only you can provide.
 
 ### Speech becomes text once, and that text is also the caption
 
@@ -392,9 +394,11 @@ while the spoken answer said 3567, then 5522 — **one turn in three**. It mangl
 way (陳一君 / 陳宜君 for 陳怡君). Reciting an exact value back is the one thing an attendant must
 not improvise, so `pipeline-cloud.sh` carries the same `LLM_AGENT_TEMP=0.2` pin forward from that
 measurement: eight runs, no wrong number. That measurement predates this branch's hosted-LLM
-swap and has not been repeated against a specific OpenCode Go model, so treat 0.2 as a reasonable
-carried-over default, not a value re-verified for e.g. `mimo-v2.5` specifically. The model still
-paraphrases freely, it just stops inventing digits.
+swap, but the pin has since been re-earned against a hosted model for a different reason:
+`s2s/checks/accuracy.py` scored the same model **6/11 at the harness's own 0.7 default against
+10/11 at 0.2**, because the extra temperature made it stop after its pre-tool preamble
+(「好的，我查一下。」) instead of going on to call the tool. The model still paraphrases freely, it
+just stops inventing digits — and, at 0.2, finishes its turns.
 
 The UI shows the lookup itself — query, department, and every match with its extension — read from
 `GET /v1/tool-trace`. The Realtime protocol has no server→client tool-result event (`ServerEvent`
@@ -620,15 +624,41 @@ Applying `twp` to the transcript would put words in it the user never said — �
 [STT comparison table](#speech-becomes-text-once-and-that-text-is-also-the-caption) above for how
 that stacks up against Paraformer and Gemma 4 E2B on the same clips.
 
-**A real turn against a hosted model** (`muse-spark-1.3-contributor` via OpenCode Go, a typed
-「現在幾點？」 → `get_current_datetime`): first audio at **3.97 s**, 1592 input / 635 output tokens.
-A second turn calling the same tool, same model, measured **8.60 s** to first audio with 1592/635
-tokens again — the spread is the hosted provider's own latency variance, not anything measurable or
-controllable from this side of the API. Qwen3-TTS itself is fast regardless (TTFA 0.02–0.08 s at RTF
+**Which hosted model, measured.** The catalogue's spread dwarfs everything local, so the default is
+chosen by measurement, not by list price — `python -m s2s.checks.model_latency --max-input-price
+0.40` reproduces this (median of 2 reps, time to first answer delta, tool turns):
+
+| model | clock | web_search | $/turn | verdict |
+|---|---|---|---|---|
+| **`deepseek-v4-flash`** ← default | **1.24 s** | **2.22 s** | $0.0003–0.0005 | 10/11 on `s2s.checks.accuracy` |
+| `muse-spark-1.2-contributor` | 1.42 s | 1.54 s | $0.0002–0.0003 | **unusable — stalls after its preamble** |
+| `muse-spark-1.3-contributor` | 5.08 s | 6.00 s | $0.0002–0.0003 | passes, but 4× slower and failed the long-form case |
+| `glm-5.3-flash` | 5.49 s | — | $0.00018 | cheapest listed |
+| `mimo-v2.5` | 7.92 s | — | $0.00023 | the previous shipped default |
+| `longcat-2.0` | 8.24 s | — | $0.00044 | |
+
+End to end through the pipeline (`python -m s2s.checks.latency`), `deepseek-v4-flash` reaches first
+audio in **1.81 s** avg (1.67–2.02 s over clock and weather turns) — so the whole stack now answers
+faster than the old default's *best* hosted call alone.
+
+**`muse-spark-1.2-contributor` is the cautionary tale**: cheapest tier and the fastest first delta
+on paper, but it intermittently emits its pre-tool preamble and then stops — no tool call, no
+answer, so the user hears 「好的，我查一下。」 and then silence. Caught only because the accuracy
+suite asks whether the tool's *result* reached the answer, not whether audio arrived; it failed
+`negation` 6 of 8 times in-process and both `weather` and `web_search` over the live pipeline.
+Latency alone would have shipped it.
+
+Earlier figures for reference, on `muse-spark-1.3-contributor`: first audio at **3.97 s** on one
+turn and **8.60 s** on the next, identical 1592/635 token counts both times — the spread is the
+hosted provider's own variance, not anything controllable from this side of the API. Qwen3-TTS itself is fast regardless (TTFA 0.02–0.08 s at RTF
 ~0.2), so **for this branch, turn latency is dominated by the hosted call, not by anything local** —
 the opposite of the fully-local branches, where the lookup round-trip (a local tool call) dominates
 over synthesis. Barge-in cancels **1.29 s** after speech starts, unchanged from the fully-local
 design since that mechanism lives entirely in the framework's own `CancelScope`.
+
+`s2s/checks/latency.py` reproduces the first-audio measurement above, repeated across the four
+prompt shapes `s2s/checks/exhaustive.py` already exercises for correctness, and prints avg/p50/p95
+per shape (`python -m s2s.checks.latency`) — see [Validating a change](#validating-a-change).
 
 No apples-to-apples "first audio" table against the fully-local branches is given here: those
 numbers were measured with Gemma 4 E4B answering directly on this same GPU, and a hosted call's
@@ -758,6 +788,10 @@ cd backend && python3 -m s2s.checks.exhaustive          # --quick skips spoken t
 # against a LIVE pipeline on :8765 (close the browser tab first -- one session slot)
 cd backend  && python3 -m s2s.checks.turn "台灣的首都是哪裡？"
 cd backend  && python3 -m s2s.checks.bargein
+cd backend  && python3 -m s2s.checks.latency     # first-audio time, repeated across prompt shapes
+# these two need an OpenCode Go key at ~/.opencode_go_key; they bypass the pipeline slot
+cd backend  && python3 -m s2s.checks.model_latency --max-input-price 0.40   # rank models by latency+cost
+cd backend  && python3 -m s2s.checks.accuracy    # 11 varied request shapes, must/must-not per case
 cd frontend && node checks/turn.mjs             # a voice turn through the UI's own client
 cd frontend && node checks/bargein.mjs
 cd frontend && node checks/log.mjs              # debug export; no server needed

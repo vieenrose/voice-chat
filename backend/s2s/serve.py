@@ -75,10 +75,12 @@ def _neutralize_mps_empty_cache() -> None:
 OPENCODE_GO_BASE = "https://opencode.ai/zen/go/v1"
 # First entry is the default (index 0, used when a POST omits "model"). Not an
 # exhaustive list -- see GET /v1/llm-models for the live ~35-model catalogue --
-# just what a fresh process or an offline dropdown falls back to. Both entries
-# are chat/completions-family (agent.qwen_harness._RESPONSES_API_PREFIXES),
-# the wire format native_loop.py has always spoken.
-OPENCODE_GO_MODELS = ("mimo-v2.5", "mimo-v2.5-pro")
+# just what a fresh process or an offline dropdown falls back to. It tracks
+# pipeline-cloud.sh's own default, deepseek-v4-flash, picked on measured latency
+# and accuracy together (s2s/checks/model_latency.py, s2s/checks/accuracy.py).
+# All three entries are chat/completions-family (agent.qwen_harness
+# ._RESPONSES_API_PREFIXES), though native_loop.py speaks /v1/responses too.
+OPENCODE_GO_MODELS = ("deepseek-v4-flash", "mimo-v2.5", "mimo-v2.5-pro")
 
 # The live LLM stage, so /v1/llm-config can repoint it without a restart. Only
 # the reachability probe cares (see LingStreaming._reachable): the tool-calling
