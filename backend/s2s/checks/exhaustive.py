@@ -77,12 +77,21 @@ def test_routes() -> None:
               "used must include other processes, e.g. llama-server")
 
     st, d = http("/v1/llm-config")
-    ok = st == 200 and {"model", "api_base"} <= set(d or {})
-    check("routes", "GET /v1/llm-config", ok, f"model={d.get('model')} base={d.get('api_base')}")
+    ok = st == 200 and {"model", "provider"} <= set(d or {})
+    check("routes", "GET /v1/llm-config", ok, f"model={d.get('model')} via={d.get('provider')}")
     if ok:
-        check("routes", "the endpoint is local",
-              "127.0.0.1" in str(d.get("api_base")) or "localhost" in str(d.get("api_base")),
-              str(d.get("api_base")))
+        # The old assertion here was "the endpoint is local", requiring 127.0.0.1
+        # in an api_base field. Inherited from the fully-local branches and
+        # inverted for this one, whose endpoint is a hosted provider on purpose --
+        # and unreachable anyway, since the gate above asserted a field the route
+        # does not return. What must actually hold: the route names its provider,
+        # and never echoes the key back (s2s/serve.py._state, README Security).
+        blob = json.dumps(d, ensure_ascii=False)
+        check("routes", "llm-config names its provider", d.get("provider") == "opencode-go",
+              str(d.get("provider")))
+        check("routes", "llm-config never echoes the key",
+              "api_key" not in blob and not re.search(r"sk-[A-Za-z0-9_-]{12,}", blob),
+              f"key_hint={d.get('key_hint')!r} -- a masked fingerprint is fine, the key is not")
 
 
 
@@ -198,10 +207,25 @@ async def test_turns() -> None:
             # the hour (12- or 24-hour). This is the assertion that caught a model
             # receiving Wednesday 2026-09-02 from the tool and saying 2026年5月14日.
             h24, h12 = now.tm_hour, (now.tm_hour % 12) or 12
-            ok_date = bool(re.search(rf"{now.tm_mon}\s*月\s*{now.tm_mday}\s*日", r["text"])
+
+            def zh(n: int) -> str:
+                """Chinese numeral for 0-59, the way these answers spell one out."""
+                d = "零一二三四五六七八九"
+                if n < 10:
+                    return d[n]
+                if n < 20:
+                    return "十" + (d[n % 10] if n % 10 else "")
+                return d[n // 10] + "十" + (d[n % 10] if n % 10 else "")
+
+            def num(n: int) -> str:
+                """Either spelling of `n`, as a regex alternation."""
+                return f"(?:{n}|{zh(n)})"
+
+            # 日 and 號 are both used for the day of the month in speech.
+            ok_date = bool(re.search(rf"{num(now.tm_mon)}\s*月\s*{num(now.tm_mday)}\s*[日號]", r["text"])
                            or re.search(rf"{now.tm_mon:02d}[-/]{now.tm_mday:02d}", r["text"]))
-            ok_time = bool(re.search(rf"\b{h24}\s*[:點時]", r["text"])
-                           or re.search(rf"\b{h12}\s*[:點時]", r["text"]))
+            ok_time = bool(re.search(rf"{num(h24)}\s*[:點時]", r["text"])
+                           or re.search(rf"{num(h12)}\s*[:點時]", r["text"]))
             check("turns", "clock matches the host clock, by date or by hour",
                   ok_date or ok_time,
                   f"host={now.tm_mon}/{now.tm_mday} {h24:02d}h  said={r['text'][:46]!r}")
