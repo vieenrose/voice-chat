@@ -66,20 +66,55 @@ def _neutralize_mps_empty_cache() -> None:
         logger.debug("could not neutralize torch.mps helpers", exc_info=True)
 
 
-# Providers the UI may select. Keeping this a fixed map rather than accepting an
-# arbitrary base URL means a request from the page cannot aim the agent (and its
-# API key) at a host of the caller's choosing.
+# OpenCode Go is the only answering provider on this branch: a hosted,
+# OpenAI-compatible endpoint (https://opencode.ai/docs/go/). Fixed here rather
+# than accepted from the page as an arbitrary base URL, so a request cannot aim
+# the agent -- and the API key it is about to be given -- at a host of the
+# caller's choosing; a caller-supplied MODEL is just a string forwarded to this
+# one fixed base, which is safe because it cannot redirect the request anywhere.
+OPENCODE_GO_BASE = "https://opencode.ai/zen/go/v1"
+# First entry is the default (index 0, used when a POST omits "model"). Not an
+# exhaustive list -- see GET /v1/llm-models for the live ~35-model catalogue --
+# just what a fresh process or an offline dropdown falls back to. Both entries
+# are chat/completions-family (agent.qwen_harness._RESPONSES_API_PREFIXES),
+# the wire format native_loop.py has always spoken.
+OPENCODE_GO_MODELS = ("mimo-v2.5", "mimo-v2.5-pro")
+
+# The live LLM stage, so /v1/llm-config can repoint it without a restart. Only
+# the reachability probe cares (see LingStreaming._reachable): the tool-calling
+# turn itself always reads LLM_API_BASE/LLM_MODEL_ID/LLM_API_KEY fresh from the
+# environment (agent/qwen_harness.py._endpoint()), so setting those three env
+# vars alone is already enough to change which model the NEXT turn talks to.
+_llm_stage: AgentLanguageModelHandler | None = None
+
+
+# GET /v1/llm-models cache: (fetched_at, [model ids]). Module-level and shared
+# across requests/tests on purpose -- a 35-entry list from a listing endpoint
+# that needs no auth changes rarely, so there is no reason to refetch on every
+# page load, and NOT fetching it inside GET /v1/llm-config keeps that route
+# offline-safe (it always answers from OPENCODE_GO_MODELS, no network) for
+# tests and for a page that has not asked for the live catalogue yet.
+_MODEL_CACHE: list = [0.0, []]
+_MODEL_CACHE_TTL = 900.0   # seconds
+
+
 def _install_llm_config_route(app) -> None:
-    """GET /v1/llm-config: which model is serving, for the UI's pipeline card.
+    """GET/POST /v1/llm-config: the OpenCode Go API key and model, from the UI.
+    GET /v1/llm-models: the live catalogue, for the model dropdown.
 
-    Read-only. The endpoint is fixed at startup (LLM_API_BASE / LLM_MODEL_ID) and
-    is always local, so there is nothing for the page to set -- it only needs to
-    know what to display, because a hardcoded label went stale the moment the
-    model changed.
+    The browser client has no backend of its own, and the LLM stage runs
+    server-side, so a key pasted into the UI has to be handed over somewhere.
+    This is that seam.
+
+    The key is held in this process only (os.environ, for the harness to read)
+    and is never logged, never written to disk, and never returned -- GET
+    reports a masked fingerprint so the UI can show whether one is set.
     """
+    from fastapi import Body, HTTPException
 
-    @app.get("/v1/llm-config")
-    def get_llm_config() -> dict:
+    def _state() -> dict:
+        key = os.getenv("LLM_API_KEY", "")
+        key_set = bool(key and key != "none")
         # The tool list is reported, not hardcoded in the page: the card read
         # "3 工具" for a while after a fourth was added, which is the same way the
         # model label went stale before it was derived from here.
@@ -90,20 +125,102 @@ def _install_llm_config_route(app) -> None:
             logger.exception("could not read the tool list")
             tools = []
         return {
+            "provider": "opencode-go",
             "model": os.getenv("LLM_MODEL_ID", LLM_MODEL_NAME),
-            "api_base": os.getenv("LLM_API_BASE", LLM_API_BASE),
+            "models": list(OPENCODE_GO_MODELS),
+            # Enough to tell two keys apart, not enough to use one.
+            "key_set": key_set,
+            "key_hint": (key[:4] + "…" + key[-4:]) if key_set and len(key) > 9 else "",
             "tools": tools,
         }
 
+    @app.get("/v1/llm-config")
+    def get_llm_config() -> dict:
+        return _state()
+
+    @app.get("/v1/llm-models")
+    def list_llm_models() -> dict:
+        """OpenCode Go's live model catalogue, filtered to what actually works
+        here, for the dropdown.
+
+        Proxied rather than fetched by the browser so the page needs no
+        third-party origin, and cached because the list changes rarely. On any
+        failure (no network, endpoint down) this falls back to the small fixed
+        OPENCODE_GO_MODELS list rather than erroring, so the dropdown is never
+        empty -- a stale-but-plausible list beats a broken page.
+
+        Filtered to model ids native_loop.py can actually speak to: OpenCode Go
+        serves some families over /v1/responses (agent.qwen_harness
+        ._RESPONSES_API_PREFIXES, now supported) or /v1/messages, Anthropic-style
+        (MiniMax, Qwen3.x -- not supported by either wire format this project
+        has). Picking an unsupported model is not a clean 400 at selection time
+        -- the gateway accepts the key and the model, then it fails at
+        generation with a bare "抱歉，模型供應者暫時故障". Confirmed live with
+        muse-spark-1.3-contributor before Responses API support existed here.
+        Unlisting the remainder beats a dropdown item that silently breaks
+        every turn.
+        """
+        import time
+
+        import httpx
+
+        # Both wire formats native_loop.py speaks are supported now (chat/completions
+        # and Responses API), so only the third family -- Anthropic Messages-shaped
+        # (MiniMax, Qwen3.x) -- is excluded. Named rather than enumerating the
+        # supported prefixes, so a new chat/completions- or Responses-family model
+        # added to the catalogue tomorrow shows up without this filter needing an edit.
+        _messages_shaped = ("minimax-", "qwen3.")
+
+        fetched_at, models = _MODEL_CACHE
+        if not models or (time.time() - fetched_at) >= _MODEL_CACHE_TTL:
+            try:
+                r = httpx.get(f"{OPENCODE_GO_BASE}/models", timeout=10.0)
+                r.raise_for_status()
+                ids = [m["id"] for m in (r.json().get("data") or []) if m.get("id")]
+                models = sorted(m for m in ids if not m.startswith(_messages_shaped))
+                _MODEL_CACHE[:] = [time.time(), models]
+            except Exception as e:
+                logger.warning("could not fetch OpenCode Go's model list: %s", e)
+                models = models or list(OPENCODE_GO_MODELS)
+        return {"models": models}
+
+    @app.post("/v1/llm-config")
+    def set_llm_config(body: dict = Body(...)) -> dict:
+        key = str(body.get("api_key") or "").strip()
+        if not key:
+            raise HTTPException(status_code=400, detail="OpenCode Go needs an API key")
+        model = str(body.get("model") or "").strip() or OPENCODE_GO_MODELS[0]
+        # Not checked against the catalogue: a caller-supplied model is just a
+        # string forwarded to this one FIXED base URL (OPENCODE_GO_BASE above),
+        # so it cannot redirect the request anywhere -- an unrecognised id
+        # simply gets a 404 from OpenCode Go itself on the next turn, the same
+        # as picking a real model that gets discontinued between the dropdown
+        # loading and the click.
+        os.environ["LLM_API_BASE"] = OPENCODE_GO_BASE
+        os.environ["LLM_MODEL_ID"] = model
+        os.environ["LLM_API_KEY"] = key
+        if _llm_stage is not None:
+            _llm_stage.reconfigure(OPENCODE_GO_BASE, model, key)
+        logger.info("LLM stage -> OpenCode Go (%s), key_set=True", model)
+        return _state()
+
 
 def _install_tool_trace_route(app) -> None:
-    """GET /v1/tool-trace: what the tools returned this session, newest last."""
+    """GET /v1/tool-trace: what the tools returned this session, newest last.
+    GET /v1/turn-trace: reasoning + tool calls + token usage for the turn IN
+    PROGRESS, for the UI's live "thinking" panel -- see s2s/turn_trace.py."""
 
     @app.get("/v1/tool-trace")
     def get_tool_trace() -> dict:
         from s2s.tool_trace import snapshot
 
         return {"trace": snapshot()}
+
+    @app.get("/v1/turn-trace")
+    def get_turn_trace() -> dict:
+        from s2s.turn_trace import snapshot
+
+        return snapshot()
 
 
 def _install_vram_route() -> None:
@@ -174,41 +291,23 @@ def _install_vram_route() -> None:
     _wsr.create_app = create_app
 
 
-_caption_stream = None
-
-
-def _tee_audio_to_captions() -> None:
-    """Copy inbound audio to the caption stream, without touching the audio path.
-
-    AudioHandler.append_pcm is the single funnel every inbound chunk passes
-    through, for both the WebSocket and WebRTC transports, so teeing here inserts
-    no handler and adds no queue hop. The tee is one non-blocking put per chunk;
-    the decoding happens on the caption thread.
-
-    Deliberately not a pipeline stage: a stage would sit in the chain and its cost,
-    however small, would be on the turn.
-    """
-    from speech_to_speech.api.openai_realtime.handlers.audio import AudioHandler
-
-    upstream = AudioHandler.append_pcm
-
-    def append_pcm(self, conn_id, pcm_bytes, src_rate):
-        if _caption_stream is not None and pcm_bytes:
-            _caption_stream.feed(pcm_bytes, src_rate)
-        return upstream(self, conn_id, pcm_bytes, src_rate)
-
-    AudioHandler.append_pcm = append_pcm
-    logger.info("inbound audio teed to the caption stream")
-
-
 def _give_stage_the_event_queue() -> None:
-    """Let our LLM stage publish transcription events.
+    """Let our LLM stage publish the transcript it produces.
 
     With --stt none there is no STT stage, so nothing produces the user transcript
-    the UI shows. Our stage can produce one -- it has the audio -- but publishing it
-    needs `text_output_queue`, which the builder passes only to LMOutputProcessor.
+    the UI shows. Our stage produces one itself now -- see AgentLanguageModelHandler
+    ._transcribe(), which asks Gemma 4 E4B to transcribe the turn's audio before
+    handing the text to the (cloud) answering model -- but publishing it needs
+    `text_output_queue`, which the builder passes only to LMOutputProcessor.
     Wrapping the builder to hand the same queue to our stage is smaller than
     threading it through get_llm_handler, whose signature is upstream's.
+
+    An earlier version of this ran a SEPARATE model on a side channel purely to
+    caption the screen live, because the answering model heard the audio directly
+    and nothing else needed a transcript at all. Now that E4B's transcript is
+    itself the thing the answering model reasons over, it is already the most
+    accurate text available -- captioning from a second, independent guess would
+    be strictly worse, so the stage simply publishes what it already produced.
     """
     upstream = s2s_pipeline._build_pipeline_handlers
 
@@ -218,61 +317,9 @@ def _give_stage_the_event_queue() -> None:
         for h in handlers:
             if isinstance(h, AgentLanguageModelHandler):
                 h.text_output_queue = q
-        # Captions stream from the audio tee rather than from the LLM stage, so they
-        # appear while the user is still speaking instead of after the segment closes.
-        global _caption_stream
-        if q is not None and os.getenv("S2S_CAPTION", "1").strip().lower() not in ("0", "false", "no"):
-            backend = os.getenv("S2S_CAPTION_BACKEND", "gemma").strip().lower()
-            if backend in ("gemma", "gemma-e2b", "e2b"):
-                # Default: a second Gemma 4 E2B transcribes the same audio E4B
-                # hears, so the caption reflects what the model family actually
-                # understood rather than an unrelated ASR's independent guess.
-                from s2s.caption_gemma import GemmaCaptionStream
-
-                _caption_stream = GemmaCaptionStream(q)
-            else:
-                from s2s.caption import CaptionStream
-
-                _caption_stream = CaptionStream(q)
-            _align_captions_to_vad(handlers, _caption_stream)
         return handlers
 
     s2s_pipeline._build_pipeline_handlers = build
-
-
-def _align_captions_to_vad(handlers, caption) -> None:
-    """Drive the caption's utterance boundaries from the pipeline's own VAD.
-
-    The alternative -- X-ASR's endpoint detection, or an idle timer -- drifts from
-    the pipeline, so a caption ends up describing a different span of audio than the
-    answer does. Silero plus Smart Turn already decide where a turn begins and ends,
-    and the VAD handler announces both on text_output_queue.
-
-    So the queue is proxied rather than the handler subclassed: the VAD publishes
-    those events from six or more places, and a proxy catches all of them without
-    reimplementing any.
-    """
-    from speech_to_speech.VAD.vad_handler import VADHandler
-
-    class _Tap:
-        def __init__(self, real):
-            self._real = real
-
-        def put(self, item, *a, **kw):
-            kind = getattr(item, "type", None)
-            if kind == "speech_started":
-                caption.begin()
-            elif kind == "speech_stopped":
-                caption.end()
-            return self._real.put(item, *a, **kw)
-
-        def __getattr__(self, name):
-            return getattr(self._real, name)
-
-    for h in handlers:
-        if isinstance(h, VADHandler) and getattr(h, "text_output_queue", None) is not None:
-            h.text_output_queue = _Tap(h.text_output_queue)
-            logger.info("caption boundaries aligned to the pipeline VAD")
 
 
 _upstream_get_llm_handler = s2s_pipeline.get_llm_handler
@@ -299,18 +346,21 @@ def _get_llm_handler(
 
     kw = vars(responses_api_language_model_handler_kwargs)
     logger.info("LLM stage: Qwen-Agent harness -> %s (%s)", LLM_API_BASE, LLM_MODEL_NAME)
-    return AgentLanguageModelHandler(
+    global _llm_stage
+    _llm_stage = AgentLanguageModelHandler(
         stop_event,
         queue_in=text_prompt_queue,
         queue_out=lm_response_queue,
         setup_kwargs={
             "api_base": LLM_API_BASE,
             "model_name": LLM_MODEL_NAME,
+            "api_key": os.getenv("LLM_API_KEY", "none"),
             # Injected per pipeline unit by _build_realtime_pipeline_unit.
             "cancel_scope": kw.get("cancel_scope"),
             "speculative_turns": kw.get("speculative_turns"),
         },
     )
+    return _llm_stage
 
 
 def _speak_simplified() -> None:
@@ -345,7 +395,6 @@ def _speak_simplified() -> None:
 def main() -> None:
     _neutralize_mps_empty_cache()
     _give_stage_the_event_queue()
-    _tee_audio_to_captions()
     _install_vram_route()
     _speak_simplified()
     logger.info("LLM endpoint: %s (%s)", LLM_API_BASE, LLM_MODEL_NAME)

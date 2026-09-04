@@ -423,10 +423,11 @@ def _clean_history(history: List[Dict]) -> List[Dict]:
 
 
 class LingStreaming:
-    def __init__(self, model_id: str = "Qwen/Qwen3.5-2B-MTP-GGUF", api_base: str = "http://127.0.0.1:11436/v1", mock: bool = False, device: str = "cuda", model_name: str = "qwen3.5-2b", degraded_mode: str = "error", **kwargs):
+    def __init__(self, model_id: str = "Qwen/Qwen3.5-2B-MTP-GGUF", api_base: str = "http://127.0.0.1:11436/v1", mock: bool = False, device: str = "cuda", model_name: str = "qwen3.5-2b", degraded_mode: str = "error", api_key: str = "none", **kwargs):
         self.model_id = model_id
         self.api_base = api_base.rstrip("/")
         self.model_name = model_name
+        self.api_key = api_key
         self.backend = f"llm-gguf:{model_name}"
         self.mock = mock
         # "mock" = serve canned replies when the endpoint is gone (--mock opted into
@@ -444,21 +445,27 @@ class LingStreaming:
             logger.info("Ling: MOCK mode (requested)")
             return
         # Try to ping server
-        import asyncio as _asyncio
         try:
             import httpx as _httpx
             # Quick sync check
             with _httpx.Client(timeout=2.0) as c:
-                r = c.get(f"{self.api_base}/models")
+                r = c.get(f"{self.api_base}/models", headers=self._auth_headers())
                 if r.status_code == 200:
                     logger.info(f"Ling 3.0 tiny MXFP4 MoE GGUF ready at {self.api_base} ✓")
                 else:
-                    logger.warning(f"Ling server not ready {r.status_code}, fallback to mock")
-                    self.mock = True
+                    # NOT self.mock = True here: a hosted provider's /models can
+                    # legitimately 401/403 on a bad or not-yet-entered key, and
+                    # that must stay recoverable once the UI sets one -- a
+                    # permanent mock latch here meant every later turn used
+                    # canned replies even after a correct key was saved.
+                    logger.warning(f"Ling server not ready {r.status_code}, will retry per request")
         except Exception as e:
             logger.warning(f"Ling server not reachable {e}, fallback to mock (will retry per request)")
             # Don't set mock True permanently, will retry
-            pass
+
+    def _auth_headers(self) -> dict:
+        key = self.api_key
+        return {"Authorization": f"Bearer {key}"} if key and key != "none" else {}
 
     _PROBE_TTL = 1.0          # seconds; a turn probes the LLM at most once per second
 
@@ -484,7 +491,7 @@ class LingStreaming:
             # "the server was never there" and degrade a perfectly good turn.
             _t = 1.5 if re.search(r"//(127\.0\.0\.1|localhost|\[::1\])", self.api_base) else 6.0
             async with httpx.AsyncClient(timeout=_t) as c:
-                r = await c.get(f"{self.api_base}/models")
+                r = await c.get(f"{self.api_base}/models", headers=self._auth_headers())
                 if r.status_code != 200:
                     ok, detail = False, f"HTTP {r.status_code} from {self.api_base}/models"
         except Exception as e:
@@ -731,6 +738,9 @@ class LingStreaming:
                     continue
                 if ev["type"] == "llm_reasoning":
                     yield {"type": "llm_reasoning", "text": ev.get("text", "")}
+                elif ev["type"] == "llm_usage":
+                    yield {"type": "llm_usage", "input_tokens": ev.get("input_tokens"),
+                           "output_tokens": ev.get("output_tokens")}
                 elif ev["type"] == "tool_call":
                     yield {"type": "tool_call", "name": ev["name"],
                            "arguments": ev.get("arguments", {}), "query": ev.get("query", "")}

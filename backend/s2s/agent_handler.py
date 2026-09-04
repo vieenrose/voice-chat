@@ -12,6 +12,15 @@ execute a tool and post ``function_call_output`` back, which cannot work here:
 backend resources. The browser therefore sees ordinary assistant text, and the
 harness's own call -> observe loop stays intact.
 
+The answering model is a hosted, text-only LLM (see agent/qwen_harness.py
+._endpoint()), so a spoken turn cannot be handed to it as audio the way it
+could to Gemma 4 E4B when E4B answered directly. ``_transcribe()`` asks
+Qwen3-ASR (s2s/stt_qwen3_asr.py, local, transformers) for a plain-text
+transcript first; that text is both the prompt the harness reasons over and the
+transcript the UI shows. There is no separate caption engine: this transcript
+is already the most accurate text available, since it is what the answering
+model itself receives.
+
 Contract (speech_to_speech 0.2.12):
   in   GenerateResponseRequest   -- carries runtime_config (and thus .chat)
   out  LLMResponseChunk | EndOfResponse
@@ -28,7 +37,6 @@ import threading
 from collections.abc import Iterator
 from typing import Any
 
-from agent.native_loop import audio_content
 from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.pipeline.handler_types import LLMIn, LLMOut
 from speech_to_speech.pipeline.messages import EndOfResponse, LLMResponseChunk
@@ -69,6 +77,7 @@ class AgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
         self,
         api_base: str = "http://127.0.0.1:11435/v1",
         model_name: str = "bonsai-8b",
+        api_key: str = "none",
         max_new_tokens: int = 512,
         cancel_scope: Any = None,
         speculative_turns: Any = None,
@@ -80,7 +89,7 @@ class AgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
         self.speculative_turns = speculative_turns
         self.max_new_tokens = max_new_tokens
         self.api_base, self.model_name = api_base, model_name
-        self.llm = LingStreaming(api_base=api_base, model_name=model_name)
+        self.llm = LingStreaming(api_base=api_base, model_name=model_name, api_key=api_key)
         # Set by serve.py after the pipeline is built; see _give_stage_the_event_queue.
         self.text_output_queue = None
 
@@ -90,19 +99,21 @@ class AgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
         threading.Thread(target=self._loop.run_forever, daemon=True, name="agent-loop").start()
         logger.info("AgentLanguageModelHandler ready (%s @ %s)", model_name, api_base)
 
-    def reconfigure(self, api_base: str, model_name: str) -> None:
+    def reconfigure(self, api_base: str, model_name: str, api_key: str = "none") -> None:
         """Point the stage at a different endpoint without restarting the pipeline.
 
-        Used by POST /v1/llm-config so the UI can switch between the local
-        llama-server and a hosted provider mid-session. The adapter caches its
-        reachability probe per instance, so it is rebuilt rather than mutated.
+        Used by POST /v1/llm-config so the UI can save an OpenCode Go API key (or
+        switch model) mid-session. The adapter caches its reachability probe per
+        instance, so it is rebuilt rather than mutated.
         """
         from llm.ling_streaming import LingStreaming
 
         self.api_base, self.model_name = api_base, model_name
-        self.llm = LingStreaming(api_base=api_base, model_name=model_name)
-        # Set by serve.py after the pipeline is built; see _give_stage_the_event_queue.
-        self.text_output_queue = None
+        self.llm = LingStreaming(api_base=api_base, model_name=model_name, api_key=api_key)
+        # text_output_queue is NOT reset here: it is set once by serve.py's
+        # _give_stage_the_event_queue after the pipeline is built, and a
+        # mid-session reconfigure() must not silently stop the transcript (and
+        # tool-trace) from reaching the UI.
         logger.info("LLM stage repointed at %s (%s)", api_base, model_name)
 
     # -- turn gating ----------------------------------------------------
@@ -117,82 +128,93 @@ class AgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
             return True
         return not self._turn_output_allowed(req.turn_id, req.turn_revision)
 
-    @staticmethod
-    def _audio_prompt(audio, sample_rate: int):
-        """The spoken turn, as content parts the loop can pass straight through."""
+    def _transcribe(self, audio, sample_rate: int) -> str:
+        """The spoken turn's audio, as text -- see s2s/stt_qwen3_asr.py."""
         import numpy as np
+
+        from s2s.stt_qwen3_asr import transcribe
 
         a = np.asarray(audio)
         if a.dtype.kind == "f":                      # VAD hands over float32 in [-1, 1]
             a = (np.clip(a, -1.0, 1.0) * 32767).astype(np.int16)
-        return [audio_content(a.astype("<i2").tobytes(), sample_rate)]
+        try:
+            return transcribe(a.astype("<i2").tobytes(), sample_rate)
+        except Exception:
+            logger.exception("Qwen3-ASR could not transcribe this turn")
+            return ""
+
+    def _publish_transcript(self, text: str) -> None:
+        """Show the transcript on screen. It is also the prompt -- see process()."""
+        if not text or self.text_output_queue is None:
+            return
+        try:
+            from speech_to_speech.pipeline.events import PartialTranscriptionEvent
+
+            self.text_output_queue.put(PartialTranscriptionEvent(delta=text))
+        except Exception:
+            logger.exception("could not publish the transcript")
 
     # -- prompt / history ------------------------------------------------
-    # How many past spoken turns keep their audio. Each second of speech is ~26
-    # prompt tokens, so a handful of short turns is affordable; beyond that the
-    # audio is dropped and only the assistant's own replies remain, which keeps
-    # the thread of the conversation without re-prefilling minutes of sound.
-    _AUDIO_TURNS = 3
-
+    # 0.2.12 returns plain {role, content} dicts even though the annotation names
+    # pydantic models; accept either so a version bump cannot silently empty
+    # every prompt.
     @staticmethod
-    def _api_audio_part(part: dict) -> dict | None:
-        """Chat stores an audio part as {type, audio}; the API wants input_audio."""
-        if part.get("type") != "input_audio" or not part.get("audio"):
-            return None
-        return {"type": "input_audio",
-                "input_audio": {"data": part["audio"], "format": "wav"}}
+    def _field(m: Any, key: str) -> Any:
+        return m.get(key) if isinstance(m, dict) else getattr(m, key, None)
 
     @classmethod
-    def _spoken_history(cls, req: LLMIn) -> list[dict]:
-        """Every past turn, with the user's speech kept as audio.
+    def _text_of(cls, m: Any) -> str:
+        c = cls._field(m, "content")
+        if isinstance(c, str):
+            return c
+        if isinstance(c, list):  # multimodal turn; keep the text parts
+            return " ".join(str(p.get("text") or "") for p in c if isinstance(p, dict)).strip()
+        return ""
 
-        The text path drops the newest user message because it is the prompt.
-        Here the prompt is the audio on the request itself, so nothing in the
-        Chat is the current turn and all of it is history.
-        """
+    @classmethod
+    def _chat_items(cls, req: LLMIn) -> list[Any]:
         chat = getattr(req.runtime_config, "chat", None)
         if chat is None:
             return []
         try:
-            items = chat.to_transformers_chat()
+            return chat.to_transformers_chat()
         except Exception:
             logger.exception("could not read chat history")
             return []
 
-        out: list[dict] = []
-        for m in items:
-            role = m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
+    @classmethod
+    def _text_history(cls, req: LLMIn) -> list[dict]:
+        """Every past turn as plain text, for a spoken turn.
+
+        The text path (_history_and_prompt) drops the newest user message
+        because it IS the prompt. Here the prompt is this turn's fresh
+        transcript, not anything in the Chat, so every stored turn is history --
+        nothing needs popping off the end.
+        """
+        history = []
+        for m in cls._chat_items(req):
+            role = cls._field(m, "role")
             if role not in ("user", "assistant"):
                 continue
-            body = m.get("content") if isinstance(m, dict) else getattr(m, "content", None)
-            if isinstance(body, list):
-                parts = [q for q in (cls._api_audio_part(p) for p in body if isinstance(p, dict))
-                         if q]
-                text = " ".join(str(p.get("text") or "") for p in body
-                                if isinstance(p, dict) and p.get("text")).strip()
-                if text:
-                    parts.append({"type": "text", "text": text})
-                if parts:
-                    out.append({"role": role, "content": parts})
-            elif isinstance(body, str) and body.strip():
-                out.append({"role": role, "content": body})
-
-        # Drop audio from all but the most recent turns; keep their text.
-        spoken = [i for i, m in enumerate(out) if isinstance(m["content"], list)]
-        for i in spoken[:-cls._AUDIO_TURNS] if len(spoken) > cls._AUDIO_TURNS else []:
-            kept = [p for p in out[i]["content"] if p.get("type") == "text"]
-            out[i]["content"] = kept or "（先前的語音提問）"
-        return out
+            body = cls._text_of(m)
+            if body:
+                history.append({"role": role, "content": body})
+        return history
 
     @staticmethod
-    def _record_turn(req: LLMIn, wav_b64: str | None, answer: str) -> None:
-        """Write the finished turn into the shared Chat.
+    def _record_turn_text(req: LLMIn, question: str, answer: str) -> None:
+        """Write the finished turn into the shared Chat, as text.
 
         With --stt none nothing else does: there is no STT stage to raise a
-        completed transcription, and captions are deliberately partial events
-        that mutate no state. Without this the model is handed an empty history
-        on every turn, so it cannot resolve "and tomorrow?" -- or even notice
-        that the user just said they did NOT want the weather.
+        completed transcription. Without this the model is handed an empty
+        history on every turn, so it cannot resolve "and tomorrow?" -- or even
+        notice that the user just said they did NOT want the weather.
+
+        Recorded as text, not audio: the answering model is a hosted, text-only
+        LLM and cannot take audio history either way, and Qwen3-ASR's transcript
+        is already the accurate record of what was said -- replaying the audio
+        and re-transcribing it on every later turn would only risk a second,
+        different transcription of the same speech.
         """
         chat = getattr(req.runtime_config, "chat", None)
         if chat is None:
@@ -203,10 +225,10 @@ class AgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
                 RealtimeConversationItemUserMessage,
             )
 
-            if wav_b64:
+            if question:
                 chat.add_item(RealtimeConversationItemUserMessage(
                     role="user", type="message",
-                    content=[{"type": "input_audio", "audio": wav_b64}]))
+                    content=[{"type": "input_text", "text": question}]))
             if answer:
                 chat.add_item(RealtimeConversationItemAssistantMessage(
                     role="assistant", type="message",
@@ -217,48 +239,26 @@ class AgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
         except Exception:
             logger.exception("could not record the turn into the chat")
 
-    @staticmethod
-    def _history_and_prompt(req: LLMIn) -> tuple[list[dict], str]:
+    @classmethod
+    def _history_and_prompt(cls, req: LLMIn) -> tuple[list[dict], str]:
         """Read the conversation out of the shared Chat on the runtime config.
 
         The newest user message is the prompt; everything before it is history in
         the {role, content} shape the harness expects.
         """
-        chat = getattr(req.runtime_config, "chat", None)
-        if chat is None:
-            return [], ""
-        try:
-            items = chat.to_transformers_chat()
-        except Exception:
-            logger.exception("could not read chat history")
-            return [], ""
-
-        # 0.2.12 returns plain {role, content} dicts even though the annotation
-        # names pydantic models; accept either so a version bump cannot silently
-        # empty every prompt.
-        def field(m: Any, key: str) -> Any:
-            return m.get(key) if isinstance(m, dict) else getattr(m, key, None)
-
-        def text_of(m: Any) -> str:
-            c = field(m, "content")
-            if isinstance(c, str):
-                return c
-            if isinstance(c, list):  # multimodal user turn; keep the text parts
-                return " ".join(str(p.get("text") or "") for p in c if isinstance(p, dict)).strip()
-            return ""
-
+        items = cls._chat_items(req)
         prompt = ""
         for i in range(len(items) - 1, -1, -1):
-            if field(items[i], "role") == "user":
-                prompt = text_of(items[i])
+            if cls._field(items[i], "role") == "user":
+                prompt = cls._text_of(items[i])
                 items = items[:i]
                 break
         history = []
         for m in items:
-            role = field(m, "role")
+            role = cls._field(m, "role")
             if role not in ("user", "assistant"):
                 continue  # tool_calls / tool results stay inside the harness
-            body = text_of(m)
+            body = cls._text_of(m)
             if body:
                 history.append({"role": role, "content": body})
         return history, prompt
@@ -266,28 +266,21 @@ class AgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
     # -- main loop -------------------------------------------------------
     def process(self, request: LLMIn) -> Iterator[LLMOut]:
         gen = self.cancel_scope.generation if self.cancel_scope is not None else None
-        history, prompt = self._history_and_prompt(request)
         # With --stt none there is no transcript: the turn arrives as audio on the
-        # request, and the model takes it as the prompt. Our own loop carries it, so
-        # unlike the framework's audio path this keeps the tools -- E4B routes one
-        # from speech alone in 0.2-0.6 s.
+        # request. Qwen3-ASR transcribes it (s2s/stt_qwen3_asr.py) before anything
+        # else happens, since the answering model is a hosted, text-only LLM and
+        # cannot take audio at all.
         audio = getattr(request, "audio", None)
         if audio is not None:
             sr = getattr(request, "audio_sample_rate", 16000)
-            # The caption lands in the Chat as a user text message, so overriding
-            # `prompt` with audio afterwards is what keeps the model on the speech.
-            # Without that, the caption would silently become the prompt and this
-            # would be an ordinary STT pipeline again -- and because the caption is
-            # published asynchronously, whether it arrived first would decide the
-            # behaviour. Overriding makes the outcome the same either way.
-            # No caption work here any more: s2s/caption.py streams it live from the
-            # audio tee, so it appears while the user is still talking rather than
-            # after the segment closes. This stage only has to answer.
-            prompt = self._audio_prompt(audio, sr)
+            prompt = self._transcribe(audio, sr)
+            self._publish_transcript(prompt)
             # The Chat holds no user message on this path (no STT stage), so the
             # newest-message-is-the-prompt rule of the text path does not apply:
-            # every stored turn is history, and the audio here is the prompt.
-            history = self._spoken_history(request)
+            # every stored turn is history, and the fresh transcript is the prompt.
+            history = self._text_history(request)
+        else:
+            history, prompt = self._history_and_prompt(request)
 
         def chunk(text: str) -> LLMResponseChunk:
             return LLMResponseChunk(
@@ -301,13 +294,19 @@ class AgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
                 cancel_generation=gen,
             )
 
-        # A spoken turn's prompt is a list of content parts, which has no .strip().
-        if not (prompt if isinstance(prompt, list) else prompt.strip()):
+        if not prompt.strip():
             logger.warning("empty prompt; nothing to answer")
             yield EndOfResponse(
                 turn_id=request.turn_id, turn_revision=request.turn_revision, cancel_generation=gen
             )
             return
+
+        try:
+            from s2s.turn_trace import begin as _trace_begin
+
+            _trace_begin(request.turn_id)
+        except Exception:
+            logger.exception("could not reset the turn trace")
 
         pending, spoken, error = "", False, None
         answered = ""      # what actually reached the user, for the history
@@ -352,9 +351,14 @@ class AgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
         # superseded (barged-in) one never happened as far as the user is
         # concerned, and recording it would answer a question they interrupted.
         if audio is not None and answered.strip() and not self._stale(gen, request):
-            part = prompt[0] if isinstance(prompt, list) and prompt else {}
-            self._record_turn(request, (part.get("input_audio") or {}).get("data"),
-                              answered.strip())
+            self._record_turn_text(request, prompt.strip(), answered.strip())
+
+        try:
+            from s2s.turn_trace import end as _trace_end
+
+            _trace_end()
+        except Exception:
+            logger.exception("could not close the turn trace")
 
         yield EndOfResponse(
             turn_id=request.turn_id,
@@ -433,8 +437,31 @@ class AgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
                     if tail:
                         yield "delta", tail
                     return
+                elif t == "llm_reasoning":
+                    # Never spoken (see AGENT_SYSTEM_MESSAGE / reasoning_content
+                    # handling), but shown live in the UI's collapsible thinking
+                    # panel -- see s2s/turn_trace.py.
+                    try:
+                        from s2s.turn_trace import add_reasoning
+
+                        add_reasoning(ev.get("text") or "")
+                    except Exception:
+                        logger.exception("could not publish a reasoning delta")
+                elif t == "llm_usage":
+                    try:
+                        from s2s.turn_trace import set_usage
+
+                        set_usage(ev.get("input_tokens"), ev.get("output_tokens"))
+                    except Exception:
+                        logger.exception("could not publish token usage")
                 elif t == "tool_call":
                     logger.info("tool -> %s", ev.get("name"))
+                    try:
+                        from s2s.turn_trace import add_tool_call
+
+                        add_tool_call(ev.get("name") or "", ev.get("arguments") or {})
+                    except Exception:
+                        logger.exception("could not publish a tool call to the turn trace")
                 elif t == "tool_result":
                     # Published for the UI's lookup panel; see serve.record_tool_trace.
                     try:
@@ -444,6 +471,12 @@ class AgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
                                ev.get("result"))
                     except Exception:
                         logger.exception("could not publish a tool trace")
+                    try:
+                        from s2s.turn_trace import add_tool_result
+
+                        add_tool_result(ev.get("name") or "", ev.get("result"))
+                    except Exception:
+                        logger.exception("could not publish a tool result to the turn trace")
                 elif t == "error":
                     yield "error", str(ev.get("message") or "llm error")
                     return

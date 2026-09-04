@@ -35,11 +35,68 @@
 
   const PIPELINE = $derived([
     ['VAD', 'Silero v5 + Smart Turn v3.2'],
-    ['STT', '無（Gemma 4 原生語音輸入）'],
-    ['LLM', llmCfg ? llmCfg.model : '無法取得（伺服器未啟動？）'],
+    ['STT', 'Qwen3-ASR 0.6B（本機，僅轉錄）'],
+    ['LLM', llmCfg ? `${llmCfg.model}（OpenCode Go）` : '無法取得（伺服器未啟動？）'],
     ['Agent', `自建工具迴圈 · 原生工具呼叫（${llmCfg?.tools?.length ?? '?'} 工具，上限 3 步）`],
     ['TTS', 'Qwen3-TTS 12Hz · GGML 24k'],
   ])
+
+  // The OpenCode Go key: held server-side only (POST /v1/llm-config, see
+  // s2s/serve.py), never sent anywhere else. localStorage just saves the user
+  // from retyping it after a page reload -- if the SERVER restarted meanwhile
+  // (losing its env var) and this browser still remembers one, it is resent
+  // automatically once llm-config reports key_set:false; see loadLlmCfg().
+  let apiKey = $state(localStorage.getItem('llmApiKey') || '')
+  let llmModel = $state(localStorage.getItem('llmModel') || 'mimo-v2.5')
+  let savingKey = $state(false)
+  let keyMsg = $state('')
+
+  async function saveLlmConfig() {
+    const target = serverUrl('/v1/llm-config')
+    if (!target || !apiKey.trim()) return
+    savingKey = true
+    keyMsg = ''
+    try {
+      const r = await fetch(target, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ api_key: apiKey.trim(), model: llmModel }),
+      })
+      const body = await r.json().catch(() => ({}))
+      if (r.ok) {
+        llmCfg = { ...llmCfg, ...body }
+        localStorage.setItem('llmApiKey', apiKey.trim())
+        localStorage.setItem('llmModel', llmModel)
+        keyMsg = '已儲存'
+      } else {
+        keyMsg = `錯誤：${body.detail || r.status}`
+      }
+    } catch (e) {
+      keyMsg = `錯誤：${e.message}`
+    } finally {
+      savingKey = false
+    }
+  }
+
+  // The full ~35-model OpenCode Go catalogue, proxied and cached server-side
+  // (GET /v1/llm-models) so the page needs no third-party origin. Falls back
+  // to llmCfg's small fixed list (from /v1/llm-config, always available even
+  // offline) until this loads, or if it fails.
+  let modelOptions = $state([])
+  async function loadLlmModels() {
+    const target = serverUrl('/v1/llm-models')
+    if (!target) return
+    try {
+      const r = await fetch(target, { cache: 'no-store' })
+      if (r.ok) modelOptions = (await r.json()).models ?? []
+    } catch {
+      /* keep whatever llmCfg.models already offers */
+    }
+  }
+  $effect(() => {
+    loadLlmModels()
+  })
+
   let textInput = $state('')
   // Light by default. index.html carries class="light" so the pre-mount paint
   // matches and the page does not flash dark before Svelte takes over.
@@ -67,6 +124,11 @@
     try {
       const r = await fetch(target, { cache: 'no-store' })
       llmCfg = r.ok ? await r.json() : null
+      // The server holds the key only in its own process environment, so a
+      // restart forgets it even though this browser still remembers one.
+      if (llmCfg && !llmCfg.key_set && apiKey.trim()) {
+        saveLlmConfig()
+      }
     } catch {
       llmCfg = null
     }
@@ -102,6 +164,75 @@
     }
   }
 
+  // Cumulative token usage across the session, for the running total in the
+  // header. Per-turn usage lives on each turn's own `.trace` (see pollTrace).
+  let usageTotal = $state({ input: 0, output: 0 })
+
+  // The assistant bubble the CURRENT in-flight response targets, tracked by
+  // object reference rather than "turns[turns.length-1]". The array position
+  // is not a safe proxy for "my bubble": speech_to_speech emits response.created
+  // on the VAD path too (handlers/audio.py, on the first audio chunk) as well
+  // as for an explicit response.create (handlers/response.py) -- so onSpeechStop
+  // and onResponseStart can both fire for one turn, and a cancelled turn's
+  // response.done can arrive interleaved with the NEXT turn's speech events.
+  // Under array-position targeting this produced a reproducible bug: a second,
+  // empty, permanently-unsealed bubble carrying a stale COPY of the previous
+  // turn's trace, immediately after the real, correctly-filled one -- caught
+  // from a real exported session, not a hypothetical. A direct reference makes
+  // "is this poll/append/seal still about the turn I think it is" an object
+  // identity check instead of an array-position guess.
+  let activeBubble = null
+
+  // Live reasoning + tool calls for the turn IN PROGRESS (GET /v1/turn-trace,
+  // s2s/turn_trace.py) attached onto that turn's own chat bubble so it renders
+  // where the reply is about to appear, then frozen there once the turn ends --
+  // "fold once finished" is just not polling any more once `done` is seen, so
+  // the <details> this renders into naturally stops re-opening itself.
+  async function pollTrace() {
+    const target = serverUrl('/v1/turn-trace')
+    if (!target) return
+    const bubble = activeBubble               // captured before the await
+    try {
+      const r = await fetch(target, { cache: 'no-store' })
+      const t = await r.json()
+      // If a new turn started (or this one was sealed) while the fetch was in
+      // flight, `activeBubble` has moved on -- drop this result rather than
+      // writing it into whatever now sits in that slot.
+      if (!bubble || bubble !== activeBubble) return
+      bubble.trace.reasoning = t.reasoning || ''
+      bubble.trace.steps = t.steps || []
+      bubble.trace.usage = t.usage || bubble.trace.usage
+      bubble.trace.done = !!t.done
+      turns = turns
+      // Keyed on this bubble's OWN trace object, not the server's turn_id --
+      // request.turn_id is None for a typed (non-voice) turn (speech_to_speech's
+      // GenerateResponseRequest), which is falsy in JS, so guarding on it here
+      // silently skipped every typed turn's tokens even though the per-turn
+      // number above displayed fine (that assignment has no such guard).
+      if (t.done && t.usage && !bubble.trace.counted) {
+        bubble.trace.counted = true
+        usageTotal = {
+          input: usageTotal.input + (t.usage.input_tokens || 0),
+          output: usageTotal.output + (t.usage.output_tokens || 0),
+        }
+      }
+    } catch {
+      /* server down or origin refuses the fetch; keep whatever is on screen */
+    }
+  }
+
+  // A placeholder bubble, created before the first spoken/streamed token so a
+  // tool call that happens before any answer text still has somewhere to
+  // render live. appendAssistant()'s existing "activeBubble already open ->
+  // write into it" branch then fills this in rather than creating a second one.
+  function ensureAssistantTurn() {
+    if (activeBubble && !activeBubble.done) return
+    activeBubble = { role: 'assistant', raw: '', text: '',
+                     done: false,
+                     trace: { reasoning: '', steps: [], usage: null, done: false, counted: false } }
+    turns = [...turns, activeBubble]
+  }
+
   async function pollVram() {
     const target = vramUrl()
     if (!target) return
@@ -129,32 +260,52 @@
     }
   })
 
+  // The thinking panel only needs to poll DURING a turn -- faster than the 1 s
+  // vramTimer tick, since reasoning/tool-call text should feel live -- and one
+  // more time right as it ends, to catch the final done:true + token usage
+  // that arrived after `responding` already flipped false.
+  let traceTimer = null
+  $effect(() => {
+    if (connected && responding && !traceTimer) {
+      pollTrace()
+      traceTimer = setInterval(pollTrace, 300)
+    } else if ((!connected || !responding) && traceTimer) {
+      clearInterval(traceTimer)
+      traceTimer = null
+      pollTrace()
+    }
+  })
+
   function scroll() {
     queueMicrotask(() => { if (chatEl) chatEl.scrollTop = chatEl.scrollHeight })
   }
 
   function appendAssistant(text) {
     if (!text) return
-    const last = turns[turns.length - 1]
-    if (last && last.role === 'assistant' && !last.done) {
-      // Convert the whole accumulated reply, not each chunk: twp substitutes
-      // multi-character phrases, which a chunk boundary can split.
-      last.raw = (last.raw || '') + text
-      last.text = toTWP(last.raw)
-      turns = turns
-    } else {
-      turns = [...turns, { role: 'assistant', raw: text, text: toTWP(text), done: false }]
-    }
+    ensureAssistantTurn()
+    const bubble = activeBubble
+    // Convert the whole accumulated reply, not each chunk: twp substitutes
+    // multi-character phrases, which a chunk boundary can split.
+    bubble.raw = (bubble.raw || '') + text
+    bubble.text = toTWP(bubble.raw)
+    turns = turns
     scroll()
   }
 
   function sealAssistant(cancelled) {
-    const last = turns[turns.length - 1]
-    if (last && last.role === 'assistant') {
-      last.done = true
-      last.cancelled = cancelled
-      turns = turns
+    const bubble = activeBubble
+    activeBubble = null   // this response is over; a later poll/append for it is now stale
+    if (!bubble) return
+    // A turn that answered with no spoken text (e.g. the empty-prompt path)
+    // and drew no tool call either leaves nothing worth a bubble for --
+    // drop it rather than showing a blank one.
+    if (!bubble.raw && !bubble.trace?.steps?.length && !bubble.trace?.reasoning) {
+      turns = turns.filter((t) => t !== bubble)
+      return
     }
+    bubble.done = true
+    bubble.cancelled = cancelled
+    turns = turns
   }
 
   const handlers = {
@@ -177,6 +328,7 @@
       // reply is being worked on. Without this the "thinking" state never showed
       // for the voice path, which is the main path.
       responding = true
+      ensureAssistantTurn()
       lastStatus = ''
     },
     // Cumulative: replace, never append. Converted for display only -- Paraformer
@@ -189,10 +341,12 @@
       if (text.trim()) turns = [...turns, { role: 'user', text: toTW(text), raw: text }]
       scroll()
     },
-    // The caption arrives as a partial and never completes: it is produced off the
-    // pipeline by X-ASR purely for display, so no transcription.completed follows.
-    // Promote it to a real turn when the assistant starts answering, or it would sit
-    // as transient italic text and be overwritten by the next utterance.
+    // The transcript arrives as a partial and never completes -- one blocking
+    // Qwen3-ASR call per utterance publishes it once, so no transcription.completed
+    // follows. It is not cosmetic: this text is also the prompt the answering
+    // model actually reasons over (see s2s/agent_handler.py._transcribe). Promote
+    // it to a real turn when the assistant starts answering, or it would sit as
+    // transient italic text and be overwritten by the next utterance.
     promotePartial() {
       const t = userPartial.trim()
       if (!t) return
@@ -200,7 +354,7 @@
       turns = [...turns, { role: 'user', text: t, raw: t, caption: true }]
       scroll()
     },
-    onResponseStart() { responding = true; lastStatus = '' },
+    onResponseStart() { responding = true; ensureAssistantTurn(); lastStatus = '' },
     onAssistantText(t) {
       if (userPartial.trim()) handlers.promotePartial()
       appendAssistant(t)
@@ -281,6 +435,22 @@
     listening = false; level = 0
   }
 
+  // Clears only the on-screen transcript. It cannot reset the model's own
+  // memory of the conversation -- that lives server-side in the pipeline's
+  // shared Chat (s2s/agent_handler.py._record_turn_text), and the Realtime
+  // protocol has no client request to clear it short of 中斷連線 + 連線 again.
+  // The button's tooltip says so, so this stays honest rather than implying a
+  // fresh start that isn't actually happening.
+  function clearConversation() {
+    // If a reply is still streaming, keep its bubble -- it is still `turns`'
+    // only reference to `activeBubble`, and dropping it here would leave that
+    // in-flight bubble orphaned: still being mutated by appendAssistant/
+    // pollTrace, but never visible again since nothing re-adds it to `turns`.
+    turns = activeBubble ? [activeBubble] : []
+    lookup = null
+    usageTotal = { input: 0, output: 0 }
+  }
+
   function sendText() {
     const t = textInput.trim()
     if (!t || !connected) return
@@ -350,7 +520,9 @@
         ...(t.raw && t.raw !== t.text ? { rawStt: t.raw } : {}),
         cancelled: !!t.cancelled,
         done: !!t.done,
+        ...(t.trace ? { trace: t.trace } : {}),
       })),
+      usageTotal,
       clientEvents,
       // Mic frames are counted above rather than listed; everything else is here.
       protocol: snap.protocol,
@@ -414,6 +586,14 @@
           VRAM {(vram.used_mib / 1024).toFixed(1)}/{(vram.total_mib / 1024).toFixed(1)} GB
         </span>
       {/if}
+      {#if usageTotal.input || usageTotal.output}
+        <span class="pill" title="OpenCode Go token 用量（本次連線累計，來自各回合的 usage 事件）"
+              style="font-variant-numeric:tabular-nums">
+          Tokens {usageTotal.input} in / {usageTotal.output} out
+        </span>
+      {/if}
+      <button class="ghost" style="padding:6px 10px; font-size:12px" onclick={clearConversation}
+              title="清空畫面上的對話記錄（不會重設模型的對話記憶，也不影響連線）">🗑 清空對話</button>
       <button class="ghost" style="padding:6px 10px; font-size:12px" onclick={exportLog}
               title="下載這次工作階段的完整記錄（JSON），用於回報問題">⬇ 記錄</button>
       <button class="ghost" style="padding:6px 10px; font-size:12px" onclick={toggleTheme}
@@ -472,6 +652,30 @@
         </div>
       </div>
 
+      <div class="card">
+        <h3>語言模型
+          <span class="subtle" style="font-weight:400">OpenCode Go</span>
+        </h3>
+        <label for="llm-key" class="subtle" style="display:block;margin-bottom:4px">
+          API 金鑰{llmCfg?.key_set ? `（已設定：${llmCfg.key_hint}）` : '（尚未設定 — 每次提問都會失敗）'}
+        </label>
+        <input id="llm-key" class="input" type="password" bind:value={apiKey}
+               placeholder="sk-…" style="margin-bottom:8px" />
+        <select class="input" bind:value={llmModel} style="margin-bottom:8px">
+          {#each (modelOptions.length ? modelOptions : (llmCfg?.models ?? ['mimo-v2.5'])) as m}
+            <option value={m}>{m}</option>
+          {/each}
+        </select>
+        <div class="controls">
+          <button class="primary" onclick={saveLlmConfig} disabled={savingKey || !apiKey.trim()}>
+            {savingKey ? '儲存中…' : '儲存'}
+          </button>
+        </div>
+        {#if keyMsg}
+          <div class="subtle" style="font-size:12px;margin-top:6px">{keyMsg}</div>
+        {/if}
+      </div>
+
       {#if lookup}
         <div class="card">
           <h3>分機查詢
@@ -517,8 +721,32 @@
         <h3>對話</h3>
         <div class="chat" bind:this={chatEl}>
           {#each turns as t}
-            <div class="bubble {t.role}" class:cancelled={t.cancelled}
-                 title={t.caption ? 'X-ASR 字幕（僅供顯示，模型直接聽語音）' : null}>{t.text}</div>
+            {#if t.role === 'assistant' && t.trace && (t.trace.reasoning || t.trace.steps.length)}
+              <details class="trace" open={!t.trace.done}>
+                <summary>
+                  {t.trace.done ? '思考過程與工具呼叫' : '思考中…'}
+                  {#if t.trace.usage}
+                    <span class="subtle">
+                      · {t.trace.usage.input_tokens ?? '?'} in / {t.trace.usage.output_tokens ?? '?'} out tokens
+                    </span>
+                  {/if}
+                </summary>
+                {#if t.trace.reasoning}
+                  <div class="trace-reasoning">{t.trace.reasoning}</div>
+                {/if}
+                {#each t.trace.steps as s}
+                  {#if s.type === 'tool_call'}
+                    <div class="trace-step">🔧 {s.name}({JSON.stringify(s.arguments ?? {})})</div>
+                  {:else}
+                    <div class="trace-step trace-result">↳ {JSON.stringify(s.result ?? {}).slice(0, 300)}</div>
+                  {/if}
+                {/each}
+              </details>
+            {/if}
+            {#if t.text || t.role !== 'assistant'}
+              <div class="bubble {t.role}" class:cancelled={t.cancelled}
+                   title={t.caption ? 'Qwen3-ASR 轉錄（同時也是模型的實際輸入）' : null}>{t.text}</div>
+            {/if}
           {/each}
           {#if userPartial}
             <div class="bubble user partial">{userPartial}</div>
@@ -602,6 +830,13 @@
   .bubble.partial{opacity:0.55; font-style:italic}
   .bubble.cancelled{opacity:0.6}
   .bubble.cancelled::after{content:' ⏹'; opacity:0.7}
+  .trace{align-self:flex-start; max-width:82%; font-size:12px; border:1px solid #232332; border-radius:10px;
+         background:#161620; padding:2px 10px; margin-bottom:-2px}
+  :global(body.light) .trace{background:#eef0f8; border-color:#e3e4ee}
+  .trace summary{cursor:pointer; padding:6px 0; opacity:0.75; user-select:none}
+  .trace-reasoning{white-space:pre-wrap; opacity:0.8; padding:2px 0 8px; border-bottom:1px dashed #2a2a3a}
+  .trace-step{font-family:ui-monospace,monospace; opacity:0.75; padding:4px 0; word-break:break-all}
+  .trace-result{opacity:0.55}
   .composer{display:flex; gap:8px; margin-top:10px}
   .composer .input{flex:1 1 auto; min-width:0}
   .composer button{flex:0 0 auto}

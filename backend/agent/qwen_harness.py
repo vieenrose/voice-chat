@@ -146,7 +146,11 @@ class QwenWebSearch(Tool):
         # the discarded result dumps ever entering the voice turn's context.
         from agent.search_agent import search as _search
         from tools.web_search import format_results
-        base, model_id, key = _endpoint()
+        # search_agent's own query-rewrite call always speaks chat/completions
+        # (wire_format is not threaded through here); off by default
+        # (SEARCH_AGENT_MAX_SEARCHES=1) and a Responses-API model with the
+        # retry turned on would need that added too.
+        base, model_id, key, _wire = _endpoint()
         res = _search(kwargs.get("question") or query, query, recency, count=5,
                       api_base=base, model=model_id, api_key=key,
                       generate_cfg=_generate_cfg())
@@ -498,8 +502,35 @@ def _thinking_on() -> bool:
 # is the same steering-by-instruction the guard layer was removed for.
 
 
-def _endpoint() -> tuple[str, str, str]:
-    """Where to send the turn: (api_base, model, api_key)."""
+def _is_local(base: str) -> bool:
+    return bool(re.search(r"//(127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0)\b", base))
+
+
+# OpenCode Go serves different model FAMILIES over different wire formats --
+# /v1/chat/completions, /v1/responses, or /v1/messages (Anthropic-style) --
+# rather than one uniform API for every model. Fetched in full from
+# https://opencode.ai/docs/go/#points-de-terminaison (2026-09-04). Confirmed
+# live: muse-spark-1.3-contributor (a /v1/responses model) sent over
+# chat/completions is accepted by the gateway -- no 400, key checked, model
+# name recognised -- and only fails at generation with a bare "抱歉，模型供應者暫時
+#故障", which is what made this worth detecting rather than leaving as a
+# provider-side mystery.
+_RESPONSES_API_PREFIXES = ("grok-", "gpt-", "muse-spark-")
+# Anthropic Messages-shaped models (minimax-*, qwen3.*) are not supported by
+# either wire format native_loop.py speaks; _wire_format() does not route to
+# them and _endpoint() cannot make them work, so picking one here still fails
+# the same way muse-spark did before this fix -- there is no third loop yet.
+
+
+def _wire_format(base: str, model: str) -> str:
+    """Which shape native_loop.run_turn should speak for this (base, model)."""
+    if not _is_local(base) and model.startswith(_RESPONSES_API_PREFIXES):
+        return "responses"
+    return "chat_completions"
+
+
+def _endpoint() -> tuple[str, str, str, str]:
+    """Where to send the turn: (api_base, model, api_key, wire_format)."""
     base = os.getenv("LLM_API_BASE", "http://127.0.0.1:11435/v1")
     key = os.getenv("LLM_API_KEY", "none")
     model = os.getenv("LLM_MODEL_ID", "gemma-4-e4b-qat")
@@ -509,26 +540,32 @@ def _endpoint() -> tuple[str, str, str]:
     # name of a model that is not loaded, or has been deleted. A remote provider
     # names its own model too, so the override is loopback-only.
     explicit = bool(os.getenv("LLM_MODEL_ID"))
-    local = bool(re.search(r"//(127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0)\b", base))
-    if local and not explicit:
+    if _is_local(base) and not explicit:
         try:
             from llm_manager import llm_manager as _llm_mgr
             if _llm_mgr.current_alias:
                 model = _llm_mgr.current_alias
         except Exception:
             pass
-    return base, model, key
+    return base, model, key, _wire_format(base, model)
 
 
 def _generate_cfg() -> dict:
-    return {
+    cfg = {
         "max_tokens": LLM_AGENT_MAX_TOKENS,
         "temperature": LLM_AGENT_TEMP,
         "top_p": LLM_AGENT_TOP_P,
-        # Thinking is a chat-template flag, not a sampling parameter.
-        "chat_template_kwargs": {"enable_thinking": _thinking_on()},
         **({"seed": int(LLM_AGENT_SEED)} if LLM_AGENT_SEED else {}),
     }
+    # chat_template_kwargs is a llama.cpp/Jinja-template extension, not a
+    # standard OpenAI field. A hosted provider's own schema validation may
+    # reject an unrecognised parameter outright, so it is sent only to a local
+    # llama-server, which is also the only place "thinking" has been measured
+    # (see _thinking_on()) -- there is no equivalent data for a hosted model.
+    base, _, _, _ = _endpoint()
+    if _is_local(base):
+        cfg["chat_template_kwargs"] = {"enable_thinking": _thinking_on()}
+    return cfg
 
 
 # Necessary but NOT sufficient on its own: measured on Gemma 4 E4B, this wording
@@ -600,7 +637,7 @@ async def run_agent_task(task: str, event_q=None, history=None) -> str:
     set_emit_target(loop, event_q)
     hist = [m for m in (history or [])
             if isinstance(m, dict) and m.get("role") in ("user", "assistant") and m.get("content")]
-    base, model, key = _endpoint()
+    base, model, key, wire_format = _endpoint()
     cfg = _generate_cfg()
 
     def _run():
@@ -616,7 +653,7 @@ async def run_agent_task(task: str, event_q=None, history=None) -> str:
             # emitted events.
             with agent_call_lock:
                 answer = run_turn(messages, _tools(), api_base=base, model=model,
-                                  api_key=key, generate_cfg=cfg)
+                                  api_key=key, generate_cfg=cfg, wire_format=wire_format)
         except Exception as e:
             # This return value is spoken, so a raw exception message would be read
             # aloud verbatim. Log the detail; say which category of failure it was.

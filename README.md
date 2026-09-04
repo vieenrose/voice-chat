@@ -1,10 +1,15 @@
 # Voice Chat — Streaming Speech-to-Speech with Tools, in zh-TW
 
-**A fully local zh-TW voice agent on HuggingFace `speech-to-speech`.**
-Silero VAD + Smart Turn → **Gemma 4 E4B hearing the speech directly** (own tool loop, real tools)
-→ Qwen3-TTS, speaking the OpenAI Realtime protocol. There is no speech-to-text model on the
-answering path; a second, smaller Gemma 4 (E2B) runs beside it only to caption the screen. No
-hosted API, no mocks, no cloud.
+**A zh-TW voice agent on HuggingFace `speech-to-speech`, with a local ear and a hosted mind.**
+Silero VAD + Smart Turn → **Qwen3-ASR transcribes** (local, `transformers`, no llama-server) → a
+**hosted LLM on OpenCode Go** answers and calls the tools (own tool loop, real tools) → Qwen3-TTS
+speaks the reply, over the OpenAI Realtime protocol.
+
+**Not fully local, on purpose, on this branch.** VAD, STT, TTS, the tools and SearXNG all run on
+this machine; the model that reasons about the question and decides which tool to call is a network
+call to a third-party API. What you say reaches that provider as text. Paste an OpenCode Go key into
+the 語言模型 card in the UI (`POST /v1/llm-config`) — no key, no answers, by design; see
+[Configuration](#configuration) and [Security](#security).
 
 Speak, interrupt it mid-sentence, search the web, hear the answer.
 **Traditional Chinese (Taiwan) throughout** — replies are zh-TW whatever language the question
@@ -18,12 +23,11 @@ stage, and the assistant asking which department.](docs/demo-extension-lookup.pn
 flowchart LR
     Mic["🎤 Mic"] -->|OpenAI Realtime<br/>WebSocket / WebRTC| RT["Realtime server<br/>:8765"]
     RT --> VAD["Silero VAD v5<br/>+ Smart Turn v3.2"]
-    VAD -->|audio| AG["LLM stage<br/>own tool loop"]
-    VAD -.->|same audio| XA["Gemma 4 E2B<br/>caption only"]
-    XA -.->|partial transcript| RT
-    AG <--> LLM["llama-server :11435<br/>Gemma 4 E4B QAT + MTP"]
-    XA <--> LLM2["llama-server :11436<br/>Gemma 4 E2B QAT + MTP"]
-    AG -->|native tool call| T{{"web_search · get_weather<br/>get_current_datetime"}}
+    VAD -->|audio| STT["Qwen3-ASR 0.6B<br/>local · transformers"]
+    STT -->|transcript| AG["LLM stage<br/>own tool loop"]
+    AG -.->|transcript| RT
+    AG <-->|HTTPS, keyed| LLM["OpenCode Go<br/>hosted LLM"]
+    AG -->|native tool call| T{{"web_search · get_weather<br/>get_current_datetime · search_contacts"}}
     T --> SX["SearXNG :8888<br/>+ wttr.in"]
     SX -.results.-> AG
     AG -->|sentence| TTS["Qwen3-TTS<br/>GGML · 24k"]
@@ -35,80 +39,99 @@ flowchart LR
     classDef m fill:#1f2430,stroke:#7c5cff,color:#eee
     classDef s fill:#12281c,stroke:#3f9e6a,color:#eee
     classDef f fill:#2a2033,stroke:#c07cff,color:#eee
-    classDef c fill:#2b2b1e,stroke:#a89b3f,color:#eee
-    class LLM,LLM2,TTS,AG m
-    class XA c
+    classDef cloud fill:#2e1e1e,stroke:#d16b6b,color:#eee
+    class TTS,AG,STT m
+    class LLM cloud
     class SX,T s
     class RT,VAD,CS f
 ```
+
+🔴 = the one component that isn't local: everything else on this diagram runs on this machine.
 
 ## Architecture
 
 Orchestration is [`huggingface/speech-to-speech`](https://github.com/huggingface/speech-to-speech)
 0.2.12 (the pip package). It owns VAD, endpointing, TTS, transport and cancellation — each stage a
-`BaseHandler` in its own thread, joined by queues. **Every component is local**; nothing calls a
-hosted API.
+`BaseHandler` in its own thread, joined by queues.
 
 Stages stay stock wherever one fits. The **LLM stage is the deliberate exception**: because it is
-ours, it can take the VAD segment as *audio* and still call tools, which the framework's own audio
-path cannot — that path hands audio to its chat-completions stage, which knows nothing about our
-tools.
-
-Two `llama-server` processes run side by side, not one: `:11435` runs Gemma 4 E4B and answers the
-conversation; `:11436` runs a second, smaller Gemma 4 E2B and only captions the screen (see
-[The on-screen caption](#the-on-screen-caption)). They never share a request — a caption call
-cannot add latency to a turn, and a slow turn cannot make the caption late.
+ours, it does its own speech-to-text and then drives a tool-calling loop against **a hosted LLM**,
+neither of which the framework's own audio path does — that path either hands audio straight to a
+chat-completions endpoint (which then needs a model that accepts audio, ruling out a hosted
+text-only one) or runs its own STT stage first but loses the tools on the way out.
 
 | | choice | notes |
 |---|---|---|
 | **Orchestrator** | `speech-to-speech` 0.2.12 | OpenAI Realtime server on `:8765`, WebSocket + WebRTC |
 | **Turn-taking** | Silero VAD v5 + Smart Turn v3.2 | local ONNX; `--min_silence_ms 700` for Mandarin |
-| **STT** | **none on the answering path** | the model hears the speech; a second Gemma 4 E2B only captions the screen |
-| **LLM** | `gemma-4-E4B-it-qat-UD-Q4_K_XL` + MTP head | llama-server `:11435`, `--mmproj` for audio, `--jinja` for native tool calls |
-| **Caption LLM** | `gemma-4-E2B-it-qat-UD-Q4_K_XL` + MTP head | llama-server `:11436`, same `--mmproj` architecture, own process |
-| **Agent** | own loop (`agent/native_loop.py`) | 3 tools, 3-step ceiling, arguments validated, results sanitised |
-| **TTS** | `Qwen3-TTS-12Hz-0.6B-CustomVoice` Q8_0 | stock s2s handler on GGML CUDA, speaker `Vivian`, fed Simplified glyphs |
+| **STT** | `Qwen3-ASR-0.6B-hf` | **local**, via `transformers` directly (`s2s/stt_qwen3_asr.py`) — see below |
+| **LLM** | a model on **OpenCode Go** | **hosted**, chosen + keyed from the UI (`POST /v1/llm-config`); default `muse-spark-1.3-contributor` |
+| **Agent** | own loop (`agent/native_loop.py`) | 4 tools, 3-step ceiling, arguments validated, results sanitised |
+| **TTS** | `Qwen3-TTS-12Hz-0.6B-CustomVoice` | Q8_0 talker + BF16/F32 codec, stock s2s handler on GGML CUDA, speaker `Vivian`, fed Simplified glyphs |
 | **Search** | SearXNG `:8888` + wttr.in | real results only |
 | **Embedding** | `granite-embedding-97m-multilingual` Q8_0 | `:11434`, semantic rerank |
 
-**Why Gemma 4 E4B.** The QAT release is both smaller and better than plain Q4_K_M, and the MTP
-(NextN) head ships as a separate 0.10 GB file that llama.cpp loads as a draft model — the
-difference between **106 and 79 tok/s**. It also hears speech natively, which the rest of this
-design depends on. Measured alternatives on the same card: Granite 4.2 3B Q4_K_M is faster
-(113 tok/s) and unusable (很高养 for 很高興, Simplified leaking through a zh-TW prompt); Qwen3.5 9B
-Q4_K_M runs at 47; Qwen3.6 35B-A3B with experts streamed from DRAM manages 41 and answered
-台灣的首都 with mainland boilerplate.
+### Why a hosted LLM, and Qwen3-ASR instead of a chat model for STT
 
-**Speech-in tool-callers were evaluated too, on the same three spoken clips and the same three
-tools.** Routing from audio alone, E4B scores 18/18:
+This branch is a deliberate architecture swap from this project's other branches, which run a
+single Gemma 4 E4B hearing audio natively and answering directly (no STT stage at all — see the
+`contact-query` branch's README for that design). Here the answering model is a hosted one instead,
+and a hosted chat-completions endpoint cannot take raw audio — so something local has to turn
+speech into text first. Two things followed from that:
 
-| | clock | weather | news | notes |
-|---|---|---|---|---|
-| **Gemma 4 E4B QAT** | 8/8 | 3/3 | 3/3 | current |
-| Gemma 4 E2B QAT | 2/8 | 3/3 | 3/3 | mishears 幾點鐘 as 幾度中午; text routing is 8/8, so it is the audio path. Not used to answer — but its weaker audio path is exactly why it now [captions the screen](#the-on-screen-caption) instead: a caption should show what a smaller model actually heard, mishears included, not paper over them with an unrelated model's guess |
-| [Qwen3-ASR-0.6B-Agent](https://huggingface.co/Luigi/Qwen3-ASR-0.6B-Agent) | 1/2 | 0/2 | 2/2 | 0.5–0.8 s to a complete call, and it generalises to tools it never saw |
-| [Step-Audio 2 mini](https://huggingface.co/stepfun-ai/Step-Audio-2-mini) 8B | 0/3 | 3/3 | 3/3 | fabricates the time; speech-to-speech, no llama.cpp path |
+**Qwen3-ASR, not a chat model asked to transcribe.** The first version of this used Gemma 4 E4B for
+STT too — the same model, just given a "transcribe this" prompt instead of "answer this" — over its
+own `llama-server`, matching the JSON-schema-constrained technique this project's caption engines
+already used (see the `contact-query` branch). It worked, but a dedicated ASR model is simply
+better suited: no reasoning pass to fight (E4B spent its whole token budget narrating a "Thinking
+Process..." plan before ever emitting a transcript, the same failure mode this project hit twice
+before for two different models — the fix each time was a JSON-schema response format, but Qwen3-ASR
+has no narration to constrain in the first place, since it isn't an instruction-following model),
+no llama-server to run (loads once via `transformers.AutoModelForMultimodalLM`, in-process), and
+measured **more accurate** on this project's own test clips: 「幫我轉接陳怡君」 was transcribed
+correctly by Qwen3-ASR, and misheard as 陳一君 by E4B's chat-completions route. It also freed real
+resources — VRAM dropped from the 7–10 GB the two local `llama-server`s needed to **~4.2 GB**, with
+no local LLM process running at all.
 
-Two of those are more interesting than the scores suggest. **Qwen3-ASR-0.6B-Agent** was
-LoRA-tuned on a single `search_contacts` tool for a phone-attendant task, yet emits well-formed
-calls to tools it has never seen — it even used the `recency` field added here. Its failure is the
-disqualifying kind, though: unrecognised intents fall back to `web_search`, so the weather question
-became `web_search{query:"台北"}` — a plausible call returning a search page instead of a forecast
-— and it is worse on VAD-trimmed audio, which is what the pipeline actually feeds. Right model for
-a narrow attendant demo, wrong one for a general assistant.
+huggingface/speech-to-speech has since added a stock `--stt qwen3-asr` backend for this exact model
+([commit `db9b7f9`](https://github.com/huggingface/speech-to-speech/commit/db9b7f9312d1e6bf27936eb2df32abf3886a1b66),
+"Add Qwen3-ASR STT backend"), but it lives on `main`, not in the 0.2.12 release this project is
+pinned to — and `main` has since removed `get_llm_handler` / `get_tts_handler` /
+`_build_pipeline_handlers`, the exact hooks `s2s/serve.py` monkey-patches to keep this project's
+tool loop and TTS text normalisation (the same problem the README's OmniVoice note below describes,
+for the same reason). `s2s/stt_qwen3_asr.py` therefore calls the same underlying `transformers` APIs
+the upstream handler uses (`AutoProcessor.apply_transcription_request`, `generate`, `decode`)
+directly, from this project's own STT step, rather than through a pipeline stage — same model, same
+call shape, none of the upstream plumbing, and no need to move off the pinned release.
 
-**Step-Audio 2 mini** answers in its own voice (no TTS stage at all) and its Chinese ASR is
-excellent, but it invents the time rather than calling the clock, and quantisation is not the
-cause — int8 with the audio encoder left in bf16 fails the same way. Native audio output also
-removes the text stage where zh-TW is normalised, so mainland wording (特朗普 for 川普) reaches the
-speaker with nothing in between.
+**Why a hosted LLM at all** is this branch's own premise rather than a measured conclusion: it
+trades "fully local" for access to a much larger catalogue of models (OpenCode Go currently lists
+~35) without needing the VRAM to run one locally. What that costs in latency and privacy is
+described in [Measured](#measured) and [Security](#security) — both sections are honest that this
+has not been measured end-to-end against a real answer, since doing so needs an API key only you
+can provide.
 
-### Native audio input, and no STT stage
+### Speech becomes text once, and that text is also the caption
 
-`pipeline.sh` runs `--stt none`. `agent_handler` converts the VAD segment to an `input_audio`
-content part and `native_loop` sends it with the tool schemas — the loop, the validation and the
-sanitising are identical whether the prompt is text or speech. Spoken tool questions route from
-audio alone:
+`pipeline-cloud.sh` runs `--stt none` at the framework level, but
+`AgentLanguageModelHandler._transcribe()` fills the gap itself: one blocking Qwen3-ASR call per
+VAD-segmented utterance turns the audio into text before anything else happens. That text is *both*
+the prompt the tool loop reasons over *and* what `PartialTranscriptionEvent` publishes to the UI.
+There is no separate caption engine and no second, independent guess at the same audio — the
+transcript on screen is the transcript the answering model received, because it is the same string.
+
+That collapses two things this project's fully-local branches need separate mechanisms for:
+
+- **The transcript is authoritative, not cosmetic.** A caption that is merely displayed can be
+  wrong without the turn suffering, because a natively-audio-hearing local model heard the real
+  audio itself regardless; here, if Qwen3-ASR mishears a name, that mishearing *is* what the hosted
+  model reasons over.
+- **History is plain text, once, not audio.** A hosted, text-only LLM cannot take audio history the
+  way a natively-audio-hearing local model can, so past turns are recorded into the shared `Chat` as
+  the transcript + the answer (`AgentLanguageModelHandler._record_turn_text`), not replayed as audio
+  on every later turn.
+
+Two spoken tool questions still route correctly through Qwen3-ASR into the tool loop:
 
 | spoken | tool | first audio after speech ended |
 |---|---|---|
@@ -116,8 +139,10 @@ audio alone:
 | 今天台北天氣如何？ | `get_weather` | 3.3 s |
 | 今天有什麼新聞？ | `web_search` | — |
 
-This also removes a failure mode: X-ASR once heard "huggingface" as "huninface" and the model
-answered about Huawei. There is no transcription step left to corrupt.
+This also removes a failure mode from the fully-local design: an unrelated caption ASR could
+mishear something the answering model heard correctly. Here there is exactly one hearing of the
+audio, so that class of bug cannot happen — the flip side, covered above, is that a Qwen3-ASR
+mishearing now *is* the model's understanding, with no fallback.
 
 **Endpointing is tuned for Mandarin.** HF's example uses `--min_silence_ms 300`; at that setting
 VAD closed turns mid-question (喂，你好 arrived as 喂， 你), and the model answered the fragment.
@@ -125,12 +150,12 @@ Mandarin has intra-sentence pauses longer than 300 ms. **700 ms** costs 400 ms o
 buys whole utterances.
 
 **Turns are remembered by this stage, because nothing else does it.** The framework fills its
-shared `Chat` from a completed transcription — and with `--stt none` there is no STT stage to
-raise one, while captions are deliberately *partial* events that mutate nothing. So the `Chat`
-stayed empty and every turn was answered in isolation: asked 「我想請教一下啊」 the model offered a
-weather lookup, and when the user said 「呃我不查天氣」 it asked *again* which region's weather —
-amnesia, not stubbornness, since the utterance contains 天氣 and there was no prior turn for 不 to
-negate. `agent_handler` now records each finished turn into the `Chat` itself:
+shared `Chat` from a completed transcription — and with `--stt none` there is no STT stage upstream
+to raise one. So the `Chat` stayed empty and every turn was answered in isolation: asked
+「我想請教一下啊」 the model offered a weather lookup, and when the user said 「呃我不查天氣」 it asked
+*again* which region's weather — amnesia, not stubbornness, since the utterance contains 天氣 and
+there was no prior turn for 不 to negate. `agent_handler` now records each finished turn into the
+`Chat` itself, as text:
 
 | spoken | reply |
 |---|---|
@@ -138,70 +163,58 @@ negate. `agent_handler` now records each finished turn into the `Chat` itself:
 | 那明天呢？ | 明天台北的天氣預報是…濕度為 90% — `get_weather`, 台北 carried over |
 | 我剛剛問的是哪個城市？ | 我上一個回答是針對台北的氣象預報。 — from memory, no tool |
 
-Past turns are replayed **as audio**, not as caption text, so the caption engine stays cosmetic
-and no transcription error can enter the model's context. Only the last three spoken turns keep
-their audio (~26 prompt
-tokens per second of speech); a **barged-in turn is never recorded**, since it never reached the
-user.
+Only the last three spoken turns keep their *reasoning* in the trace (see the live thinking panel
+below); the recorded `Chat` history itself is always just text, so it costs nothing extra to keep
+further back. A **barged-in turn is never recorded**, since it never reached the user.
 
-Limits, measured rather than assumed: the "30 seconds" in Google's card is **per utterance, not
-per session** — five consecutive audio turns worked, growing the prompt ~185 tokens each; a single
-clip transcribed completely at 25 s and 40 s, while at 60 s the tail was silently dropped.
+**Qwen3-ASR was chosen over asking a chat model to transcribe.** An earlier version of this used
+Gemma 4 E4B for STT too — the same technique this project's fully-local branches use for their
+on-screen caption, over E4B's own `llama-server`, with a JSON-schema-constrained reply
+(`{"transcript": "..."}`) to stop it narrating a "Thinking Process..." plan instead of answering. It
+worked, but a dedicated ASR model is simply better suited here: no reasoning pass to fight in the
+first place, no `llama-server` to run (loads once via `transformers.AutoModelForMultimodalLM`,
+in-process), and measured **more accurate** on this project's own test clips — 「幫我轉接陳怡君」
+transcribed correctly by Qwen3-ASR, misheard as 陳一君 by E4B's chat-completions route. VRAM
+dropped from the 7–10 GB two local `llama-server`s needed to **~4.2 GB**, with no local LLM process
+running at all.
 
-### The on-screen caption
+huggingface/speech-to-speech has since added a stock `--stt qwen3-asr` backend for this exact model
+([commit `db9b7f9`](https://github.com/huggingface/speech-to-speech/commit/db9b7f9312d1e6bf27936eb2df32abf3886a1b66)),
+but it lives on `main`, not the 0.2.12 release this project is pinned to — and `main` has since
+removed `get_llm_handler` / `get_tts_handler` / `_build_pipeline_handlers`, the exact hooks
+`s2s/serve.py` monkey-patches to keep this project's tool loop and TTS text normalisation (the same
+problem the OmniVoice note below describes, for the same reason). `s2s/stt_qwen3_asr.py` therefore
+calls the same underlying `transformers` APIs the upstream handler uses
+(`AutoProcessor.apply_transcription_request`, `generate`, `decode`) directly, from this project's
+own STT step, rather than through a pipeline stage.
 
-The caption is a **second opinion asked of the same audio**, not a peek at what the model
-actually saw — Gemma 4 E4B hears the raw audio directly, the caption comes from decoding it
-independently, and the two can disagree. The first version used X-ASR, an unrelated streaming
-transducer, for that second opinion; the two could disagree simply because X-ASR is a much
-smaller, general-purpose model, making the caption look wrong even on a turn E4B answered
-correctly. It now uses **a second Gemma 4 — E2B, its own QAT + MTP GGUF, native audio input** —
-so the caption reflects what the same model family understood, not an unrelated ASR's guess.
+One real bug on the way there, since fixed: `from_pretrained` revalidates the Hub on every call — a
+HEAD request per config/tokenizer/weights file — even when the exact revision is already cached,
+measured at **~4 s of sequential round-trips per process start**. `_load()` now tries
+`local_files_only=True` first and only reaches the network if this is genuinely the first run on
+this machine. Model load: 1.3 s (from ~5 s). Warm per-utterance latency: **0.13 s**.
 
-E2B runs on its own `llama-server` (`s2s/deploy/llm-e2b-caption.sh`, port `11436`), a separate
-process from the E4B server driving the conversation, so a slow or stalled caption call can only
-make the caption late — it cannot block the turn. Verified: all 751 tensors in E2B's and E4B's
-`mmproj` are byte-identical (conv frontend, all 12 audio-transformer blocks, the pre-encoder) —
-only one small adapter differs, `mm.a.input_projection.weight`, `(2560,1536)` for E4B vs.
-`(1536,1536)` for E2B, mapping the same shared audio embedding into each model's own hidden size.
-So E2B is genuinely hearing the audio, at the cost of its own weaker transcription — a caption is
-now honest about what E2B heard even when that is imperfect, rather than papering over it with an
-unrelated model's independent guess.
+**Measured against the alternatives, same clips, same GPU:**
 
-Two things had to be fixed to make E2B usable for this at all:
+| STT | warm latency | load | 陳怡君 test | needs |
+|---|---|---|---|---|
+| **Qwen3-ASR-0.6B** (current) | **0.13 s** | 1.3 s | ✅ correct | nothing extra |
+| Paraformer-zh | 0.03–0.07 s | ~11 s | ❌ "陳意軍" | `funasr` |
+| Gemma 4 E2B (chat-completions, JSON-schema) | ~0.31 s | own `llama-server` | ✅ correct | a whole extra GPU process |
 
-- **Asked to "transcribe" cold** (no tool schema, no system prompt), E2B reliably spent its whole
-  `max_tokens` budget narrating a "Thinking Process..." plan and returned empty content —
-  reasoning and the answer share one token budget, so `--reasoning off` is set on its server.
-- **Even with reasoning off**, a free-text prompt got restated and the transcript buried
-  mid-paragraph in quotes: `The audio clip is: "帮我转接陈一军"\nI need to output only the
-  transcript.` The caller (`s2s/caption_gemma.py`) now constrains the reply with a JSON schema —
-  `{"transcript": "..."}` — which the server turns into a grammar the model literally cannot
-  narrate around, at a third of the tokens (24–28 vs. 57–64) and without parsing prose.
-
-Three properties carry over from the X-ASR version, and each was got wrong first:
-
-- **Teed, not staged.** Audio is copied inside `AudioHandler.append_pcm`, the one funnel every
-  inbound chunk passes through, so no handler joins the chain. One non-blocking put; the HTTP
-  call to E2B happens on a daemon thread.
-- **Published as a *partial*.** A *completed* transcription is added to the `Chat` by
-  `RealtimeService` and reaches the model next turn — that cost 0.3 s.
-- **Boundaries come from the pipeline's VAD**, not the caption engine's own endpointing.
-  `speech_started` arrives a few hundred ms *into* the speech, so a short rolling pre-roll is kept
-  between utterances and seeded into the buffer at `begin()` — otherwise the caption and the model
-  would describe different spans of the same audio.
-
-Unlike X-ASR's true incremental decoding, a chat-completions call has no notion of "extend this
-partial", so each tick re-sends the whole utterance-so-far (`S2S_CAPTION_GEMMA_INTERVAL`, default
-0.7 s — coarser than X-ASR's 0.25 s, to keep the number of LLM calls bounded). Measured per tick: ~300 ms.
-`S2S_CAPTION_BACKEND=xasr` restores the original engine; `S2S_CAPTION=0` turns captions off
-entirely.
+Paraformer is actually the fastest per call — small dedicated ASR models are quick, and Qwen3-ASR
+carries a heavier encoder for its accuracy and multilingual range. But it mangled the one name in
+this set with a genuine homophone risk, exactly the kind of slip `search_contacts`'s phonetic
+fallback exists to catch (see [below](#the-attendant-flow-one-name-several-people)) — a
+faster-but-wrong transcript is not a win for a directory-lookup demo. Gemma 4 E2B is accurate but by
+far the slowest of the three, because that path is an HTTP call to a separate GPU-resident process
+with grammar constraints layered on, versus Qwen3-ASR's direct in-process tensor call.
 
 ### The voice, and why the TTS reads Simplified
 
 `Qwen3-TTS-12Hz-0.6B-CustomVoice` has nine preset speakers, and the handler's default is
 **`Aiden` — a sunny American male voice**, which the pipeline was using to speak Mandarin.
-`pipeline.sh` now sets `--qwen3_tts_speaker Vivian`, measured best of the Chinese presets.
+`pipeline-cloud.sh` sets `--qwen3_tts_speaker Vivian`, measured best of the Chinese presets.
 
 **The TTS is fed Simplified characters; the screen keeps zh-TW.** (Also in `tts_text.py`.) 「記得帶把傘喔」 was read with
 the wrong syllable in 5 of 6 runs — 扇, 散, 線, 三, 山 — while the identical sentence written
@@ -243,16 +256,59 @@ Two routes to a genuinely Taiwanese voice were evaluated and neither is adopted:
   0.56 against Qwen3-TTS's 0.17, and its weights are **CC-BY-NC**, where Qwen3-TTS is Apache-2.0.
   It missed 傘 as well.
 
-### Tool calls are native, not prompted
+### Tool calls are native, not prompted — over two wire formats
 
-`--jinja` makes llama.cpp apply Gemma's own chat template, so tools are declared in the request
-and returned as structured `tool_calls`. Nothing parses prose for a JSON blob. Gemma's template
-gives reasoning, tool calls and tool responses each their own framing
-(`<|channel>thought`, `<|tool_call>`, `<|tool_response>`), which is why deliberation never reaches
-the speaker.
+The tools are declared in the request and returned as structured tool calls, never parsed from
+prose — this holds for a local llama-server too, but the point is sharper for a hosted model, since
+there is no chat template to inspect or patch when it goes wrong. OpenCode Go serves different
+model *families* over different APIs, though: MiMo, GLM, Kimi, LongCat, DeepSeek, Hy and Omen Alpha
+speak OpenAI's **Chat Completions** API; Muse Spark, Grok and GPT-5.6 Luna speak OpenAI's
+**Responses** API instead — a different request shape (`input` items, not `messages`), a different
+streaming event vocabulary, and tool calls addressed by `call_id` rather than carried inline on an
+assistant message.
 
-Answers are shaped for speech: the system message asks for one or two spoken sentences with no
-markdown. The same three questions dropped from 33/275/358 audio chunks to 18/51/87.
+`agent/native_loop.py` has one loop per format — `_run_turn_chat_completions` and
+`_run_turn_responses_api` — chosen per turn by `agent/qwen_harness.py._wire_format(base, model)`,
+which only checks the model id against the (small, hand-verified) list of Responses-API model
+prefixes; everything else, including a local llama-server, uses Chat Completions as it always has.
+Picking the wrong one is not a clean 400: OpenCode Go's gateway accepts the key and the model either
+way, and only fails at generation with a bare **"抱歉，模型供應者暫時故障"** — confirmed live with
+`muse-spark-1.3-contributor` sent as Chat Completions, before this dispatch existed. `GET
+/v1/llm-models`'s dropdown filter (see [Configuration](#configuration)) exists for the same reason
+in the other direction: it excludes only the third family OpenCode Go also serves (MiniMax, Qwen3.x,
+over Anthropic's Messages API), which neither loop speaks yet.
+
+Both loops emit the same internal event vocabulary regardless of wire format — `llm_reasoning`,
+`tool_call`, `tool_result`, `llm_usage`, `llm_delta` — so everything downstream (chunking, the
+retract/reset protocol, the UI) is wire-format-agnostic. Reasoning is never spoken (the system
+message asks for one or two plain sentences with no markdown; the same three questions dropped from
+33/275/358 audio chunks to 18/51/87 once that landed) but it **is** shown live, alongside tool
+calls and token usage, in a collapsible panel — see below.
+
+### Watching the model think
+
+Every turn's reasoning, tool calls and token usage stream live into a panel above the reply bubble
+(`<details>`, open while the turn is in progress, folding itself shut the moment it ends) —
+`s2s/turn_trace.py` holds the state for the turn currently in flight, `agent_handler._drive()`
+publishes into it as `native_loop`'s events arrive, and the frontend polls `GET /v1/turn-trace`
+every 300 ms while `responding` is true. There is deliberately no history of past turns' traces kept
+server-side — only one turn is ever in flight (one pipeline slot), so the frontend copies each
+turn's last-seen snapshot onto that turn's own chat bubble once `done` flips, and stops polling.
+
+Token usage additionally accumulates into a running session total in the header
+(`stream_options.include_usage` on Chat Completions; `response.completed`'s `usage` field on
+Responses API) — both are provider-reported counts, not estimated. One thing worth knowing if you
+extend this: `GenerateResponseRequest.turn_id` is `None` for a *typed* (non-voice) turn, which is
+falsy in JS — an early version of the usage total silently skipped every typed turn's tokens because
+it gated the running-total increment on that id being truthy. The per-turn number in the panel
+displayed correctly regardless (a different code path, no such guard), which is how the bug was
+caught: the folded summary said 1592/635 while the header total stayed at zero. Fixed by keying the
+"already counted" check on the turn's own trace object instead of the server's turn id.
+
+**清空對話** clears only the on-screen transcript and the running token total — it cannot reset the
+model's own memory of the conversation, since that lives server-side in the shared `Chat`
+(`_record_turn_text`, above) and the Realtime protocol has no client request to clear it short of
+disconnecting and reconnecting. The button's own tooltip says so.
 
 ### Searching: the query is the whole problem
 
@@ -334,8 +390,11 @@ ask instead of guessing or reading the whole list aloud. Spoken, end to end:
 wrong. At the default sampling temperature of 0.7 the tool returned 分機 1102 every single time
 while the spoken answer said 3567, then 5522 — **one turn in three**. It mangled the name the same
 way (陳一君 / 陳宜君 for 陳怡君). Reciting an exact value back is the one thing an attendant must
-not improvise, so `pipeline.sh` pins `LLM_AGENT_TEMP=0.2`: eight runs, no wrong number. The model
-still paraphrases freely, it just stops inventing digits.
+not improvise, so `pipeline-cloud.sh` carries the same `LLM_AGENT_TEMP=0.2` pin forward from that
+measurement: eight runs, no wrong number. That measurement predates this branch's hosted-LLM
+swap and has not been repeated against a specific OpenCode Go model, so treat 0.2 as a reasonable
+carried-over default, not a value re-verified for e.g. `mimo-v2.5` specifically. The model still
+paraphrases freely, it just stops inventing digits.
 
 The UI shows the lookup itself — query, department, and every match with its extension — read from
 `GET /v1/tool-trace`. The Realtime protocol has no server→client tool-result event (`ServerEvent`
@@ -344,6 +403,13 @@ same HTTP surface as `/v1/vram`. It doubles as the check on the spoken answer: t
 tool's own output, so a fabricated number is visible on screen.
 
 #### Measured: 500 people, spoken queries
+
+**These numbers predate this branch's hosted-LLM swap** — they were measured with Gemma 4 E4B
+answering directly (the `contact-query` branch's architecture), not with a hosted OpenCode Go
+model. The mechanism they describe (disambiguation, phonetic fallback, digit pronunciation) is
+unchanged here, but the eval has not been re-run against a hosted model — doing so consumes a real
+API key's quota, which this repo does not have one of to spend. Treat the numbers below as
+evidence the *mechanism* works, not as this branch's own measured accuracy or latency.
 
 `python3 -m s2s.checks.extension_eval --n 30` runs real spoken turns over the Realtime
 protocol. Questions are synthesised with **edge-tts** (zh-TW neural), played into the pipeline,
@@ -442,34 +508,37 @@ than in this file, where they would drift.
 
 ```bash
 SEARXNG_SETTINGS_PATH=/tmp/searxng/settings.yml python3 -m searx.webapp   # :8888
-backend/s2s/deploy/llm-audio.sh          # Gemma 4 E4B QAT + MTP + audio projector, :11435
-backend/s2s/deploy/llm-e2b-caption.sh    # Gemma 4 E2B QAT + MTP + audio projector, :11436
-backend/s2s/deploy/pipeline.sh           # no STT stage, speech straight to the model, :8765
+backend/s2s/deploy/pipeline-cloud.sh     # Qwen3-ASR (local) + a hosted LLM, :8765
 ```
 
-`llm-e2b-caption.sh` is optional in the sense that the pipeline starts without it, but with it down
-`S2S_CAPTION_BACKEND=gemma` (the default) fails every caption call silently — the turn still
-answers, the screen just shows nothing while the user is talking. Run it, or set
-`S2S_CAPTION_BACKEND=xasr` to fall back to the original streaming-transducer engine, which needs
-no second `llama-server`.
-
-| variant | what it changes |
-|---|---|
-| `llm.sh` | no `--mmproj`: text only, ~1 GB less VRAM. Pair with `pipeline-stt.sh`. |
-| `pipeline-stt.sh` | Paraformer transcribes and the model gets text — the pre-audio route |
-| `pipeline-audio.sh` | HF's own `--stt none` example: the *framework's* stage, so **no tools** |
-| `freetoken.sh` | Qwen3.6 35B-A3B with experts in DRAM |
-
-Then talk to it with any Realtime client, or open the web UI:
+That is the whole local stack on this branch — no `llama-server` for the LLM, and none for STT
+either (Qwen3-ASR loads through `transformers` on first use, inside this same process). Then open
+the web UI, connect, and **paste an OpenCode Go API key into the 語言模型 card** — every turn
+answers with "抱歉，API 金鑰無效，請重新填寫" until one is set, which is expected, not a bug:
 
 ```bash
-speech-to-speech talk --url ws://127.0.0.1:8765/v1/realtime
 cd frontend && npm install && npm run dev     # http://localhost:5173
 ```
 
-Weights not pulled from the Hub on first use: LLM `/home/user/llms/gemma-qat/`, caption LLM
-`/home/user/llms/gemma-qat-e2b/`, TTS `/tmp/qwen3_tts/talker_cv_q8.gguf` + `codec.gguf`,
-embedding `/tmp/granite-emb-gguf/`, SearXNG `/tmp/searxng/settings.yml`.
+Or talk to it with any Realtime client (the key still has to be set through the UI first, since the
+protocol itself carries no credential field for it):
+
+```bash
+speech-to-speech talk --url ws://127.0.0.1:8765/v1/realtime
+```
+
+| script | what it's for |
+|---|---|
+| `pipeline-cloud.sh` | this branch's default: Qwen3-ASR + a hosted LLM |
+| `pipeline.sh`, `llm-audio.sh` | the `contact-query` branch's fully-local design (Gemma 4 E4B hears and answers directly) — present in the repo but not this branch's path |
+| `llm.sh` / `pipeline-stt.sh` | Paraformer transcribes, a *local* text-only model answers |
+| `pipeline-audio.sh` | HF's own `--stt none` example: the *framework's* audio stage, so **no tools** |
+| `freetoken.sh` | Qwen3.6 35B-A3B with experts in DRAM, for a local LLM |
+
+Weights not pulled from the Hub on first use: STT `Qwen/Qwen3-ASR-0.6B-hf` (the standard HF cache),
+TTS `/tmp/qwen3_tts/talker_cv_q8.gguf` + `codec.gguf`, embedding `/tmp/granite-emb-gguf/`, SearXNG
+`/tmp/searxng/settings.yml`. There is no local LLM checkpoint to place — the answering model is
+whichever one you pick in the UI, on OpenCode Go's own infrastructure.
 
 > **`/tmp` here is tmpfs — it is RAM, with a quota.** A multi-GB write fails partway with
 > `Disk quota exceeded` even though `df` shows free space. Put new weights on a real disk.
@@ -525,68 +594,71 @@ Applying `twp` to the transcript would put words in it the user never said — �
 ## Features
 
 - **Barge-in on speech detection**, not end-of-utterance.
-- **No speech-to-text on the answering path.** Gemma 4 E4B hears the audio and routes tools from
-  speech alone; a second, smaller Gemma 4 (E2B) captions from a side path that never enters the
-  pipeline.
-- **Multi-turn memory on the audio path.** Follow-ups resolve against earlier turns
-  (「那明天呢？」 keeps the city), with past speech replayed as audio.
-- **Real tools**, called natively: `web_search`, `get_weather`, `get_current_datetime`, with
-  arguments validated and results fenced as untrusted data.
+- **STT is local, the LLM is hosted.** Qwen3-ASR transcribes speech in-process (no `llama-server`);
+  the answering model is chosen and keyed from the UI, on OpenCode Go.
+- **Two wire formats, dispatched automatically.** OpenAI Chat Completions or Responses API,
+  depending which family the chosen model belongs to — see
+  [Tool calls are native](#tool-calls-are-native-not-prompted--over-two-wire-formats).
+- **Live reasoning, tool calls and token usage**, in a panel that folds shut once the turn ends —
+  see [Watching the model think](#watching-the-model-think).
+- **A running token-usage total** in the header, and a **清空對話** button to clear the on-screen
+  transcript (not the model's own memory of the conversation — see that same section).
+- **Multi-turn memory**, kept as plain text in the shared `Chat` (`_record_turn_text`) rather than
+  replayed audio, since the answering model cannot take audio at all.
+- **Real tools**, called natively: `web_search`, `get_weather`, `get_current_datetime`,
+  `search_contacts`, with arguments validated and results fenced as untrusted data.
 - **zh-TW throughout**, whatever language the question was asked in — and the TTS is fed
   Simplified glyphs so Traditional-only characters are pronounced correctly, while the
   transcript on screen stays Traditional.
 - **Answers sized for speech** — one or two spoken sentences, no markdown.
-- **Thinking never spoken.** Deliberation stays in `reasoning_content`.
-- **Live captions**, a VRAM readout, and a debug export of the whole session.
+- **Thinking never spoken**, but shown live (see above) — deliberation stays out of the TTS queue.
+- **A VRAM readout and a debug export** of the whole session.
 
 ## Measured (RTX 3060, live stack)
 
-Spoken turns over the Realtime protocol, timed from end-of-speech:
+**STT (Qwen3-ASR-0.6B, local):** 0.13 s warm per utterance, 1.3 s model load. See the
+[STT comparison table](#speech-becomes-text-once-and-that-text-is-also-the-caption) above for how
+that stacks up against Paraformer and Gemma 4 E2B on the same clips.
 
-| spoken | tool | first audio |
-|---|---|---|
-| 請問現在是幾點鐘了呢？ | `get_current_datetime` | 2.1 s |
-| 今天台北天氣如何？ | `get_weather` | 3.3 s |
-| 今天有什麼新聞？ | `web_search` | — |
+**A real turn against a hosted model** (`muse-spark-1.3-contributor` via OpenCode Go, a typed
+「現在幾點？」 → `get_current_datetime`): first audio at **3.97 s**, 1592 input / 635 output tokens.
+A second turn calling the same tool, same model, measured **8.60 s** to first audio with 1592/635
+tokens again — the spread is the hosted provider's own latency variance, not anything measurable or
+controllable from this side of the API. Qwen3-TTS itself is fast regardless (TTFA 0.02–0.08 s at RTF
+~0.2), so **for this branch, turn latency is dominated by the hosted call, not by anything local** —
+the opposite of the fully-local branches, where the lookup round-trip (a local tool call) dominates
+over synthesis. Barge-in cancels **1.29 s** after speech starts, unchanged from the fully-local
+design since that mechanism lives entirely in the framework's own `CancelScope`.
 
-Generation, Gemma 4 E4B QAT UD-Q4_K_XL (4.22 GB), greedy:
-
-| | decode |
-|---|---|
-| **with MTP** (default) | **106 tok/s** |
-| without MTP | 79 tok/s |
-
-Decode is memory-bandwidth-bound; MTP's self-speculation is what pushes past the single-token
-bound. Qwen3-TTS TTFA is 0.02–0.08 s at RTF ~0.2, so a tool turn's latency is the lookup
-round-trip, not synthesis. The Gemma 4 E2B caption's first partial lands **~0.75 s into speech**,
-0.9–1.9 s before `speech_stopped` — well ahead of the answer, which starts 1.0–1.7 s *after*
-`speech_stopped`. Barge-in cancels **1.29 s** after speech starts.
+No apples-to-apples "first audio" table against the fully-local branches is given here: those
+numbers were measured with Gemma 4 E4B answering directly on this same GPU, and a hosted call's
+latency depends on a third party's load, not this machine — comparing them would imply a
+like-for-like measurement that doesn't exist.
 
 ## Configuration
 
 | Env | Default | Purpose |
 |---|---|---|
-| `S2S_LLM_API_BASE` / `S2S_LLM_MODEL_NAME` | `…:11435/v1` / `gemma-4-e4b-qat` | which llama-server the LLM stage talks to |
+| `LLM_API_BASE` / `LLM_MODEL_ID` / `LLM_API_KEY` | set via the UI | the hosted endpoint the tool loop talks to — `POST /v1/llm-config` sets all three; see [API](#api) |
+| `STT_MODEL` / `STT_DEVICE` / `STT_LANGUAGE` | `Qwen/Qwen3-ASR-0.6B-hf` / `cuda` / auto-detect | which Qwen3-ASR checkpoint, and a forced language if you don't want per-utterance detection |
 | `S2S_USE_UPSTREAM_LLM` | unset | `1` runs the stock s2s LLM stage (loses the tools) |
 | `LLM_AGENT_MAX_STEPS` | `3` | tool-loop ceiling: tool → observe → answer |
 | `LLM_AGENT_MAX_TOKENS` | `2048` | per-turn cap (thinking + tool call + answer) |
-| `LLM_AGENT_THINKING` | `1` | thinking pass |
-| `LLM_AGENT_TEMP` / `LLM_AGENT_TOP_P` | `0.7` / `0.9` | agent-turn sampling; `pipeline.sh` pins temp to `0.2` so extensions are not improvised |
-| `LLM_AGENT_SEED` | unset | reproducible agent turns |
+| `LLM_AGENT_THINKING` | `1` | thinking pass — **local llama-server only**; a hosted provider's own reasoning is not controlled by this flag |
+| `LLM_AGENT_TEMP` / `LLM_AGENT_TOP_P` | `0.7` / `0.9` | agent-turn sampling; `pipeline-cloud.sh` carries forward a `0.2` temp pin measured on the fully-local design (see the attendant-flow section's caveat) |
+| `LLM_AGENT_SEED` | unset | reproducible agent turns — local llama-server only; most hosted models ignore an OpenAI `seed` field |
 | `LLM_REQUEST_TIMEOUT` | `45` | a hung call must not hold the only pipeline slot |
-| `S2S_CAPTION` / `S2S_CAPTION_BACKEND` | `1` / `gemma` | captions on/off; `xasr` restores the original streaming-transducer engine |
-| `S2S_CAPTION_LLM_API_BASE` / `S2S_CAPTION_LLM_MODEL` | `…:11436/v1` / `gemma-4-e2b-caption` | which llama-server the E2B caption engine talks to |
-| `S2S_CAPTION_GEMMA_INTERVAL` | `0.7` | seconds between caption re-transcriptions (coarser than X-ASR's, since each tick is a full LLM call) |
 | `VOICE_TZ` | `Asia/Taipei` | timezone `get_current_datetime` reports by default |
 | `SEARXNG_URL` | `http://localhost:8888` | search backend for `web_search` |
 | `LLM_TOOL_PREAMBLE_MAX` | `40` | longest pre-tool utterance that is spoken; `0` discards all of it |
 | `SEARCH_AGENT_MAX_SEARCHES` | `1` | `2` lets the search sub-agent rewrite a failed query and retry |
 | `SEARCH_AGENT_MIN_RELEVANCE` | `0.2` | below this a search counts as failed; news legitimately scores ~0.33 |
-| `LLM_PATH_GEMMA` / `LLM_PATH_GEMMA_MTP` | see `llm_manager.py` | weights and MTP draft head |
-| `LLM_MTP` / `LLM_MTP_DRAFT_N` | `1` / `3` | self-speculative decoding |
 | `TTS_MODEL_DIR` | `/tmp/qwen3_tts` | TTS GGUF location |
 
-The TTS speaker and instruct are set in `s2s/deploy/pipeline.sh`, not by env.
+The TTS speaker and instruct are set in `s2s/deploy/pipeline-cloud.sh`, not by env. `LLM_PATH_GEMMA*`
+/ `LLM_MTP*` (self-speculative decoding for a *local* llama-server) exist but are unused on this
+branch's default path — they matter for `llm-audio.sh` / `freetoken.sh` (the fully-local variants
+listed in [Quick Start](#quick-start)), not for `pipeline-cloud.sh`.
 
 ## API
 
@@ -600,12 +672,25 @@ event set works, including the framework's own `speech-to-speech talk`.
 `conversation.item.input_audio_transcription.delta` / `.completed`,
 `response.output_audio.delta`, `response.output_audio_transcript.done`, `response.done`.
 
-Three details decide whether a client behaves correctly:
+Four details decide whether a client behaves correctly:
 
 - **`input_audio_transcription.delta` is cumulative.** Each carries the whole transcript so far,
   not the increment, so partials must *replace*. Appending yields 「欢迎欢迎大家来欢迎大家来体验…」.
-- **A voice turn never emits `response.created`** — the server sends it only for an explicit
-  `response.create`. End-of-speech is what signals that a reply is coming.
+- **A voice turn can still emit `response.created`.** The framework's own `handlers/audio.py`
+  raises it on the VAD path too, on the first outbound audio chunk — not only for an explicit
+  `response.create`, which an earlier version of this README claimed was the only source. Getting
+  this wrong cost a real bug: the frontend used `response.created` (`onResponseStart`) and
+  end-of-speech (`onSpeechStop`) as two *independent* signals to open a new reply bubble, each
+  assumed to be the only one that would fire for a given turn. Both can fire for the *same* voice
+  turn, and a client that reacts to each by "creating a new bubble unless the array's last entry is
+  still open" breaks the moment the two arrive out of the order that assumption expects — confirmed
+  from a real exported session: a properly-answered turn followed immediately by a second, empty,
+  permanently-unsealed bubble carrying a stale copy of the first one's trace. The frontend now
+  tracks the active reply by object reference (`activeBubble` in `App.svelte`) rather than by
+  array position, which is immune to which event arrives first or how many times either fires.
+- **A voice turn's reply bubble is created eagerly, before either signal above.** `ensureAssistantTurn()`
+  runs as soon as `responding` turns true, so a tool call that happens before any answer text has
+  somewhere to render live — see [Watching the model think](#watching-the-model-think).
 - **With an audio response the assistant text arrives on
   `response.output_audio_transcript.done`**, once per spoken chunk, so those accumulate rather
   than replace.
@@ -617,19 +702,31 @@ rejects the entire `session.update`. Output declares 24000, the rate Qwen3-TTS p
 One session at a time by default (`--num_pipelines 1`); further connections are rejected. Each
 extra pipeline has its own STT/TTS handlers and costs VRAM.
 
-Two read-only routes are added by `s2s/serve.py`, not upstream:
+Routes added by `s2s/serve.py`, not upstream — all read-only except `/v1/llm-config`'s `POST`:
 
-- `GET /v1/llm-config` — which model is serving, so the UI's pipeline card is derived rather than
-  hardcoded (a fixed string went stale the moment the model changed).
+- `GET`/`POST /v1/llm-config` — which model is serving (so the UI's pipeline card is derived
+  rather than hardcoded) and, on `POST`, sets the OpenCode Go API key and model for the *next* turn
+  onward; see [Configuration](#configuration). The key lives only in this process's environment —
+  never logged, never written to disk, never echoed back (`GET` reports a masked fingerprint).
+- `GET /v1/llm-models` — OpenCode Go's live model catalogue, filtered to ids this project's two
+  wire-format loops can actually speak (excludes the Anthropic-Messages-shaped family: MiniMax,
+  Qwen3.x). Cached 15 minutes; falls back to a small fixed list on any fetch failure.
+- `GET /v1/tool-trace` — what the tools returned this session, across turns, for the directory
+  lookup panel.
+- `GET /v1/turn-trace` — reasoning, tool calls and token usage for the turn *currently* in flight,
+  for the live thinking panel. Only one turn's trace exists server-side at a time (one pipeline
+  slot); the frontend keeps each turn's own history in the browser.
 - `GET /v1/vram` — GPU memory for the UI's readout. The browser speaks only the Realtime protocol
-  and has no backend of its own, so this rides on the same server. Both install permissive CORS
-  for GET, which the framework ships none of; that is fine for WebSockets but would block the
-  fetch whenever the page is served from a different origin.
+  and has no backend of its own, so this rides on the same server.
+
+All of the above install permissive CORS for their methods, which the framework ships none of;
+that is fine for WebSockets but would block the fetch whenever the page is served from a different
+origin than `:8765`.
 
 ## Security
 
 **The Realtime endpoint has no authentication.** Anyone who can reach `:8765` can drive the LLM
-and the GPU.
+and the GPU — and, on this branch, spend your OpenCode Go quota.
 
 | Control | Practice |
 |---|---|
@@ -637,6 +734,13 @@ and the GPU.
 | Never | Funnel it, or bind it to a public interface |
 | TLS | required for microphone access from another machine |
 | SearXNG | loopback only; reachable from the tool, not from the client |
+| OpenCode Go key | held only in this process's environment (`POST /v1/llm-config`) — never logged, never written to disk, never returned by `GET`; anyone who can reach `:8765` can already drive it without needing to see the key itself |
+
+**Not fully local, on this branch.** The answering model's provider sees your speech, transcribed
+to text, and its own reply — that is the whole point of a hosted model. Every other stage (VAD,
+STT, TTS, the tools, SearXNG) stays on this machine and sees nothing leave it. If that trade-off
+is wrong for a given use, the fully-local branches (`contact-query` and others — see
+[Quick Start](#quick-start)) keep everything, including the answering model, on this machine.
 
 ## Validating a change
 
@@ -645,7 +749,7 @@ PEP 668 distro (`externally-managed-environment`) install it into a venv:
 `python3 -m venv --system-site-packages .venv && .venv/bin/pip install pytest`.
 
 ```bash
-cd backend && python3 -m pytest tests/ -q       # 182 tests, no GPU or network
+cd backend && python3 -m pytest tests/ -q       # 211 tests, no GPU or network
 ruff check backend --config ruff.toml           # gate: E4, E7, E9, F, B
 
 # the whole stack against a running pipeline; exits non-zero on failure
@@ -677,6 +781,7 @@ transcript.
 
 ## License
 
-Code Apache-2.0. Models: Gemma 4, Qwen3-TTS, Granite-embedding-97M, X-ASR, Paraformer, Silero VAD,
-Smart Turn v3.2 (Apache-2.0/MIT); SearXNG AGPL-3.0.
+Code Apache-2.0. Models: Qwen3-ASR, Qwen3-TTS, Granite-embedding-97M, Silero VAD, Smart Turn v3.2
+(Apache-2.0/MIT); SearXNG AGPL-3.0. The answering model is hosted on OpenCode Go, under its own
+terms — this repo does not redistribute it.
 Orchestration: [huggingface/speech-to-speech](https://github.com/huggingface/speech-to-speech).

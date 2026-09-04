@@ -13,6 +13,8 @@ from pathlib import Path
 from queue import Queue
 from threading import Event
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
@@ -227,6 +229,104 @@ class TestNoDuplication(unittest.TestCase):
     def test_final_that_is_a_filtered_subset_adds_nothing(self):
         spoken = self._spoken([("delta", "Let me think. 答案是台北。"), ("final", "答案是台北。")])
         self.assertEqual("".join(spoken).count("答案是台北"), 1)
+
+
+def build_audio(events, transcript, chat_turns=(), cancel_scope=None):
+    """Like build(), but the request carries audio instead of a chat prompt.
+
+    _transcribe is monkeypatched rather than loading the real Qwen3-ASR model:
+    what these tests pin down is that process() wires the transcript into the
+    prompt, the output queue, and the recorded turn -- not the STT call itself
+    (s2s/stt_qwen3_asr.py has its own tests for that).
+    """
+    h = _Handler(
+        Event(), Queue(), Queue(),
+        setup_kwargs={"events": events, "cancel_scope": cancel_scope},
+    )
+    h._transcribe = lambda audio, sr: transcript
+    h.text_output_queue = Queue()
+    req = GenerateResponseRequest(
+        runtime_config=make_runtime_config(chat_turns),
+        audio=np.zeros(2, dtype=np.float32), audio_sample_rate=16000,
+        turn_id="t1", turn_revision=0,
+    )
+    return h, req
+
+
+class TestAudioTurn(unittest.TestCase):
+    """The audio path: E4B's transcript becomes both the prompt and the caption.
+
+    There is no separate caption engine any more -- the transcript IS what the
+    answering model reasons over, so publishing it is just reporting what
+    already happened, not a second, independent guess at the same audio.
+    """
+
+    def test_transcript_becomes_the_prompt(self):
+        h, req = build_audio([("delta", "ok。")], "今天台北天氣如何")
+        list(h.process(req))
+        history, prompt = h.seen
+        self.assertEqual(prompt, "今天台北天氣如何")
+        self.assertEqual(history, [])
+
+    def test_transcript_is_published_for_the_ui(self):
+        h, req = build_audio([("delta", "ok。")], "今天台北天氣如何")
+        list(h.process(req))
+        from speech_to_speech.pipeline.events import PartialTranscriptionEvent
+        published = h.text_output_queue.get_nowait()
+        self.assertIsInstance(published, PartialTranscriptionEvent)
+        self.assertEqual(published.delta, "今天台北天氣如何")
+
+    def test_empty_transcript_ends_the_turn_without_calling_the_model(self):
+        h, req = build_audio([("delta", "should not run")], "")
+        out = list(h.process(req))
+        self.assertEqual([o for o in out if isinstance(o, LLMResponseChunk)], [])
+        self.assertIsInstance(out[-1], EndOfResponse)
+        self.assertTrue(h.text_output_queue.empty(), "nothing to caption when nothing was heard")
+
+    def test_past_turns_reach_the_prompt_as_text_history(self):
+        h, req = build_audio([("delta", "明天也是晴天。")], "那明天呢",
+                              chat_turns=[("user", "今天台北天氣如何"),
+                                          ("assistant", "今天是晴天。")])
+        list(h.process(req))
+        history, prompt = h.seen
+        self.assertEqual(prompt, "那明天呢")
+        self.assertEqual(history, [{"role": "user", "content": "今天台北天氣如何"},
+                                   {"role": "assistant", "content": "今天是晴天。"}])
+
+    def test_answered_turn_is_recorded_as_text_for_the_next_turn(self):
+        h, req = build_audio([("delta", "今天是晴天。")], "今天台北天氣如何")
+        list(h.process(req))
+        # A later AUDIO turn reads it back with _text_history (nothing popped as
+        # "the prompt", since the fresh transcript already is the prompt there).
+        history2 = h._text_history(GenerateResponseRequest(
+            runtime_config=req.runtime_config, turn_id="t2", turn_revision=0))
+        self.assertEqual(history2, [{"role": "user", "content": "今天台北天氣如何"},
+                                    {"role": "assistant", "content": "今天是晴天。"}])
+
+    def test_a_barged_in_turn_is_never_recorded(self):
+        scope = FakeCancelScope()
+        events = [("delta", "第一句。"), ("cancel", ""), ("delta", "第二句。")]
+
+        class H(_Handler):
+            def _drive(self, history, prompt):
+                for kind, payload in events:
+                    if kind == "cancel":
+                        scope.cancel()
+                        continue
+                    yield kind, payload
+
+        h = H(Event(), Queue(), Queue(), setup_kwargs={"cancel_scope": scope})
+        h._transcribe = lambda audio, sr: "喂你好"
+        h.text_output_queue = Queue()
+        req = GenerateResponseRequest(
+            runtime_config=make_runtime_config([]),
+            audio=np.zeros(2, dtype=np.float32), audio_sample_rate=16000,
+            turn_id="t1", turn_revision=0,
+        )
+        list(h.process(req))
+        history2, _ = h._history_and_prompt(GenerateResponseRequest(
+            runtime_config=req.runtime_config, turn_id="t2", turn_revision=0))
+        self.assertEqual(history2, [], "a superseded turn never happened as far as history is concerned")
 
 
 class TestPromptExtraction(unittest.TestCase):

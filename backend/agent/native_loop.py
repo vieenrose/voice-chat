@@ -92,8 +92,27 @@ def audio_content(pcm16: bytes, sample_rate: int = 16000) -> dict:
 
 
 def run_turn(messages: list[dict], tools: dict, *, api_base: str, model: str,
-             api_key: str = "none", generate_cfg: dict | None = None) -> str:
+             api_key: str = "none", generate_cfg: dict | None = None,
+             wire_format: str = "chat_completions") -> str:
     """One agent turn. Emits events as it goes; returns the final answer text.
+
+    ``wire_format`` picks which API shape to speak -- some OpenCode Go models
+    (Muse Spark, Grok, GPT-5.6 Luna) are served over OpenAI's Responses API
+    rather than Chat Completions, a different request/event shape entirely (see
+    agent/qwen_harness.py._wire_format). Everything else -- a local llama-server,
+    and every chat/completions-family OpenCode Go model (MiMo, GLM, Kimi,
+    LongCat, DeepSeek, Hy, Omen Alpha) -- uses the default.
+    """
+    if wire_format == "responses":
+        return _run_turn_responses_api(messages, tools, api_base=api_base, model=model,
+                                        api_key=api_key, generate_cfg=generate_cfg)
+    return _run_turn_chat_completions(messages, tools, api_base=api_base, model=model,
+                                       api_key=api_key, generate_cfg=generate_cfg)
+
+
+def _run_turn_chat_completions(messages: list[dict], tools: dict, *, api_base: str, model: str,
+                                api_key: str = "none", generate_cfg: dict | None = None) -> str:
+    """One agent turn over OpenAI's Chat Completions API. See run_turn().
 
     A message's content may be a list of parts, so a spoken turn is just
     ``[audio_content(pcm)]`` in place of text -- the tool schemas, the loop and the
@@ -107,7 +126,11 @@ def run_turn(messages: list[dict], tools: dict, *, api_base: str, model: str,
     answer = ""
 
     for _step in range(MAX_STEPS):
-        body = {"model": model, "messages": convo, "stream": True, **cfg}
+        # stream_options.include_usage asks the last chunk to carry token counts
+        # (choices: [] on that one) -- a standard OpenAI field; a provider that
+        # does not recognise it should just ignore it, not reject the request.
+        body = {"model": model, "messages": convo, "stream": True,
+                "stream_options": {"include_usage": True}, **cfg}
         if schemas:
             body["tools"] = schemas
         content, reasoning, calls = "", "", {}
@@ -128,6 +151,10 @@ def run_turn(messages: list[dict], tools: dict, *, api_base: str, model: str,
                         chunk = json.loads(payload)
                     except json.JSONDecodeError:
                         continue
+                    usage = chunk.get("usage")
+                    if usage:
+                        _emit({"type": "llm_usage", "input_tokens": usage.get("prompt_tokens"),
+                               "output_tokens": usage.get("completion_tokens")})
                     delta = ((chunk.get("choices") or [{}])[0]).get("delta") or {}
                     rc = delta.get("reasoning_content")
                     if rc:
@@ -200,6 +227,171 @@ def run_turn(messages: list[dict], tools: dict, *, api_base: str, model: str,
                           # strict servers reject the message without it.
                           "tool_call_id": c["id"] or f"call_{i}",
                           "name": c["name"], "content": result})
+    else:
+        logger.warning("tool loop hit its %d-step ceiling; answering with what we have", MAX_STEPS)
+        answer = content
+
+    return answer
+
+
+def _tool_schemas_responses(tools: dict) -> list[dict]:
+    """Responses API tool schemas are flat -- {type, name, description,
+    parameters} -- not nested under "function" the way Chat Completions' are."""
+    return [{"type": "function", "name": t.name, "description": t.description,
+             "parameters": t.parameters}
+            for t in tools.values()]
+
+
+def _messages_to_responses_input(messages: list[dict]) -> tuple[str, list[dict]]:
+    """Split a leading system message into `instructions`; the rest become
+    Responses API input items. run_agent_task always builds `messages` as
+    [system?, ...history, user] with plain string content -- never containing a
+    prior turn's tool calls, since those are internal to one run_turn call -- so
+    every remaining item is an ordinary user/assistant text turn."""
+    instructions = ""
+    items: list[dict] = []
+    for m in messages:
+        if m["role"] == "system" and not items and not instructions:
+            instructions = m["content"]
+            continue
+        kind = "input_text" if m["role"] == "user" else "output_text"
+        items.append({"role": m["role"], "content": [{"type": kind, "text": m["content"]}]})
+    return instructions, items
+
+
+def _generate_cfg_for_responses(cfg: dict) -> dict:
+    """Translate the shared sampling config to Responses API field names.
+
+    max_tokens -> max_output_tokens (the Chat Completions name is rejected);
+    chat_template_kwargs (a llama.cpp/Jinja extension) and seed (not a Responses
+    API parameter) are dropped rather than forwarded and possibly rejected.
+    """
+    out = {}
+    if "temperature" in cfg:
+        out["temperature"] = cfg["temperature"]
+    if "top_p" in cfg:
+        out["top_p"] = cfg["top_p"]
+    if "max_tokens" in cfg:
+        out["max_output_tokens"] = cfg["max_tokens"]
+    return out
+
+
+def _run_turn_responses_api(messages: list[dict], tools: dict, *, api_base: str, model: str,
+                             api_key: str = "none", generate_cfg: dict | None = None) -> str:
+    """One agent turn over OpenAI's Responses API. See run_turn().
+
+    Built from the documented Responses API event/request shape (OpenCode Go's
+    docs mark these models @ai-sdk/openai, i.e. the same shape OpenAI's own API
+    uses) and confirmed working live against OpenCode Go with a real key and
+    muse-spark-1.3-contributor: a spoken tool question answered correctly over
+    this path. The event names below (response.output_text.delta,
+    response.output_item.added/.done, response.function_call_arguments.delta)
+    are OpenAI's documented ones; if a different OpenCode Go provider's proxy
+    diverges from them, this degrades to reading no text and no tool calls,
+    surfacing as "抱歉，這個問題我暫時無法回答" rather than a crash -- the same
+    unknown-event tolerance the chat/completions loop already has.
+    """
+    cfg = _generate_cfg_for_responses(dict(generate_cfg or {}))
+    schemas = _tool_schemas_responses(tools)
+    instructions, convo = _messages_to_responses_input(messages)
+    spoke_preamble = False
+    answer = ""
+
+    for _step in range(MAX_STEPS):
+        body = {"model": model, "input": convo, "stream": True, **cfg}
+        if instructions:
+            body["instructions"] = instructions
+        if schemas:
+            body["tools"] = schemas
+        content = ""
+        calls: dict[str, dict] = {}      # call_id -> {"name": str, "args": str}
+        order: list[str] = []            # call_id insertion order, for a stable replay
+        streamed = 0
+
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            with client.stream("POST", f"{api_base.rstrip('/')}/responses",
+                               json=body,
+                               headers={"Authorization": f"Bearer {api_key}"}) as r:
+                r.raise_for_status()
+                for line in r.iter_lines():
+                    if not line or not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if not payload or payload == "[DONE]":
+                        continue
+                    try:
+                        ev = json.loads(payload)
+                    except json.JSONDecodeError:
+                        continue
+                    kind = ev.get("type")
+                    if kind == "response.output_text.delta":
+                        piece = ev.get("delta") or ""
+                        if piece:
+                            content += piece
+                            _emit({"type": "llm_delta", "text": piece})
+                            streamed += len(piece)
+                    elif kind == "response.reasoning_summary_text.delta":
+                        rc = ev.get("delta") or ""
+                        if rc:
+                            _emit({"type": "llm_reasoning", "text": rc})
+                    elif kind == "response.output_item.added":
+                        item = ev.get("item") or {}
+                        if item.get("type") == "function_call":
+                            cid = item.get("call_id") or item.get("id") or f"call_{len(order)}"
+                            calls[cid] = {"name": item.get("name") or "", "args": ""}
+                            order.append(cid)
+                    elif kind == "response.function_call_arguments.delta":
+                        cid = ev.get("call_id") or ev.get("item_id")
+                        if cid in calls:
+                            calls[cid]["args"] += ev.get("delta") or ""
+                    elif kind == "response.output_item.done":
+                        item = ev.get("item") or {}
+                        if item.get("type") == "function_call":
+                            cid = item.get("call_id") or item.get("id")
+                            if cid in calls:
+                                if item.get("name"):
+                                    calls[cid]["name"] = item["name"]
+                                if item.get("arguments"):
+                                    calls[cid]["args"] = item["arguments"]
+                    elif kind == "response.completed":
+                        usage = (ev.get("response") or {}).get("usage") or {}
+                        if usage:
+                            _emit({"type": "llm_usage", "input_tokens": usage.get("input_tokens"),
+                                   "output_tokens": usage.get("output_tokens")})
+                    elif kind in ("response.failed", "error"):
+                        err = ((ev.get("response") or {}).get("error") or ev.get("error") or {})
+                        raise RuntimeError(err.get("message") or f"responses api {kind}")
+
+        if not calls:
+            answer = content
+            break
+
+        # Same preamble handling as the chat/completions loop: a short spoken
+        # acknowledgement survives, anything longer (deliberation leaking out)
+        # is retracted. See _run_turn_chat_completions for the full rationale.
+        if streamed:
+            ack = content.strip()
+            if (PREAMBLE_MAX_CHARS and not spoke_preamble
+                    and 0 < len(ack) <= PREAMBLE_MAX_CHARS):
+                spoke_preamble = True
+                logger.debug("keeping tool preamble: %r", ack)
+            else:
+                _emit({"type": "llm_delta", "text": "", "reset": True})
+
+        if content.strip():
+            convo.append({"role": "assistant", "content": [{"type": "output_text", "text": content}]})
+
+        for cid in order:
+            c = calls[cid]
+            convo.append({"type": "function_call", "call_id": cid,
+                          "name": c["name"], "arguments": c["args"] or "{}"})
+            tool = tools.get(c["name"])
+            if tool is None:
+                logger.warning("model called an unknown tool: {!r}", c["name"])
+                result = sanitize_tool_output(f"no such tool: {c['name']}")
+            else:
+                result = _run_tool(tool, c["args"])
+            convo.append({"type": "function_call_output", "call_id": cid, "output": result})
     else:
         logger.warning("tool loop hit its %d-step ceiling; answering with what we have", MAX_STEPS)
         answer = content
