@@ -11,10 +11,8 @@ Speak, interrupt it mid-sentence, search the web, hear the answer.
 was asked in, with English kept only for proper nouns and untranslatable terms.
 
 ![The extension-lookup demo: a spoken name matched to three colleagues, the lookup panel
-showing every match with its extension, and the assistant asking which department.](docs/demo-extension-lookup.png)
-
-![The demo mid-conversation: a spoken weather question routed to the tool, answered in zh-TW,
-with the live VRAM readout and the pipeline card showing no STT stage.](docs/demo.png)
+showing every match with its extension, the live VRAM readout, the pipeline card showing no STT
+stage, and the assistant asking which department.](docs/demo-extension-lookup.png)
 
 ```mermaid
 flowchart LR
