@@ -3,8 +3,8 @@
 **A fully local zh-TW voice agent on HuggingFace `speech-to-speech`.**
 Silero VAD + Smart Turn → **Gemma 4 E4B hearing the speech directly** (own tool loop, real tools)
 → Qwen3-TTS, speaking the OpenAI Realtime protocol. There is no speech-to-text model on the
-answering path; X-ASR runs beside it only to caption the screen. No hosted API, no mocks, no
-cloud.
+answering path; a second, smaller Gemma 4 (E2B) runs beside it only to caption the screen. No
+hosted API, no mocks, no cloud.
 
 Speak, interrupt it mid-sentence, search the web, hear the answer.
 **Traditional Chinese (Taiwan) throughout** — replies are zh-TW whatever language the question
@@ -21,9 +21,10 @@ flowchart LR
     Mic["🎤 Mic"] -->|OpenAI Realtime<br/>WebSocket / WebRTC| RT["Realtime server<br/>:8765"]
     RT --> VAD["Silero VAD v5<br/>+ Smart Turn v3.2"]
     VAD -->|audio| AG["LLM stage<br/>own tool loop"]
-    VAD -.->|same audio| XA["X-ASR<br/>caption only"]
+    VAD -.->|same audio| XA["Gemma 4 E2B<br/>caption only"]
     XA -.->|partial transcript| RT
     AG <--> LLM["llama-server :11435<br/>Gemma 4 E4B QAT + MTP"]
+    XA <--> LLM2["llama-server :11436<br/>Gemma 4 E2B QAT + MTP"]
     AG -->|native tool call| T{{"web_search · get_weather<br/>get_current_datetime"}}
     T --> SX["SearXNG :8888<br/>+ wttr.in"]
     SX -.results.-> AG
@@ -37,7 +38,7 @@ flowchart LR
     classDef s fill:#12281c,stroke:#3f9e6a,color:#eee
     classDef f fill:#2a2033,stroke:#c07cff,color:#eee
     classDef c fill:#2b2b1e,stroke:#a89b3f,color:#eee
-    class LLM,TTS,AG m
+    class LLM,LLM2,TTS,AG m
     class XA c
     class SX,T s
     class RT,VAD,CS f
@@ -59,8 +60,9 @@ tools.
 |---|---|---|
 | **Orchestrator** | `speech-to-speech` 0.2.12 | OpenAI Realtime server on `:8765`, WebSocket + WebRTC |
 | **Turn-taking** | Silero VAD v5 + Smart Turn v3.2 | local ONNX; `--min_silence_ms 700` for Mandarin |
-| **STT** | **none on the answering path** | the model hears the speech; X-ASR only captions the screen |
+| **STT** | **none on the answering path** | the model hears the speech; a second Gemma 4 E2B only captions the screen |
 | **LLM** | `gemma-4-E4B-it-qat-UD-Q4_K_XL` + MTP head | llama-server `:11435`, `--mmproj` for audio, `--jinja` for native tool calls |
+| **Caption LLM** | `gemma-4-E2B-it-qat-UD-Q4_K_XL` + MTP head | llama-server `:11436`, same `--mmproj` architecture, own process |
 | **Agent** | own loop (`agent/native_loop.py`) | 3 tools, 3-step ceiling, arguments validated, results sanitised |
 | **TTS** | `Qwen3-TTS-12Hz-0.6B-CustomVoice` Q8_0 | stock s2s handler on GGML CUDA, speaker `Vivian`, fed Simplified glyphs |
 | **Search** | SearXNG `:8888` + wttr.in | real results only |
@@ -133,8 +135,9 @@ negate. `agent_handler` now records each finished turn into the `Chat` itself:
 | 那明天呢？ | 明天台北的天氣預報是…濕度為 90% — `get_weather`, 台北 carried over |
 | 我剛剛問的是哪個城市？ | 我上一個回答是針對台北的氣象預報。 — from memory, no tool |
 
-Past turns are replayed **as audio**, not as caption text, so X-ASR stays cosmetic and no ASR
-error can enter the model's context. Only the last three spoken turns keep their audio (~26 prompt
+Past turns are replayed **as audio**, not as caption text, so the caption engine stays cosmetic
+and no transcription error can enter the model's context. Only the last three spoken turns keep
+their audio (~26 prompt
 tokens per second of speech); a **barged-in turn is never recorded**, since it never reached the
 user.
 
@@ -144,19 +147,52 @@ clip transcribed completely at 25 s and 40 s, while at 60 s the tail was silentl
 
 ### The on-screen caption
 
-X-ASR decodes the same audio as it arrives, so the caption builds while the user is still
-speaking. Three properties keep it free, and each was got wrong first:
+The caption is a **second opinion asked of the same audio**, not a peek at what the model
+actually saw — Gemma 4 E4B hears the raw audio directly, the caption comes from decoding it
+independently, and the two can disagree. The first version used X-ASR, an unrelated streaming
+transducer, for that second opinion; the two could disagree simply because X-ASR is a much
+smaller, general-purpose model, making the caption look wrong even on a turn E4B answered
+correctly. It now uses **a second Gemma 4 — E2B, its own QAT + MTP GGUF, native audio input** —
+so the caption reflects what the same model family understood, not an unrelated ASR's guess.
+
+E2B runs on its own `llama-server` (`s2s/deploy/llm-e2b-caption.sh`, port `11436`), a separate
+process from the E4B server driving the conversation, so a slow or stalled caption call can only
+make the caption late — it cannot block the turn. Verified: all 751 tensors in E2B's and E4B's
+`mmproj` are byte-identical (conv frontend, all 12 audio-transformer blocks, the pre-encoder) —
+only one small adapter differs, `mm.a.input_projection.weight`, `(2560,1536)` for E4B vs.
+`(1536,1536)` for E2B, mapping the same shared audio embedding into each model's own hidden size.
+So E2B is genuinely hearing the audio, at the cost of its own weaker transcription — a caption is
+now honest about what E2B heard even when that is imperfect, rather than papering over it with an
+unrelated model's independent guess.
+
+Two things had to be fixed to make E2B usable for this at all:
+
+- **Asked to "transcribe" cold** (no tool schema, no system prompt), E2B reliably spent its whole
+  `max_tokens` budget narrating a "Thinking Process..." plan and returned empty content —
+  reasoning and the answer share one token budget, so `--reasoning off` is set on its server.
+- **Even with reasoning off**, a free-text prompt got restated and the transcript buried
+  mid-paragraph in quotes: `The audio clip is: "帮我转接陈一军"\nI need to output only the
+  transcript.` The caller (`s2s/caption_gemma.py`) now constrains the reply with a JSON schema —
+  `{"transcript": "..."}` — which the server turns into a grammar the model literally cannot
+  narrate around, at a third of the tokens (24–28 vs. 57–64) and without parsing prose.
+
+Three properties carry over from the X-ASR version, and each was got wrong first:
 
 - **Teed, not staged.** Audio is copied inside `AudioHandler.append_pcm`, the one funnel every
-  inbound chunk passes through, so no handler joins the chain. One non-blocking put; decoding is
-  on a daemon thread, on CPU. 2.07 s median first audio with captions against 2.09 s without.
+  inbound chunk passes through, so no handler joins the chain. One non-blocking put; the HTTP
+  call to E2B happens on a daemon thread.
 - **Published as a *partial*.** A *completed* transcription is added to the `Chat` by
   `RealtimeService` and reaches the model next turn — that cost 0.3 s.
-- **Boundaries come from the pipeline's VAD**, not X-ASR's own endpointing. `speech_started`
-  arrives a few hundred ms *into* the speech and the pipeline keeps that pre-roll, so audio is fed
-  continuously and only *publishing* is gated — resetting the decoder dropped the opening words.
+- **Boundaries come from the pipeline's VAD**, not the caption engine's own endpointing.
+  `speech_started` arrives a few hundred ms *into* the speech, so a short rolling pre-roll is kept
+  between utterances and seeded into the buffer at `begin()` — otherwise the caption and the model
+  would describe different spans of the same audio.
 
-`S2S_CAPTION=0` turns it off.
+Unlike X-ASR's true incremental decoding, a chat-completions call has no notion of "extend this
+partial", so each tick re-sends the whole utterance-so-far (`S2S_CAPTION_GEMMA_INTERVAL`, default
+0.7 s — coarser than X-ASR's 0.25 s, to keep the number of LLM calls bounded). Measured per tick: ~300 ms.
+`S2S_CAPTION_BACKEND=xasr` restores the original engine; `S2S_CAPTION=0` turns captions off
+entirely.
 
 ### The voice, and why the TTS reads Simplified
 
@@ -479,8 +515,9 @@ Applying `twp` to the transcript would put words in it the user never said — �
 ## Features
 
 - **Barge-in on speech detection**, not end-of-utterance.
-- **No speech-to-text on the answering path.** Gemma 4 hears the audio and routes tools from
-  speech alone; X-ASR captions from a side path that never enters the pipeline.
+- **No speech-to-text on the answering path.** Gemma 4 E4B hears the audio and routes tools from
+  speech alone; a second, smaller Gemma 4 (E2B) captions from a side path that never enters the
+  pipeline.
 - **Multi-turn memory on the audio path.** Follow-ups resolve against earlier turns
   (「那明天呢？」 keeps the city), with past speech replayed as audio.
 - **Real tools**, called natively: `web_search`, `get_weather`, `get_current_datetime`, with
@@ -511,8 +548,9 @@ Generation, Gemma 4 E4B QAT UD-Q4_K_XL (4.22 GB), greedy:
 
 Decode is memory-bandwidth-bound; MTP's self-speculation is what pushes past the single-token
 bound. Qwen3-TTS TTFA is 0.02–0.08 s at RTF ~0.2, so a tool turn's latency is the lookup
-round-trip, not synthesis. The X-ASR caption reaches the client at **+0.89 s**, ahead of first
-audio. Barge-in cancels **1.29 s** after speech starts.
+round-trip, not synthesis. The Gemma 4 E2B caption's first partial lands **~0.75 s into speech**,
+0.9–1.9 s before `speech_stopped` — well ahead of the answer, which starts 1.0–1.7 s *after*
+`speech_stopped`. Barge-in cancels **1.29 s** after speech starts.
 
 ## Configuration
 
@@ -526,7 +564,9 @@ audio. Barge-in cancels **1.29 s** after speech starts.
 | `LLM_AGENT_TEMP` / `LLM_AGENT_TOP_P` | `0.7` / `0.9` | agent-turn sampling; `pipeline.sh` pins temp to `0.2` so extensions are not improvised |
 | `LLM_AGENT_SEED` | unset | reproducible agent turns |
 | `LLM_REQUEST_TIMEOUT` | `45` | a hung call must not hold the only pipeline slot |
-| `S2S_CAPTION` / `S2S_CAPTION_DEVICE` | `1` / `cpu` | the X-ASR caption, and where it runs |
+| `S2S_CAPTION` / `S2S_CAPTION_BACKEND` | `1` / `gemma` | captions on/off; `xasr` restores the original streaming-transducer engine |
+| `S2S_CAPTION_LLM_API_BASE` / `S2S_CAPTION_LLM_MODEL` | `…:11436/v1` / `gemma-4-e2b-caption` | which llama-server the E2B caption engine talks to |
+| `S2S_CAPTION_GEMMA_INTERVAL` | `0.7` | seconds between caption re-transcriptions (coarser than X-ASR's, since each tick is a full LLM call) |
 | `VOICE_TZ` | `Asia/Taipei` | timezone `get_current_datetime` reports by default |
 | `SEARXNG_URL` | `http://localhost:8888` | search backend for `web_search` |
 | `LLM_TOOL_PREAMBLE_MAX` | `40` | longest pre-tool utterance that is spoken; `0` discards all of it |

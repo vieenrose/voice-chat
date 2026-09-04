@@ -222,9 +222,18 @@ def _give_stage_the_event_queue() -> None:
         # appear while the user is still speaking instead of after the segment closes.
         global _caption_stream
         if q is not None and os.getenv("S2S_CAPTION", "1").strip().lower() not in ("0", "false", "no"):
-            from s2s.caption import CaptionStream
+            backend = os.getenv("S2S_CAPTION_BACKEND", "gemma").strip().lower()
+            if backend in ("gemma", "gemma-e2b", "e2b"):
+                # Default: a second Gemma 4 E2B transcribes the same audio E4B
+                # hears, so the caption reflects what the model family actually
+                # understood rather than an unrelated ASR's independent guess.
+                from s2s.caption_gemma import GemmaCaptionStream
 
-            _caption_stream = CaptionStream(q)
+                _caption_stream = GemmaCaptionStream(q)
+            else:
+                from s2s.caption import CaptionStream
+
+                _caption_stream = CaptionStream(q)
             _align_captions_to_vad(handlers, _caption_stream)
         return handlers
 
