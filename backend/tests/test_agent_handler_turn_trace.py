@@ -51,8 +51,8 @@ class _FakeLLM:
 class _Handler(AgentLanguageModelHandler):
     """setup() only, so the real _drive()/process() run unmodified."""
 
-    def setup(self, harness_events=None, **kw):
-        self.cancel_scope = None
+    def setup(self, harness_events=None, cancel_scope=None, **kw):
+        self.cancel_scope = cancel_scope
         self.speculative_turns = None
         self.max_new_tokens = 64
         self.llm = _FakeLLM(harness_events or [])
@@ -92,7 +92,18 @@ class TestTurnTraceIntegration(unittest.TestCase):
             {"type": "tool_result", "name": "get_weather", "result": {"forecast": "sunny"}},
         ])
         self.assertEqual(snap["usage"], {"input_tokens": 88, "output_tokens": 21})
+        self.assertEqual(snap["answer"], "今天台北天氣晴朗。")
         self.assertTrue(snap["done"])
+
+    def test_multi_sentence_answer_accumulates_in_the_trace(self):
+        # Each sentence flushes as its own chunk (see _split_at); the trace's
+        # `answer` is the fallback shown in the chat bubble, so it must be the
+        # full reply the user heard, not just the last flushed piece.
+        events = [{"type": "llm_done", "text": "第一句。第二句。"}]
+        h, req = _build(events)
+        list(h.process(req))
+
+        self.assertEqual(turn_trace.snapshot()["answer"], "第一句。第二句。")
 
     def test_a_turn_with_no_reasoning_or_tools_leaves_an_empty_but_closed_trace(self):
         events = [{"type": "llm_done", "text": "你好。"}]
@@ -117,6 +128,45 @@ class TestTurnTraceIntegration(unittest.TestCase):
         snap = turn_trace.snapshot()
         self.assertEqual(snap["turn_id"], "t1")   # both requests reuse turn_id "t1" in this fixture
         self.assertEqual(snap["reasoning"], "")
+
+    def test_a_barged_in_turns_answer_never_reaches_the_trace(self):
+        # A superseded turn never happened as far as the user is concerned (see
+        # process()'s own comment above _record_turn_text); the trace's
+        # fallback `answer` must honor the same rule, or the UI would show text
+        # for a reply the user actually interrupted.
+        scope = FakeCancelScope()
+
+        class H(_Handler):
+            def _drive(self, history, prompt):
+                yield "delta", "第一句。"
+                scope.cancel()      # user starts talking mid-turn
+                yield "delta", "第二句。"
+
+        h = H(Event(), Queue(), Queue(), setup_kwargs={"cancel_scope": scope})
+        h._transcribe = lambda audio, sr: "今天台北天氣如何"
+        req = GenerateResponseRequest(
+            runtime_config=RuntimeConfig(),
+            audio=np.zeros(2, dtype=np.float32), audio_sample_rate=16000,
+            turn_id="t1", turn_revision=0,
+        )
+        list(h.process(req))
+
+        self.assertEqual(turn_trace.snapshot()["answer"], "")
+
+
+class FakeCancelScope:
+    def __init__(self):
+        self._gen = 0
+
+    @property
+    def generation(self):
+        return self._gen
+
+    def cancel(self):
+        self._gen += 1
+
+    def is_stale(self, gen):
+        return gen != self._gen
 
 
 if __name__ == "__main__":

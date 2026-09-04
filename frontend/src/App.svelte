@@ -202,6 +202,7 @@
       bubble.trace.reasoning = t.reasoning || ''
       bubble.trace.steps = t.steps || []
       bubble.trace.usage = t.usage || bubble.trace.usage
+      bubble.trace.answer = t.answer || bubble.trace.answer
       bubble.trace.done = !!t.done
       turns = turns
       // Keyed on this bubble's OWN trace object, not the server's turn_id --
@@ -229,7 +230,7 @@
     if (activeBubble && !activeBubble.done) return
     activeBubble = { role: 'assistant', raw: '', text: '',
                      done: false,
-                     trace: { reasoning: '', steps: [], usage: null, done: false, counted: false } }
+                     trace: { reasoning: '', steps: [], usage: null, answer: '', done: false, counted: false } }
     turns = [...turns, activeBubble]
   }
 
@@ -296,6 +297,16 @@
     const bubble = activeBubble
     activeBubble = null   // this response is over; a later poll/append for it is now stale
     if (!bubble) return
+    // The live transcript (response.output_audio_transcript) can silently go
+    // missing while TTS still speaks the reply -- a real, observed framework
+    // race in the turn-reopen path (see s2s/turn_trace.py.set_answer). When
+    // that happens `bubble.raw` never received anything even though the turn
+    // produced a real answer, so fall back to the harness's own record of the
+    // text it assembled rather than showing (or dropping) an empty bubble.
+    if (!bubble.raw && bubble.trace?.answer) {
+      bubble.raw = bubble.trace.answer
+      bubble.text = toTWP(bubble.raw)
+    }
     // A turn that answered with no spoken text (e.g. the empty-prompt path)
     // and drew no tool call either leaves nothing worth a bubble for --
     // drop it rather than showing a blank one.
@@ -364,9 +375,15 @@
       audioSeconds += play.push(b64)
       speaking = true
     },
-    onResponseDone(status, reason) {
+    async onResponseDone(status, reason) {
       responding = false
       lastStatus = status === 'cancelled' ? `已中斷（${reason || 'cancelled'}）` : ''
+      // Fetch the trace one more time BEFORE sealing, while activeBubble still
+      // points at this turn's bubble -- s2s/turn_trace.py.set_answer is only
+      // written right as the backend finishes the turn, so a poll from the
+      // periodic timer can easily predate it and this fallback would otherwise
+      // never see the answer it exists for.
+      await pollTrace()
       sealAssistant(status === 'cancelled')
     },
     onError(msg) { error = msg; note('server.error', { message: msg }) },

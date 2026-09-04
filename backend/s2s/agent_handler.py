@@ -354,6 +354,14 @@ class AgentLanguageModelHandler(BaseHandler[LLMIn, LLMOut]):
             self._record_turn_text(request, prompt.strip(), answered.strip())
 
         try:
+            if answered.strip() and not self._stale(gen, request):
+                from s2s.turn_trace import set_answer as _trace_set_answer
+
+                _trace_set_answer(answered.strip())
+        except Exception:
+            logger.exception("could not record the turn's answer into the trace")
+
+        try:
             from s2s.turn_trace import end as _trace_end
 
             _trace_end()
