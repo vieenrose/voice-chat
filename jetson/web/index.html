@@ -39,6 +39,9 @@
   .meter .fill { height:100%; width:0; background:#16a34a; transition: width 60ms linear; }
   .meter .fill.hot { background:#d97706; }
   .meter .fill.clip { background:var(--bad); }
+  select { padding:10px; border-radius:8px; border:1px solid #9ca3af; background:var(--card); color:var(--fg); font-size:16px; }
+  #blurb { color: var(--muted); font-size: 14px; margin: 6px 0 0; min-height: 1.4em; }
+  .scene { color: var(--muted); text-align:center; font-size:13px; margin: 10px 0; }
   #lat { font: 14px ui-monospace, monospace; color: var(--muted); white-space: pre; margin-top: 10px; }
 </style>
 </head>
@@ -52,13 +55,18 @@
     <button id="go">開始</button>
     <button id="hang" disabled>停止</button>
   </div>
+  <div class="row">
+    <label for="role">角色</label>
+    <select id="role" disabled><option value="assistant">語音助理</option></select>
+  </div>
+  <div id="blurb"></div>
   <div class="meter"><span>🎤</span><div class="bar"><div class="fill" id="vu"></div></div><span id="vudb">— dB</span></div>
   <div id="status">尚未連線。請輸入存取碼並允許麥克風。</div>
   <div class="log" id="log"></div>
   <div id="lat"></div>
   </section>
-  <section class="tl" aria-label="Chronologie des composants">
-    <iframe src="trace?embed=1" title="Chronologie VAD / ASR / LLM / TTS et ressources"></iframe>
+  <section class="tl" aria-label="各元件時間軸">
+    <iframe src="trace?embed=1" title="VAD / ASR / LLM / TTS 時間軸與資源使用"></iframe>
   </section>
   </div>
 </main>
@@ -186,7 +194,7 @@
       const msg = e.code === 4401 ? "存取碼不正確。" : e.code === 4409 ? "伺服器忙碌，另一個會話使用中。" : "連線已關閉。";
       status(msg, e.code !== 1000);
       stopAudio(); stopMic(); ws = null;
-      $("go").disabled = false; $("hang").disabled = true;
+      $("go").disabled = false; $("hang").disabled = true; $("role").disabled = true;
     };
     ws.onmessage = (e) => {
       if (e.data instanceof ArrayBuffer) {
@@ -199,6 +207,8 @@
       }
       const m = JSON.parse(e.data);
       switch (m.type) {
+        case "roles": fillRoles(m); break;
+        case "role": sceneChanged(m); break;
         case "partial": partialLine(m.text); break;
         case "user": finalizeUser(m.text, m.replace); break;
         case "echo_dropped": if (partialEl) { partialEl.remove(); partialEl = null; } break;
@@ -211,6 +221,28 @@
       }
     };
   }
+
+  const blurbs = {};
+  function fillRoles(m) {
+    const sel = $("role");
+    sel.innerHTML = "";
+    for (const r of m.items) {
+      blurbs[r.id] = r.blurb;
+      sel.add(new Option(r.name, r.id));
+    }
+    sel.value = m.current;
+    sel.disabled = false;
+    $("blurb").textContent = blurbs[m.current] || "";
+  }
+  function sceneChanged(m) {
+    stopAudio();
+    $("role").value = m.id;
+    $("blurb").textContent = m.blurb || "";
+    if (partialEl) { partialEl.remove(); partialEl = null; }
+    lastUser = null;
+    if (m.id !== "assistant" || $("log").children.length) line("scene", "—— 角色：" + m.name + " ——");
+  }
+  $("role").onchange = () => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "role", id: $("role").value })); };
 
   let partialEl = null;
   function partialLine(text) {

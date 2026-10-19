@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="fr">
+<html lang="zh-Hant">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Jetson Timeline</title>
+<title>Jetson 時間軸</title>
 <style>
   :root { --bg:#f6f7f9; --fg:#1d2330; --muted:#6b7280; --card:#fff; --grid:#e5e7eb; --accent:#2563eb; --bad:#b91c1c;
           --vad:#64748b; --asr:#0891b2; --llm:#7c3aed; --tts:#ea580c; --spk:#16a34a; --gpu:#7c3aed; --cpu:#2563eb; }
@@ -42,37 +42,37 @@
 </head>
 <body>
 <main>
-  <h1 class="hide-embed">Chronologie des composants et des ressources</h1>
-  <p class="sub hide-embed">Jetson Nano : 4 cœurs CPU (ARM A57), GPU Maxwell 128 cœurs, 4 Go de RAM partagée entre CPU et GPU. Mise à jour chaque seconde ; 0 = maintenant.</p>
+  <h1 class="hide-embed">各元件與資源時間軸</h1>
+  <p class="sub hide-embed">Jetson Nano：4 核心 CPU（ARM A57）、128 核心 Maxwell GPU、4 GB 記憶體（CPU 與 GPU 共用）。每秒更新；0 代表現在。</p>
   <div class="row">
     <input id="token" class="hide-embed" type="password" placeholder="LAN 存取碼" autocomplete="off">
     <select id="win"><option value="15">15 s</option><option value="30" selected>30 s</option><option value="60">60 s</option><option value="120">120 s</option></select>
-    <button id="pause">Pause</button>
+    <button id="pause">暫停</button>
     <span id="status">—</span>
   </div>
   <div class="card"><canvas id="cv" height="520"></canvas>
     <div class="legend">
-      <span><span class="sw" style="background:var(--vad)"></span>VAD (Silero, CPU 1 thread)</span>
-      <span><span class="sw" style="background:var(--asr)"></span>ASR (X-ASR sherpa-onnx, CPU 2 threads)</span>
-      <span><span class="sw" style="background:var(--llm)"></span>LLM (Bonsai 2B fwd35, GPU)</span>
-      <span><span class="sw" style="background:var(--tts)"></span>TTS (PrimeTTS ORT, CPU 4 threads)</span>
-      <span><span class="sw" style="background:var(--spk)"></span>Haut-parleur (lecture estimée)</span>
+      <span><span class="sw" style="background:var(--vad)"></span>VAD（Silero，CPU 1 執行緒）</span>
+      <span><span class="sw" style="background:var(--asr)"></span>ASR（X-ASR sherpa-onnx，CPU 2 執行緒）</span>
+      <span><span class="sw" style="background:var(--llm)"></span>LLM（Bonsai 2B fwd35，GPU）</span>
+      <span><span class="sw" style="background:var(--tts)"></span>TTS（PrimeTTS ORT，CPU 3 執行緒）</span>
+      <span><span class="sw" style="background:var(--spk)"></span>喇叭（估計播放時間）</span>
     </div>
   </div>
 
-  <h2>Dernier tour : où passe le temps</h2>
-  <div class="card"><div id="turn">En attente d'un tour complet (fin de parole → audio joué)…</div></div>
+  <h2>最近一輪：時間花在哪裡</h2>
+  <div class="card"><div id="turn">等待完整的一輪對話（說完話 → 聲音播放）…</div></div>
 
-  <details id="who" open><summary>Qui utilise quoi (CPU / GPU)</summary>
+  <details id="who" open><summary>誰用了什麼（CPU / GPU）</summary>
   <div class="card scroll">
     <table>
-      <tr><th>Composant</th><th>Matériel</th><th>Threads</th><th>Quand</th><th>Coût mesuré</th></tr>
-      <tr><td><span class="sw" style="background:var(--vad)"></span>VAD Silero v6</td><td>CPU</td><td>1</td><td>Chaque trame micro (32 ms), en continu</td><td>quelques ms par paquet de 128 ms</td></tr>
-      <tr><td><span class="sw" style="background:var(--asr)"></span>ASR X-ASR (streaming)</td><td>CPU</td><td>2</td><td>Seulement quand le VAD a ouvert la porte (pré-roll puis parole), et le flush en fin de phrase</td><td>RTF 0,32 ; flush ≈ 0,1–0,2 s</td></tr>
-      <tr><td>Smart Turn v3.2 (désactivé)</td><td>CPU</td><td>2</td><td>À chaque fin de parole si VC_SMART_TURN=1</td><td>≈ 460 ms par appel</td></tr>
-      <tr><td><span class="sw" style="background:var(--llm)"></span>LLM Bonsai-2 2B ternaire</td><td>GPU (+ 1 cœur CPU pour piloter)</td><td>—</td><td>Après la fin de parole : prefill puis décodage token par token</td><td>prefill ≈ 1,5–2 s</td></tr>
-      <tr><td><span class="sw" style="background:var(--tts)"></span>TTS PrimeTTS + g2pW</td><td>CPU</td><td>4</td><td>Dès la première phrase complète du LLM, pendant que le LLM continue</td><td>≈ 1–1,5 s par phrase</td></tr>
-      <tr><td><span class="sw" style="background:var(--spk)"></span>Réseau + navigateur</td><td>—</td><td>—</td><td>Envoi de chaque phrase synthétisée, lecture côté navigateur</td><td>0,2–1,1 s observés</td></tr>
+      <tr><th>元件</th><th>硬體</th><th>執行緒</th><th>何時運作</th><th>實測成本</th></tr>
+      <tr><td><span class="sw" style="background:var(--vad)"></span>VAD Silero v6</td><td>CPU</td><td>1</td><td>持續處理每個麥克風音框（32 ms）</td><td>每 128 ms 音訊僅數 ms</td></tr>
+      <tr><td><span class="sw" style="background:var(--asr)"></span>ASR X-ASR（串流）</td><td>CPU</td><td>2</td><td>只在 VAD 開門後運作（先送預錄音訊再送語音），句尾再做一次排空</td><td>RTF 0.32；排空約 0.27 秒</td></tr>
+      <tr><td>Smart Turn v3.2（預設關閉）</td><td>CPU</td><td>2</td><td>設定 VC_SMART_TURN=1 時，每次說完話都執行</td><td>每次約 460 ms</td></tr>
+      <tr><td><span class="sw" style="background:var(--llm)"></span>LLM Bonsai-2 2B 三元權重</td><td>GPU（另用 1 個 CPU 核心驅動）</td><td>—</td><td>說完話後：先預填（prefill），再逐 token 解碼</td><td>預填約 0.35–0.5 秒（換角色後的第一輪需完整預填）</td></tr>
+      <tr><td><span class="sw" style="background:var(--tts)"></span>TTS PrimeTTS + g2pW</td><td>CPU</td><td>3</td><td>LLM 產生第一個短句後立即開始，與 LLM 解碼同時進行</td><td>每句約 0.5–2 秒</td></tr>
+      <tr><td><span class="sw" style="background:var(--spk)"></span>網路 + 瀏覽器</td><td>—</td><td>—</td><td>傳送每句合成的語音，並由瀏覽器播放</td><td>實測 0.2–1.1 秒</td></tr>
     </table>
   </div>
   </details>
@@ -87,14 +87,14 @@
   const save = (v) => { try { localStorage.setItem(KEY, v); } catch (_) {} };
   $("token").value = saved();
   let paused = false, last = null;
-  $("pause").onclick = () => { paused = !paused; $("pause").classList.toggle("on", paused); $("pause").textContent = paused ? "Reprendre" : "Pause"; };
+  $("pause").onclick = () => { paused = !paused; $("pause").classList.toggle("on", paused); $("pause").textContent = paused ? "繼續" : "暫停"; };
   $("win").onchange = () => tick();
 
   const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
-  const LANES = [["Speaker", "--spk", "Haut-parleur"], ["TTS", "--tts", "TTS · CPU"], ["LLM", "--llm", "LLM · GPU"],
+  const LANES = [["Speaker", "--spk", "喇叭"], ["TTS", "--tts", "TTS · CPU"], ["LLM", "--llm", "LLM · GPU"],
                  ["ASR", "--asr", "ASR · CPU"], ["VAD", "--vad", "VAD · CPU"]];
-  const MARKS = { speech_start: "début parole", speech_end: "fin parole", user: "texte", first_token: "1er token",
-                  audio_sent: "audio envoyé", played: "joué", barge_in: "barge-in" };
+  const MARKS = { speech_start: "開始說話", speech_end: "說完", user: "文字", first_token: "首個 token",
+                  audio_sent: "音訊送出", played: "已播放", barge_in: "打斷" };
 
   function draw(d) {
     const cv = $("cv"), dpr = window.devicePixelRatio || 1;
@@ -147,7 +147,7 @@
     }
     const gy = r0 + ncore * coreH + 10, gh = 70;
     g.fillStyle = fg; g.fillText("GPU %", 4, gy + gh / 2 - 8);
-    g.fillStyle = muted; g.fillText("RAM (tirets)", 4, gy + gh / 2 + 8);
+    g.fillStyle = muted; g.fillText("記憶體（虛線）", 4, gy + gh / 2 + 8);
     g.strokeStyle = grid; g.strokeRect(L, gy, R - L, gh);
     const curve = (key, color, max, dash) => {
       g.strokeStyle = color; g.setLineDash(dash); g.lineWidth = 1.5; g.beginPath();
@@ -180,7 +180,7 @@
     }
     const s = d.samples[d.samples.length - 1];
     if (s) $("status").textContent = "CPU " + s.cpu.map((v) => v.toFixed(0) + "%").join(" ") +
-      " · GPU " + (s.gpu == null ? "—" : s.gpu.toFixed(0) + "%") + " · RAM " + s.mem + "/" + d.mem_total_mb + " Mo";
+      " · GPU " + (s.gpu == null ? "—" : s.gpu.toFixed(0) + "%") + " · RAM " + s.mem + "/" + d.mem_total_mb + " MB";
   }
 
   // last complete turn: speech_end -> user text -> first token -> first audio sent -> played
@@ -199,16 +199,16 @@
     const tts = d.spans.find((s) => s.comp === "TTS" && s.t0 >= ft.t - 0.01);
     const f = (v) => (1000 * v).toFixed(0).padStart(5) + " ms";
     const rows = [
-      ["fin de parole → texte ASR (attente VAD 450 ms déjà comptée avant)", user.t - end.t],
-      ["texte → 1er token LLM (prefill GPU)", ft.t - user.t],
-      ["1er token → 1re phrase prête (LLM décode jusqu'à la ponctuation)", tts ? tts.t0 - ft.t : null],
-      ["synthèse TTS de la 1re phrase (CPU)", tts ? tts.t1 - tts.t0 : null],
-      ["audio envoyé → joué (réseau + navigateur)", played.t - sent.t],
+      ["說完 → ASR 文字（VAD 的 450 ms 等待已先計入）", user.t - end.t],
+      ["文字 → LLM 首個 token（GPU 預填）", ft.t - user.t],
+      ["首個 token → 第一句就緒（LLM 解碼到標點為止）", tts ? tts.t0 - ft.t : null],
+      ["第一句的 TTS 合成（CPU）", tts ? tts.t1 - tts.t0 : null],
+      ["音訊送出 → 播放（網路 + 瀏覽器）", played.t - sent.t],
     ];
-    $("turn").textContent = "Tour terminé il y a " + (-played.t).toFixed(0) + " s : « " + user.label + " »\n" +
-      "Total fin de parole → audio joué : " + f(played.t - end.t) + "\n\n" +
+    $("turn").textContent = (-played.t).toFixed(0) + " 秒前完成一輪：「" + user.label + "」\n" +
+      "說完 → 聲音播放，合計：" + f(played.t - end.t) + "\n\n" +
       rows.map(([k, v]) => (v == null ? "    — " : f(v)) + "  " + k).join("\n") +
-      "\n\nNote : la fin de parole est datée par le VAD après 450 ms de silence ; le dernier son entendu est 450 ms plus tôt.";
+      "\n\n註：VAD 在安靜 450 ms 後才判定說完，所以最後一個聲音比標記時間早 450 ms。";
   }
 
   async function tick() {
@@ -218,15 +218,15 @@
       // embedded: the chat column holds the code; pick it up once the user has connected there
       const t = saved();
       if (t) $("token").value = t;
-      else { $("status").textContent = embed ? "Connectez-vous dans le chat pour voir la chronologie." : "Entrez le code d'accès."; return; }
+      else { $("status").textContent = embed ? "請先在左側對話區連線，才能顯示時間軸。" : "請輸入存取碼。"; return; }
       return tick();
     }
     try {
       const r = await fetch("trace.json?s=" + $("win").value + "&token=" + encodeURIComponent(token), { cache: "no-store" });
-      if (r.status === 401) { $("token").value = ""; $("status").textContent = "Code d'accès incorrect."; $("status").className = "bad"; return; }
+      if (r.status === 401) { $("token").value = ""; $("status").textContent = "存取碼不正確。"; $("status").className = "bad"; return; }
       last = await r.json(); save(token); $("status").className = "";
       draw(last); turnSummary(last);
-    } catch (e) { $("status").textContent = "Serveur injoignable."; $("status").className = "bad"; }
+    } catch (e) { $("status").textContent = "無法連線到伺服器。"; $("status").className = "bad"; }
   }
   window.addEventListener("resize", () => last && draw(last));
   setInterval(tick, 1000); tick();

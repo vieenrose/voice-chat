@@ -39,6 +39,7 @@ from starlette.websockets import WebSocketDisconnect
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from asr import Asr  # noqa: E402
 from llm import Llm  # noqa: E402
+import roles  # noqa: E402
 from smart_turn import SmartTurn  # noqa: E402
 import timeline as tr  # noqa: E402
 from tts import Tts  # noqa: E402
@@ -187,10 +188,13 @@ def load_engines():
 
 
 class Turn:
-    def __init__(self, n, text, t_last_voice):
+    def __init__(self, n, text, t_last_voice, role):
         self.n = n
         self.text = text
         self.t_last_voice = t_last_voice
+        self.voice = role["voice"]
+        self.system = roles.system_prompt(role)
+        self.scripted = False  # a fixed line (role opening) spoken without the LLM
         self.cancelled = threading.Event()
         self.reply = ""
         self.t_first_token = None
@@ -198,13 +202,28 @@ class Turn:
         self.chunks = 0  # TTS chunks emitted so far
 
 
+RUNAWAY = re.compile(r"\n\s*\n|(.)\1{5,}|(.{2,12}?)\2{2,}")
+
+
+def runaway(text):
+    """Index where a reply degenerates, else -1: a blank line (a spoken answer is one paragraph, the 2B model
+    repeats its last question after it), a character repeated 6+ times, or a phrase repeated 3+ times."""
+    m = RUNAWAY.search(text.lstrip("\n"))
+    if not m:
+        return -1
+    lead = len(text) - len(text.lstrip("\n"))
+    return lead + (m.start() if m.group(1) is None and m.group(2) is None else
+                   m.start() + (len(m.group(2)) if m.group(2) else 0))
+
+
 def run_turn(turn, emit, history):
     """Worker thread: LLM deltas -> sentences -> TTS -> events for the sender coroutine."""
     buf = ""
     t_req = time.monotonic()
+    stopped = False  # the reply degenerated: what was kept is final, the rest of the stream is drained
     try:
-        for delta in ENG.llm.stream(history, turn.text):
-            if turn.cancelled.is_set():
+        for delta in (iter([turn.text]) if turn.scripted else ENG.llm.stream(history, turn.text, turn.system)):
+            if turn.cancelled.is_set() or stopped:
                 continue  # keep draining so the engine is free for the next request
             if turn.t_first_token is None:
                 turn.t_first_token = time.monotonic()
@@ -212,6 +231,13 @@ def run_turn(turn, emit, history):
                 tr.mark("first_token")
             turn.reply += delta
             buf += delta
+            bad = runaway(turn.reply)
+            if bad >= 0:
+                buf = buf[:max(0, len(buf) - (len(turn.reply) - bad))]
+                turn.reply = turn.reply[:bad].strip()
+                stopped = True
+                ENG.llm.cancel()
+                print("reply cut (degenerate): %r" % turn.reply, flush=True)
             while True:
                 cut = first_cut(buf) if turn.chunks == 0 else find_cut(buf)
                 if cut < 0:
@@ -231,7 +257,7 @@ def _speak(turn, emit, sentence):
     if turn.cancelled.is_set() or not sentence.strip():
         return
     with tr.span("TTS", sentence):
-        wav, _ = ENG.tts.synth_sentence(sentence)
+        wav, _ = ENG.tts.synth_sentence(sentence, turn.voice)
     if turn.cancelled.is_set() or len(wav) == 0:
         return
     turn.chunks += 1
@@ -270,7 +296,8 @@ async def session(ws):
           "open": False, "pre": np.zeros(0, dtype=np.float32),  # VAD-gated STT: open flag, pre-roll audio
           "prev": None,  # (text, end time) of the last user utterance, for turn reopen
           "reopen": False,  # the current utterance continues the previous one
-          "echo_zone": False}  # the current utterance started while (or right after) the assistant spoke
+          "echo_zone": False,  # the current utterance started while (or right after) the assistant spoke
+          "role": roles.ROLES[0]}
     history = []
     rec = open_recording()  # (wav writer, event log, [samples written]) or None
 
@@ -285,9 +312,10 @@ async def session(ws):
             rec[1].write("%s\n" % line)
             rec[1].flush()
 
-    async def start_turn(text, t_last_voice):
+    async def start_turn(text, t_last_voice, scripted=False):
         st["n"] += 1
-        turn = Turn(st["n"], text, t_last_voice)
+        turn = Turn(st["n"], text, t_last_voice, st["role"])
+        turn.scripted = scripted
         st["cur"], st["last"] = turn, turn
         threading.Thread(target=run_turn, args=(turn, emit, list(history)), daemon=True).start()
 
@@ -336,7 +364,8 @@ async def session(ws):
                 if st["cur"] is turn:
                     st["cur"] = None
                 if not turn.cancelled.is_set() and turn.reply.strip():
-                    history.append((turn.text, turn.reply))
+                    if not turn.scripted:
+                        history.append((turn.text, turn.reply))
                     await ws.send_json({"type": "assistant", "turn": turn.n, "text": to_tw(turn.reply)})
                 seq = 0
 
@@ -365,7 +394,17 @@ async def session(ws):
             await cut_current()
             await start_turn(text, t_voice)
 
+    async def switch_role(role):
+        """New scene: stop what is playing, restart the conversation, speak the role's opening line."""
+        await cut_current()
+        history.clear()  # the LLM sees a new system prompt: it prefills in full, no stale state is reused
+        st["role"], st["prev"], st["reopen"] = role, None, False
+        await ws.send_json({"type": "role", "id": role["id"], "name": role["name"], "blurb": role["blurb"]})
+        if role["opening"]:
+            await start_turn(role["opening"], time.monotonic(), scripted=True)
+
     send_task = asyncio.create_task(sender())
+    await ws.send_json({"type": "roles", "items": roles.listing(), "current": st["role"]["id"]})
     try:
         while True:
             msg = await ws.receive()
@@ -427,10 +466,12 @@ async def session(ws):
                         st["held"] = (t_voice, t_end, now + INCOMPLETE_DELAY_S)
             elif msg.get("text"):
                 data = json.loads(msg["text"])
-                if data.get("type") == "played":
+                if data.get("type") == "role" and data.get("id") in roles.BY_ID:
+                    await switch_role(roles.BY_ID[data["id"]])
+                elif data.get("type") == "played":
                     turn = st["last"]
                     if turn is not None and turn.n == data.get("turn") and turn.t_first_sent is not None \
-                            and data.get("seq") == 1:
+                            and data.get("seq") == 1 and not turn.scripted:
                         tr.mark("played")
                         now = time.monotonic()
                         lv = turn.t_last_voice

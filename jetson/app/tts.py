@@ -61,8 +61,8 @@ class Tts:
         })[0]
         return [list(map(float, probs[i])) for i in range(batch)]
 
-    def synth_sentence(self, text):
-        """Returns (float32 wav at 16 kHz, seconds spent) for one sentence."""
+    def synth_sentence(self, text, voice=None):
+        """Returns (float32 wav at 16 kHz, seconds spent) for one sentence. `voice`: speaker id, default self.voice."""
         t0 = time.monotonic()
         out = self.frontend.convert(text)
         if not out["phone_ids"]:
@@ -73,7 +73,7 @@ class Tts:
         wav = self.vits.run(["wav"], {
             "x": phones, "tone": tones, "lang": langs,
             "x_lengths": np.array([phones.shape[1]], dtype=np.int64),
-            "sid": self.voice,
+            "sid": self.voice if voice is None else np.array([voice], dtype=np.int64),
             "noise_scale": np.array([0.667], dtype=np.float32),
             "length_scale": np.array([1.0], dtype=np.float32),
         })[0].reshape(-1).astype(np.float32)

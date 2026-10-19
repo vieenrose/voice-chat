@@ -26,9 +26,9 @@ HISTORY_MAX = 8  # history window: when it would exceed HISTORY_MAX turns it res
 HISTORY_KEEP = 4  # so the prompt prefix (and the engine's state) stays valid for several turns
 
 
-def build_prompt(tok, history, user_text):
+def build_prompt(tok, history, user_text, system=SYSTEM):
     """history: list of (user, assistant) pairs. Returns token ids."""
-    parts = ["<|im_start|>system\n" + SYSTEM + "<|im_end|>\n"]
+    parts = ["<|im_start|>system\n" + system + "<|im_end|>\n"]
     for u, a in history:
         parts.append("<|im_start|>user\n" + u + "<|im_end|>\n")
         parts.append("<|im_start|>assistant\n<think>\n\n</think>\n\n" + a + "<|im_end|>\n")
@@ -66,13 +66,13 @@ class Llm:
         except (BrokenPipeError, ValueError):
             pass
 
-    def stream(self, history, user_text):
+    def stream(self, history, user_text, system=SYSTEM):
         """Yields text deltas. Stops early after cancel(). Ends with the full reply in `self.last`."""
         if self.win > len(history):  # new session: the history restarted
             self.win = 0
         if len(history) - self.win > HISTORY_MAX:
             self.win = len(history) - HISTORY_KEEP
-        ids = build_prompt(self.tok, history[self.win:], user_text)
+        ids = build_prompt(self.tok, history[self.win:], user_text, system)
         if len(ids) + self.max_new > MAX_CTX:
             raise ValueError("prompt too long: %d tokens" % len(ids))
         with self.lock:
