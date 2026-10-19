@@ -1,5 +1,5 @@
 """End-to-end check of role switching against the running server: the roles list, the role message,
-the spoken opening line (voice differs per role) and the stop when switching again mid-opening.
+the opening line spoken on connect and the stop when the role restarts mid-opening.
 
   venv/bin/python app/role_test.py
 """
@@ -43,23 +43,20 @@ async def main():
         print("%s %s" % ("PASS" if cond else "FAIL", text))
 
     async with websockets.connect("wss://127.0.0.1:8443/ws?token=" + TOKEN, ssl=CTX, max_size=None) as ws:
-        msgs, _ = await collect(ws, 1.0)
+        msgs, samples = await collect(ws, 8.0)
         roles = next((m for m in msgs if m["type"] == "roles"), None)
-        check(roles and len(roles["items"]) >= 5 and roles["current"] == "assistant", "roles list on connect")
-        await ws.send(json.dumps({"type": "role", "id": "cafe"}))
-        msgs, samples = await collect(ws, 8.0)
-        types = [m["type"] for m in msgs]
-        check("role" in types and any(m.get("name") == "咖啡店店員" for m in msgs if m["type"] == "role"), "role acknowledged")
+        check(roles and [r["id"] for r in roles["items"]] == ["support"] and roles["current"] == "support", "one role, current on connect")
+        check(any(m["type"] == "role" and m.get("name") == "電信客服" for m in msgs), "role announced on connect")
         spoken = "".join(m["text"] for m in msgs if m["type"] == "audio_start")
-        check(spoken == "歡迎光臨！請問今天想喝點什麼？" and samples > 16000, "opening spoken: %r, %.1fs audio" % (spoken, samples / 16000))
+        check(spoken == "感謝來電，我是客服小林，請問有什麼可以幫您？" and samples > 16000, "opening spoken at connect: %r, %.1fs audio" % (spoken, samples / 16000))
         check(any(m["type"] == "assistant" for m in msgs), "opening shown as an assistant line")
-        await ws.send(json.dumps({"type": "role", "id": "interview"}))
+        await ws.send(json.dumps({"type": "role", "id": "support"}))
         await asyncio.sleep(0.3)
-        await ws.send(json.dumps({"type": "role", "id": "guide"}))  # switch again while the opening is still going
+        await ws.send(json.dumps({"type": "role", "id": "support"}))  # restart while the opening is still going
         msgs, samples = await collect(ws, 8.0)
         spoken = "".join(m["text"] for m in msgs if m["type"] == "audio_start")
-        check("stop_audio" in [m["type"] for m in msgs], "switching mid-opening stops the audio")
-        check(spoken.endswith("嗨，歡迎來台南！今天想先去逛哪裡呢？") and "你好，請坐" not in spoken[-20:], "last role spoke: %r" % spoken[-24:])
+        check("stop_audio" in [m["type"] for m in msgs], "restarting mid-opening stops the audio")
+        check(spoken.endswith("請問有什麼可以幫您？") and samples > 16000, "opening spoken again: %r" % spoken[-24:])
         await ws.send(json.dumps({"type": "role", "id": "nope"}))
         msgs, _ = await collect(ws, 1.0)
         check(not any(m["type"] == "role" for m in msgs), "unknown role ignored")

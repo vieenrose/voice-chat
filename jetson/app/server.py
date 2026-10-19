@@ -183,7 +183,7 @@ def load_engines():
     if SMART_TURN:
         ENG.smart = SmartTurn(str(ROOT / "models" / "smart-turn" / "smart-turn-v3.2-int8.onnx"),
                               threads=int(os.environ.get("VC_SMART_TURN_THREADS", "2")))
-    ENG.llm = Llm(str(ROOT / "fwd35_serve"), str(ROOT / "models" / os.environ.get("VC_LLM", "Ternary-Bonsai-2-4B-PTQ1_0.gguf")),
+    ENG.llm = Llm(str(ROOT / "fwd35_serve"), str(ROOT / "models" / os.environ.get("VC_LLM", "Ternary-Bonsai-2-2B-PTQ1_0.gguf")),
                   str(ROOT / "models" / "tok" / "tokenizer.json"), max_new=200)
 
 
@@ -399,12 +399,14 @@ async def session(ws):
         await cut_current()
         history.clear()  # the LLM sees a new system prompt: it prefills in full, no stale state is reused
         st["role"], st["prev"], st["reopen"] = role, None, False
+        asyncio.create_task(asyncio.to_thread(ENG.llm.warm, roles.system_prompt(role)))
         await ws.send_json({"type": "role", "id": role["id"], "name": role["name"], "blurb": role["blurb"]})
         if role["opening"]:
             await start_turn(role["opening"], time.monotonic(), scripted=True)
 
     send_task = asyncio.create_task(sender())
     await ws.send_json({"type": "roles", "items": roles.listing(), "current": st["role"]["id"]})
+    await switch_role(st["role"])  # the scene starts with its spoken opening line (and warms the prompt)
     try:
         while True:
             msg = await ws.receive()

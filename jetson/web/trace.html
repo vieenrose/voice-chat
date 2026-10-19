@@ -48,13 +48,14 @@
     <input id="token" class="hide-embed" type="password" placeholder="LAN 存取碼" autocomplete="off">
     <select id="win"><option value="15">15 s</option><option value="30" selected>30 s</option><option value="60">60 s</option><option value="120">120 s</option></select>
     <button id="pause">暫停</button>
+    <button id="export" title="把目前時間範圍內的事件、各輪延遲與資源用量存成文字檔">匯出文字檔</button>
     <span id="status">—</span>
   </div>
   <div class="card"><canvas id="cv" height="520"></canvas>
     <div class="legend">
       <span><span class="sw" style="background:var(--vad)"></span>VAD（Silero，CPU 1 執行緒）</span>
       <span><span class="sw" style="background:var(--asr)"></span>ASR（X-ASR sherpa-onnx，CPU 2 執行緒）</span>
-      <span><span class="sw" style="background:var(--llm)"></span>LLM（Bonsai 4B fwd35，GPU）</span>
+      <span><span class="sw" style="background:var(--llm)"></span>LLM（Bonsai 2B fwd35，GPU）</span>
       <span><span class="sw" style="background:var(--tts)"></span>TTS（PrimeTTS ORT，CPU 3 執行緒）</span>
       <span><span class="sw" style="background:var(--spk)"></span>喇叭（估計播放時間）</span>
     </div>
@@ -70,7 +71,7 @@
       <tr><td><span class="sw" style="background:var(--vad)"></span>VAD Silero v6</td><td>CPU</td><td>1</td><td>持續處理每個麥克風音框（32 ms）</td><td>每 128 ms 音訊僅數 ms</td></tr>
       <tr><td><span class="sw" style="background:var(--asr)"></span>ASR X-ASR 480 ms（串流）</td><td>CPU</td><td>2</td><td>只在 VAD 開門後運作（先送預錄音訊再送語音），句尾再做一次排空</td><td>RTF 0.47；排空約 0.58 秒（補 1.0 秒靜音）</td></tr>
       <tr><td>Smart Turn v3.2（預設關閉）</td><td>CPU</td><td>2</td><td>設定 VC_SMART_TURN=1 時，每次說完話都執行</td><td>每次約 460 ms</td></tr>
-      <tr><td><span class="sw" style="background:var(--llm)"></span>LLM Bonsai-2 4B 三元權重</td><td>GPU（另用 1 個 CPU 核心驅動）</td><td>—</td><td>說完話後：先預填（prefill），再逐 token 解碼</td><td>整句回覆約 1–3 秒；換角色後第一輪需完整預填，約 7–9 秒</td></tr>
+      <tr><td><span class="sw" style="background:var(--llm)"></span>LLM Bonsai-2 2B 三元權重</td><td>GPU（另用 1 個 CPU 核心驅動）</td><td>—</td><td>說完話後：先預填（prefill），再逐 token 解碼</td><td>預填約 0.35–0.5 秒；換角色後的系統提示在開場白播放時預先預填</td></tr>
       <tr><td><span class="sw" style="background:var(--tts)"></span>TTS PrimeTTS + g2pW</td><td>CPU</td><td>3</td><td>LLM 產生第一個短句後立即開始，與 LLM 解碼同時進行</td><td>每句約 0.5–2 秒</td></tr>
       <tr><td><span class="sw" style="background:var(--spk)"></span>網路 + 瀏覽器</td><td>—</td><td>—</td><td>傳送每句合成的語音，並由瀏覽器播放</td><td>實測 0.2–1.1 秒</td></tr>
     </table>
@@ -210,6 +211,77 @@
       rows.map(([k, v]) => (v == null ? "    — " : f(v)) + "  " + k).join("\n") +
       "\n\n註：VAD 在安靜 450 ms 後才判定說完，所以最後一個聲音比標記時間早 450 ms。";
   }
+
+  // Text export of the current window: per-turn latency, a chronological event list, resource usage per second.
+  function exportText(d, takenAt) {
+    const pad = (n, w = 2) => String(n).padStart(w, "0");
+    const clock = (t) => { const x = new Date(takenAt + t * 1000); return pad(x.getHours()) + ":" + pad(x.getMinutes()) + ":" + pad(x.getSeconds()) + "." + pad(x.getMilliseconds(), 3); };
+    const ms = (v) => Math.round(1000 * v) + " ms";
+    const L = [];
+    const stamp = new Date(takenAt);
+    L.push("Jetson 語音對話時間軸");
+    L.push("匯出時間：" + stamp.toLocaleString("zh-TW", { hour12: false }) + "；範圍：最近 " + d.window + " 秒；記憶體總量：" + d.mem_total_mb + " MB");
+    L.push("時間欄為牆上時鐘（由伺服器相對時間換算，誤差約 1 秒）；「t」為相對匯出時刻的秒數（負值代表過去）。");
+
+    // turns: each "user" mark closes a turn at its next "played"
+    const marks = d.marks.slice().sort((a, b) => a.t - b.t);
+    L.push("", "== 各輪延遲 ==");
+    let n = 0;
+    marks.forEach((m, i) => {
+      if (m.name !== "user") return;
+      let end = null;
+      for (let k = i; k >= 0; k--) if (marks[k].name === "speech_end") { end = marks[k]; break; }
+      const rest = marks.slice(i + 1);
+      const nextUser = rest.findIndex((x) => x.name === "user");
+      const span = nextUser < 0 ? rest : rest.slice(0, nextUser);
+      const ft = span.find((x) => x.name === "first_token"), sent = span.find((x) => x.name === "audio_sent"), pl = span.find((x) => x.name === "played");
+      const cut = span.find((x) => x.name === "barge_in");
+      const tts = d.spans.find((x) => x.comp === "TTS" && ft && x.t0 >= ft.t - 0.01);
+      L.push("第 " + (++n) + " 輪 " + clock(m.t) + "  「" + m.label + "」" + (cut ? "  [被打斷]" : ""));
+      if (end) L.push("  說完 → ASR 文字      " + ms(m.t - end.t));
+      if (ft) L.push("  文字 → LLM 首個 token " + ms(ft.t - m.t));
+      if (tts && ft) L.push("  首個 token → 第一句就緒 " + ms(tts.t0 - ft.t) + "；第一句 TTS 合成 " + ms(tts.t1 - tts.t0));
+      if (sent && pl) L.push("  音訊送出 → 播放      " + ms(pl.t - sent.t));
+      if (end && pl) L.push("  說完 → 聲音播放（合計） " + ms(pl.t - end.t));
+    });
+    if (!n) L.push("（此範圍內沒有完整的一輪）");
+
+    L.push("", "== 事件（依時間） ==", "時間          t(s)     內容（VAD 與 ASR 的短區段已合併為區間）");
+    const ev = [];
+    const merged = (comp, text) => {
+      const out = [];
+      let run = null;
+      d.spans.filter((x) => x.comp === comp).sort((x, y) => x.t0 - y.t0).forEach((x) => {
+        if (run && x.t0 - run.t1 < 0.3) { run.t1 = Math.max(run.t1, x.t1); run.n++; }
+        else { if (run) out.push(run); run = { t0: x.t0, t1: x.t1, n: 1 }; }
+      });
+      if (run) out.push(run);
+      return out.map((x) => [x.t0, text + "（" + x.n + " 次運算）  (" + ms(x.t1 - x.t0) + ")"]);
+    };
+    const rows = merged("VAD", "VAD 有聲區間").concat(merged("ASR", "ASR 辨識區間"));
+    d.spans.filter((x) => x.comp !== "VAD" && x.comp !== "ASR").forEach((x) =>
+      rows.push([x.t0, x.comp + (x.label ? " " + x.label : "") + "  (" + ms(x.t1 - x.t0) + ")"]));
+    marks.forEach((m) => rows.push([m.t, "▶ " + (MARKS[m.name] || m.name) + (m.label ? "：" + m.label : "")]));
+    rows.sort((x, y) => x[0] - y[0]).forEach(([t, text]) => L.push(clock(t) + "  " + t.toFixed(2).padStart(7) + "  " + text));
+
+    L.push("", "== 資源（每秒） ==", "時間          CPU 各核心 %        GPU %   RAM MB");
+    let lastSec = null;
+    d.samples.forEach((q) => {
+      const sec = Math.floor(q.t);
+      if (sec === lastSec) return;
+      lastSec = sec;
+      L.push(clock(q.t) + "  " + q.cpu.map((v) => v.toFixed(0).padStart(3)).join(" ") + "      " + (q.gpu == null ? "  —" : q.gpu.toFixed(0).padStart(3)) + "     " + q.mem);
+    });
+    return L.join("\n") + "\n";
+  }
+  $("export").onclick = () => {
+    if (!last) { $("status").textContent = "尚無資料可匯出。"; return; }
+    const at = Date.now(), x = new Date(at), pad = (v) => String(v).padStart(2, "0");
+    const name = "trace-" + x.getFullYear() + pad(x.getMonth() + 1) + pad(x.getDate()) + "-" + pad(x.getHours()) + pad(x.getMinutes()) + pad(x.getSeconds()) + ".txt";
+    const url = URL.createObjectURL(new Blob([exportText(last, at)], { type: "text/plain;charset=utf-8" }));
+    const a = document.createElement("a"); a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
 
   async function tick() {
     if (paused) return;

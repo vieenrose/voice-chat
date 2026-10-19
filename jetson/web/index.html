@@ -57,7 +57,7 @@
   </div>
   <div class="row">
     <label for="role">角色</label>
-    <select id="role" disabled><option value="assistant">語音助理</option></select>
+    <select id="role" disabled><option value="support">電信客服</option></select>
   </div>
   <div id="blurb"></div>
   <div class="meter"><span>🎤</span><div class="bar"><div class="fill" id="vu"></div></div><span id="vudb">— dB</span></div>
@@ -240,7 +240,7 @@
     $("blurb").textContent = m.blurb || "";
     if (partialEl) { partialEl.remove(); partialEl = null; }
     lastUser = null;
-    if (m.id !== "assistant" || $("log").children.length) line("scene", "—— 角色：" + m.name + " ——");
+    line("scene", "—— 角色：" + m.name + " ——");
   }
   $("role").onchange = () => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "role", id: $("role").value })); };
 

@@ -66,6 +66,23 @@ class Llm:
         except (BrokenPipeError, ValueError):
             pass
 
+    def warm(self, system=SYSTEM):
+        """Prefills the system block ahead of the first turn (the Nano's 4B prefills ~45 ms per token), so
+        that turn only prefills what the user said. A no-op if the engine state already starts with it."""
+        ids = self.tok.encode("<|im_start|>system\n" + system + "<|im_end|>\n", add_special_tokens=False).ids
+        with self.lock:
+            if self.held[:len(ids)] == ids:
+                return
+            self.held = []
+            self.proc.stdin.write("1 %s\n" % " ".join(map(str, ids)))
+            self.proc.stdin.flush()
+            while True:
+                line = self.proc.stdout.readline().strip()
+                if not line or line in ("END", "ERR"):
+                    break
+                if line.startswith("P "):
+                    self.held = ids[:int(line[2:])]
+
     def stream(self, history, user_text, system=SYSTEM):
         """Yields text deltas. Stops early after cancel(). Ends with the full reply in `self.last`."""
         if self.win > len(history):  # new session: the history restarted

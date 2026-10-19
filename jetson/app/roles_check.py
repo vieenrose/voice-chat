@@ -17,17 +17,13 @@ from server import runaway  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = {
-    "assistant": ["你好", "台灣的首都是哪裡？", "謝謝"],
-    "cafe": ["我想要一杯熱拿鐵", "有什麼蛋糕可以推薦嗎？", "好，那我要一塊，一共多少錢？"],
-    "interview": ["我叫小王，做了三年的後端開發", "我最擅長的是 Python 和資料庫", "我想換工作是因為想學更多新技術"],
-    "guide": ["我明天早上到，第一天要去哪裡？", "那中午有什麼好吃的？", "你是機器人嗎？"],
     "support": ["我家的網路一直斷線", "指示燈是紅色的", "好，我重開機了，還是不行"],
 }
 BAD = re.compile(r"人工智慧|語言模型|語音助理|AI|我是機器|[*#`]|^\s*[-\d]+[.、)]")
 
 
 def main(binary, ids):
-    llm = Llm(binary, str(ROOT / "models" / os.environ.get("VC_LLM", "Ternary-Bonsai-2-4B-PTQ1_0.gguf")),
+    llm = Llm(binary, str(ROOT / "models" / os.environ.get("VC_LLM", "Ternary-Bonsai-2-2B-PTQ1_0.gguf")),
               str(ROOT / "models" / "tok" / "tokenizer.json"), max_new=80)
     flagged = 0
     for rid in ids:

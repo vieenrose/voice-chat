@@ -8,7 +8,7 @@
 |---|---|---|
 | VAD | Silero | CPU |
 | STT | X-ASR 480 ms chunk（sherpa-onnx，int8），由 VAD 觸發 | CPU |
-| LLM | Bonsai-2 三元 4B，`fwd35_serve`（PULSAR 引擎，`engine/make_serve.py`） | GPU |
+| LLM | Bonsai-2 三元 2B，`fwd35_serve`（PULSAR 引擎，`engine/make_serve.py`） | GPU |
 | TTS | PrimeTTS v2.1（g2pW + VITS，onnxruntime） | CPU |
 | 輪次偵測 | Smart Turn v3.2（預設關閉） | CPU |
 
@@ -24,19 +24,19 @@
 頁面（zh-TW）包含角色選單、即時逐字稿與最近一輪的延遲；右側是追蹤面板
 （VAD／ASR／LLM／TTS／喇叭時間軸、各核心 CPU、GPU，以及最近一輪的時間花在哪裡）。
 
-![WebUI，咖啡店店員情境](docs/webui-roleplay.png)
+![WebUI，咖啡店店員情境（此角色已移除，截圖僅供版面參考）](docs/webui-roleplay.png)
 
 此截圖是在 headless Chrome 中的真實對話，麥克風輸入為合成語音。這種語音會讓 X-ASR 把部分句子截短
 （例如 `有什`）；真人說話則不會，逐字稿照 ASR 的輸出原樣呈現。
 
 ## 角色扮演
 
-頁面有角色選單（`app/roles.py`：語音助理、咖啡店店員、面試官、台南導覽員、電信客服）。每個角色包含
-一份系統提示、3 種 TTS 聲音之一，以及一句不經過 LLM、直接由 TTS 說出的開場白；提示中會告訴模型
-這句話已經說過。切換角色會中斷音訊並重新開始對話（系統提示改變，所以第一次回答需完整 prefill）。
-`run_turn` 中的回覆防護會在遇到空行、重複字元或重複詞句時截斷回覆並取消生成：小模型否則會
-陷入循環（`點點點…`）或重複上一個問題。
-`app/roles_check.py` 逐角色播放腳本對話（僅用 GPU），`app/role_test.py` 在執行中的伺服器上檢查協定。
+目前只保留一個角色：電信客服（`app/roles.py`）。咖啡店店員、面試官、台南導覽員對 2B 模型來說太難，
+回覆常常跑出角色或重複，所以移除了。連線後伺服器會先用 TTS（不經 LLM）說出開場白，
+系統提示中也會告訴模型這句話已經說過，並在開場白播放時先預填系統提示（`Llm.warm`），
+第一輪回答就只需要處理使用者說的話。`run_turn` 中的回覆防護會在遇到空行、重複字元或重複詞句時
+截斷回覆並取消生成：小模型否則會陷入循環（`點點點…`）或重複上一個問題。
+`app/roles_check.py` 播放腳本對話（僅用 GPU），`app/role_test.py` 在執行中的伺服器上檢查協定。
 
 ## ASR 模型
 
