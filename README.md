@@ -7,7 +7,7 @@
 | 階段 | 模型 | 執行裝置 |
 |---|---|---|
 | VAD | Silero | CPU |
-| STT | X-ASR（sherpa-onnx），由 VAD 觸發 | CPU |
+| STT | X-ASR 480 ms chunk（sherpa-onnx，int8），由 VAD 觸發 | CPU |
 | LLM | Bonsai-2 三元 2B，`fwd35_serve`（PULSAR 引擎，`engine/make_serve.py`） | GPU |
 | TTS | PrimeTTS v2.1（g2pW + VITS，onnxruntime） | CPU |
 | 輪次偵測 | Smart Turn v3.2（預設關閉） | CPU |
@@ -38,6 +38,25 @@
 陷入循環（`點點點…`）或重複上一個問題。
 `app/roles_check.py` 逐角色播放腳本對話（僅用 GPU），`app/role_test.py` 在執行中的伺服器上檢查協定。
 
+## ASR 模型
+
+使用官方 [X-ASR-zh-en](https://huggingface.co/GilgameshWind/X-ASR-zh-en) 的 480 ms chunk 串流模型（`run.sh` 的 `VC_ASR_DIR`，預設 `~/xasr-new/480`）。
+官方只提供 fp32，encoder 與 joiner 用 `onnxruntime.quantization.quantize_dynamic`（MatMul、QUInt8）轉成 int8，
+Nano 記憶體不足，所以在另一台機器上轉換。
+
+串流 encoder 要多收到一個 chunk 的音訊才會解出最後幾個字，所以 `finish()` 在 VAD 判定說完後補 1.0 s 靜音
+（`VC_ASR_FLUSH_S`）。0.6 s 會截掉句尾。在 40 句 `tw_cs` 上以 2 條執行緒、greedy 解碼量測：
+
+| 模型 | 補靜音 | CER | RTF |
+|---|---|---|---|
+| 960 ms（舊的 `base`） | 1.0 s | 53.9% | 0.42 |
+| **480 ms（採用）** | 1.0 s | **8.7%** | 0.66 |
+| 160 ms | 1.0 s | 12.2% | 1.08 |
+| 480 ms | 0.5 s | 21.6% | 0.53 |
+
+RTF 含補的靜音，句子很短所以偏高。160 ms 在 2 條執行緒上超過即時，不適用。
+代價是每句結尾多約 0.3 s 延遲（flush 從約 270 ms 變成約 580 ms）；0.5 s 與 1.0 s 之間的值尚未量測。
+
 ## CPU 配置
 
 沒有綁定核心，也沒有調整優先權：每個元件分配固定的執行緒數，其餘交由 Linux 在 4 個核心間排程。
@@ -60,7 +79,7 @@
 | 2 | 2.53 s | 2.66 s（+5%） |
 
 第 4 條執行緒單獨使用沒有加速，還會與引擎的驅動執行緒和網路迴圈競爭。把 TTS 綁到核心 1-3、引擎綁到
-核心 0，只多快 0.02 s，所以不採用。ASR 用 2 條執行緒已是最佳（flush 約 270 ms；3 或 4 條沒有增益）。
+核心 0，只多快 0.02 s，所以不採用。ASR 用 2 條執行緒已是最佳（480 ms 模型的 flush 約 580 ms；3 條約 560 ms，4 條反而較慢 700 ms）。
 插話（使用者在助理說話時開口，ASR 與 TTS 同時運作）尚未量測。
 
 ## 診斷
