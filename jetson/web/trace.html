@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jetson Timeline</title>
+<style>
+  :root { --bg:#f6f7f9; --fg:#1d2330; --muted:#6b7280; --card:#fff; --grid:#e5e7eb; --accent:#2563eb; --bad:#b91c1c;
+          --vad:#64748b; --asr:#0891b2; --llm:#7c3aed; --tts:#ea580c; --spk:#16a34a; --gpu:#7c3aed; --cpu:#2563eb; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg:#0f1218; --fg:#e6e9ef; --muted:#9aa3b2; --card:#181d26; --grid:#2a3140; --accent:#60a5fa; --bad:#f87171;
+      --vad:#94a3b8; --asr:#22d3ee; --llm:#a78bfa; --tts:#fb923c; --spk:#4ade80; --gpu:#a78bfa; --cpu:#60a5fa; }
+  }
+  :root[data-theme="dark"] { --bg:#0f1218; --fg:#e6e9ef; --muted:#9aa3b2; --card:#181d26; --grid:#2a3140; --accent:#60a5fa; --bad:#f87171;
+    --vad:#94a3b8; --asr:#22d3ee; --llm:#a78bfa; --tts:#fb923c; --spk:#4ade80; --gpu:#a78bfa; --cpu:#60a5fa; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 system-ui, sans-serif; }
+  main { max-width: 1200px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 20px; margin: 4px 0 4px; }
+  h2 { font-size: 16px; margin: 20px 0 8px; }
+  .sub { color: var(--muted); margin: 0 0 12px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom: 10px; }
+  input[type=password] { padding:8px; border-radius:8px; border:1px solid #9ca3af; background:var(--card); color:var(--fg); min-width: 160px; }
+  button, select { padding:8px 12px; border-radius:8px; border:1px solid var(--grid); background:var(--card); color:var(--fg); font-size:14px; }
+  button.on { background: var(--accent); color:#fff; border-color: var(--accent); }
+  .card { background:var(--card); border-radius:12px; padding:12px; }
+  canvas { width:100%; display:block; }
+  #status { color: var(--muted); font-size: 13px; }
+  #status.bad { color: var(--bad); }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  .sw { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:6px; vertical-align: middle; }
+  .scroll { overflow-x: auto; }
+  #turn { font: 13px ui-monospace, monospace; white-space: pre-wrap; }
+  body.embed main { max-width: none; padding: 12px; }
+  body.embed .hide-embed { display: none; }
+  body.embed { background: var(--card); }
+  body.embed .card { padding: 0; }
+  details summary { cursor: pointer; color: var(--muted); margin: 16px 0 8px; font-weight: 600; }
+  .legend { display:flex; gap:14px; flex-wrap:wrap; font-size:13px; color:var(--muted); margin-top:8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1 class="hide-embed">Chronologie des composants et des ressources</h1>
+  <p class="sub hide-embed">Jetson Nano : 4 cœurs CPU (ARM A57), GPU Maxwell 128 cœurs, 4 Go de RAM partagée entre CPU et GPU. Mise à jour chaque seconde ; 0 = maintenant.</p>
+  <div class="row">
+    <input id="token" class="hide-embed" type="password" placeholder="LAN 存取碼" autocomplete="off">
+    <select id="win"><option value="15">15 s</option><option value="30" selected>30 s</option><option value="60">60 s</option><option value="120">120 s</option></select>
+    <button id="pause">Pause</button>
+    <span id="status">—</span>
+  </div>
+  <div class="card"><canvas id="cv" height="520"></canvas>
+    <div class="legend">
+      <span><span class="sw" style="background:var(--vad)"></span>VAD (Silero, CPU 1 thread)</span>
+      <span><span class="sw" style="background:var(--asr)"></span>ASR (X-ASR sherpa-onnx, CPU 2 threads)</span>
+      <span><span class="sw" style="background:var(--llm)"></span>LLM (Bonsai 2B fwd35, GPU)</span>
+      <span><span class="sw" style="background:var(--tts)"></span>TTS (PrimeTTS ORT, CPU 4 threads)</span>
+      <span><span class="sw" style="background:var(--spk)"></span>Haut-parleur (lecture estimée)</span>
+    </div>
+  </div>
+
+  <h2>Dernier tour : où passe le temps</h2>
+  <div class="card"><div id="turn">En attente d'un tour complet (fin de parole → audio joué)…</div></div>
+
+  <details id="who" open><summary>Qui utilise quoi (CPU / GPU)</summary>
+  <div class="card scroll">
+    <table>
+      <tr><th>Composant</th><th>Matériel</th><th>Threads</th><th>Quand</th><th>Coût mesuré</th></tr>
+      <tr><td><span class="sw" style="background:var(--vad)"></span>VAD Silero v6</td><td>CPU</td><td>1</td><td>Chaque trame micro (32 ms), en continu</td><td>quelques ms par paquet de 128 ms</td></tr>
+      <tr><td><span class="sw" style="background:var(--asr)"></span>ASR X-ASR (streaming)</td><td>CPU</td><td>2</td><td>Seulement quand le VAD a ouvert la porte (pré-roll puis parole), et le flush en fin de phrase</td><td>RTF 0,32 ; flush ≈ 0,1–0,2 s</td></tr>
+      <tr><td>Smart Turn v3.2 (désactivé)</td><td>CPU</td><td>2</td><td>À chaque fin de parole si VC_SMART_TURN=1</td><td>≈ 460 ms par appel</td></tr>
+      <tr><td><span class="sw" style="background:var(--llm)"></span>LLM Bonsai-2 2B ternaire</td><td>GPU (+ 1 cœur CPU pour piloter)</td><td>—</td><td>Après la fin de parole : prefill puis décodage token par token</td><td>prefill ≈ 1,5–2 s</td></tr>
+      <tr><td><span class="sw" style="background:var(--tts)"></span>TTS PrimeTTS + g2pW</td><td>CPU</td><td>4</td><td>Dès la première phrase complète du LLM, pendant que le LLM continue</td><td>≈ 1–1,5 s par phrase</td></tr>
+      <tr><td><span class="sw" style="background:var(--spk)"></span>Réseau + navigateur</td><td>—</td><td>—</td><td>Envoi de chaque phrase synthétisée, lecture côté navigateur</td><td>0,2–1,1 s observés</td></tr>
+    </table>
+  </div>
+  </details>
+</main>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const embed = new URLSearchParams(location.search).has("embed");
+  if (embed) { document.body.classList.add("embed"); $("who").open = false; $("win").value = "15"; }
+  const KEY = "vc_token";
+  const saved = () => { try { return localStorage.getItem(KEY) || ""; } catch (_) { return ""; } };
+  const save = (v) => { try { localStorage.setItem(KEY, v); } catch (_) {} };
+  $("token").value = saved();
+  let paused = false, last = null;
+  $("pause").onclick = () => { paused = !paused; $("pause").classList.toggle("on", paused); $("pause").textContent = paused ? "Reprendre" : "Pause"; };
+  $("win").onchange = () => tick();
+
+  const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+  const LANES = [["Speaker", "--spk", "Haut-parleur"], ["TTS", "--tts", "TTS · CPU"], ["LLM", "--llm", "LLM · GPU"],
+                 ["ASR", "--asr", "ASR · CPU"], ["VAD", "--vad", "VAD · CPU"]];
+  const MARKS = { speech_start: "début parole", speech_end: "fin parole", user: "texte", first_token: "1er token",
+                  audio_sent: "audio envoyé", played: "joué", barge_in: "barge-in" };
+
+  function draw(d) {
+    const cv = $("cv"), dpr = window.devicePixelRatio || 1;
+    const W = cv.clientWidth, H = 520;
+    cv.width = W * dpr; cv.height = H * dpr;
+    const g = cv.getContext("2d"); g.scale(dpr, dpr);
+    g.clearRect(0, 0, W, H);
+    const L = Math.min(120, W * 0.28), R = W - 8, win = d.window;
+    const x = (t) => L + (R - L) * (1 + t / win);
+    const fg = css("--fg"), muted = css("--muted"), grid = css("--grid");
+    g.font = "12px system-ui"; g.textBaseline = "middle";
+
+    // time grid
+    const step = win <= 15 ? 1 : win <= 30 ? 2 : win <= 60 ? 5 : 10;
+    for (let t = 0; t >= -win; t -= step) {
+      g.strokeStyle = grid; g.beginPath(); g.moveTo(x(t), 0); g.lineTo(x(t), H - 18); g.stroke();
+      g.fillStyle = muted; g.textAlign = "center"; g.fillText(t + " s", x(t), H - 8);
+    }
+    g.textAlign = "left";
+
+    // component lanes
+    const laneH = 34, top = 6;
+    LANES.forEach(([comp, color, name], i) => {
+      const y = top + i * laneH;
+      g.fillStyle = fg; g.fillText(name, 4, y + laneH / 2);
+      g.fillStyle = css(color);
+      for (const s of d.spans) {
+        if (s.comp !== comp) continue;
+        const a = x(Math.max(s.t0, -win)), b = Math.max(x(Math.min(s.t1, 0)), a + 1.5);
+        g.globalAlpha = comp === "VAD" ? 0.55 : 0.9;
+        g.fillRect(a, y + 6, b - a, laneH - 12);
+      }
+      g.globalAlpha = 1;
+    });
+
+    // resources: per-core CPU heat strips, GPU and RAM curves
+    const r0 = top + LANES.length * laneH + 14;
+    const ncore = d.samples.length ? d.samples[0].cpu.length : 4;
+    const coreH = 22;
+    for (let c = 0; c < ncore; c++) {
+      const y = r0 + c * coreH;
+      g.fillStyle = fg; g.fillText("CPU " + c, 4, y + coreH / 2);
+      for (let i = 1; i < d.samples.length; i++) {
+        const p = d.samples[i - 1], q = d.samples[i];
+        g.globalAlpha = Math.min(1, 0.06 + q.cpu[c] / 100);
+        g.fillStyle = css("--cpu");
+        g.fillRect(x(p.t), y + 3, Math.max(1, x(q.t) - x(p.t)), coreH - 6);
+      }
+      g.globalAlpha = 1;
+    }
+    const gy = r0 + ncore * coreH + 10, gh = 70;
+    g.fillStyle = fg; g.fillText("GPU %", 4, gy + gh / 2 - 8);
+    g.fillStyle = muted; g.fillText("RAM (tirets)", 4, gy + gh / 2 + 8);
+    g.strokeStyle = grid; g.strokeRect(L, gy, R - L, gh);
+    const curve = (key, color, max, dash) => {
+      g.strokeStyle = color; g.setLineDash(dash); g.lineWidth = 1.5; g.beginPath();
+      let started = false;
+      for (const s of d.samples) {
+        if (s[key] == null) continue;
+        const px = x(s.t), py = gy + gh - gh * Math.min(1, s[key] / max);
+        started ? g.lineTo(px, py) : g.moveTo(px, py); started = true;
+      }
+      g.stroke(); g.setLineDash([]); g.lineWidth = 1;
+    };
+    curve("gpu", css("--gpu"), 100, []);
+    curve("mem", muted, d.mem_total_mb, [4, 3]);
+
+    // instant events
+    const bottom = gy + gh;
+    for (const m of d.marks) {
+      if (m.name === "audio_sent" || !MARKS[m.name]) continue;
+      const px = x(m.t);
+      g.strokeStyle = m.name === "barge_in" ? css("--bad") : m.name === "speech_end" ? css("--accent") : muted;
+      g.setLineDash([3, 3]); g.beginPath(); g.moveTo(px, top); g.lineTo(px, bottom); g.stroke(); g.setLineDash([]);
+    }
+    const lb = d.marks.filter((m) => MARKS[m.name] && m.name !== "audio_sent");
+    let lastX = -1e9, row = 0;
+    for (const m of lb) {
+      const px = x(m.t);
+      row = px - lastX < 70 ? (row + 1) % 3 : 0; lastX = px;
+      g.fillStyle = m.name === "barge_in" ? css("--bad") : muted;
+      g.fillText(MARKS[m.name], px + 3, bottom + 10 + row * 13);
+    }
+    const s = d.samples[d.samples.length - 1];
+    if (s) $("status").textContent = "CPU " + s.cpu.map((v) => v.toFixed(0) + "%").join(" ") +
+      " · GPU " + (s.gpu == null ? "—" : s.gpu.toFixed(0) + "%") + " · RAM " + s.mem + "/" + d.mem_total_mb + " Mo";
+  }
+
+  // last complete turn: speech_end -> user text -> first token -> first audio sent -> played
+  function turnSummary(d) {
+    const ms = d.marks;
+    let iPlayed = -1;
+    for (let i = ms.length - 1; i >= 0; i--) if (ms[i].name === "played") { iPlayed = i; break; }
+    if (iPlayed < 0) return;
+    const before = (name, i) => { for (let k = i; k >= 0; k--) if (ms[k].name === name) return ms[k]; return null; };
+    const user = before("user", iPlayed); if (!user) return;
+    const end = before("speech_end", ms.indexOf(user));
+    const ft = ms.slice(ms.indexOf(user), iPlayed).find((m) => m.name === "first_token");
+    const sent = ms.slice(ms.indexOf(user), iPlayed + 1).find((m) => m.name === "audio_sent");
+    if (!end || !ft || !sent) return;
+    const played = ms[iPlayed];
+    const tts = d.spans.find((s) => s.comp === "TTS" && s.t0 >= ft.t - 0.01);
+    const f = (v) => (1000 * v).toFixed(0).padStart(5) + " ms";
+    const rows = [
+      ["fin de parole → texte ASR (attente VAD 450 ms déjà comptée avant)", user.t - end.t],
+      ["texte → 1er token LLM (prefill GPU)", ft.t - user.t],
+      ["1er token → 1re phrase prête (LLM décode jusqu'à la ponctuation)", tts ? tts.t0 - ft.t : null],
+      ["synthèse TTS de la 1re phrase (CPU)", tts ? tts.t1 - tts.t0 : null],
+      ["audio envoyé → joué (réseau + navigateur)", played.t - sent.t],
+    ];
+    $("turn").textContent = "Tour terminé il y a " + (-played.t).toFixed(0) + " s : « " + user.label + " »\n" +
+      "Total fin de parole → audio joué : " + f(played.t - end.t) + "\n\n" +
+      rows.map(([k, v]) => (v == null ? "    — " : f(v)) + "  " + k).join("\n") +
+      "\n\nNote : la fin de parole est datée par le VAD après 450 ms de silence ; le dernier son entendu est 450 ms plus tôt.";
+  }
+
+  async function tick() {
+    if (paused) return;
+    const token = $("token").value.trim();
+    if (!token) {
+      // embedded: the chat column holds the code; pick it up once the user has connected there
+      const t = saved();
+      if (t) $("token").value = t;
+      else { $("status").textContent = embed ? "Connectez-vous dans le chat pour voir la chronologie." : "Entrez le code d'accès."; return; }
+      return tick();
+    }
+    try {
+      const r = await fetch("trace.json?s=" + $("win").value + "&token=" + encodeURIComponent(token), { cache: "no-store" });
+      if (r.status === 401) { $("token").value = ""; $("status").textContent = "Code d'accès incorrect."; $("status").className = "bad"; return; }
+      last = await r.json(); save(token); $("status").className = "";
+      draw(last); turnSummary(last);
+    } catch (e) { $("status").textContent = "Serveur injoignable."; $("status").className = "bad"; }
+  }
+  window.addEventListener("resize", () => last && draw(last));
+  setInterval(tick, 1000); tick();
+})();
+</script>
+</body>
+</html>

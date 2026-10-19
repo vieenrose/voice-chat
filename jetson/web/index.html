@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jetson 語音對話</title>
+<style>
+  :root { --bg:#f6f7f9; --fg:#1d2330; --muted:#6b7280; --card:#fff; --accent:#2563eb; --bad:#b91c1c; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg:#0f1218; --fg:#e6e9ef; --muted:#9aa3b2; --card:#181d26; --accent:#60a5fa; --bad:#f87171; }
+  }
+  :root[data-theme="dark"] { --bg:#0f1218; --fg:#e6e9ef; --muted:#9aa3b2; --card:#181d26; --accent:#60a5fa; --bad:#f87171; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 system-ui, "Noto Sans CJK TC", sans-serif; }
+  main { max-width: 1440px; margin: 0 auto; padding: 16px; }
+  .layout { display:grid; grid-template-columns: minmax(320px, 420px) 1fr; gap: 16px; align-items: start; }
+  .chat { position: sticky; top: 12px; }
+  .chat .log { max-height: calc(100vh - 300px); overflow-y: auto; }
+  .tl { background:var(--card); border-radius:12px; overflow:hidden; }
+  .tl iframe { display:block; width:100%; height: 980px; border:0; background: transparent; }
+  @media (max-width: 900px) {
+    .layout { grid-template-columns: 1fr; }
+    .chat { position: static; }
+    .chat .log { max-height: none; }
+  }
+  h1 { font-size: 20px; margin: 8px 0 12px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  input[type=password] { flex:1; min-width:180px; padding:10px; border-radius:8px; border:1px solid #9ca3af; background:var(--card); color:var(--fg); }
+  button { padding:10px 16px; border-radius:8px; border:0; background:var(--accent); color:#fff; font-size:16px; }
+  button:disabled { opacity:.5; }
+  #status { color: var(--muted); margin: 8px 0; min-height: 1.5em; }
+  #status.bad { color: var(--bad); }
+  .log { background:var(--card); border-radius:12px; padding:12px; min-height:220px; }
+  .line { margin: 6px 0; }
+  .user { color: var(--fg); }
+  .bot { color: var(--accent); }
+  .partial { color: var(--muted); font-style: italic; }
+  .meter { display:flex; align-items:center; gap:8px; margin: 4px 0 10px; font: 13px ui-monospace, monospace; color: var(--muted); }
+  .meter .bar { flex:1; height:10px; border-radius:5px; background:var(--card); border:1px solid #9ca3af; overflow:hidden; }
+  .meter .fill { height:100%; width:0; background:#16a34a; transition: width 60ms linear; }
+  .meter .fill.hot { background:#d97706; }
+  .meter .fill.clip { background:var(--bad); }
+  #lat { font: 14px ui-monospace, monospace; color: var(--muted); white-space: pre; margin-top: 10px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Jetson 語音對話（本機）</h1>
+  <div class="layout">
+  <section class="chat">
+  <div class="row">
+    <input id="token" type="password" placeholder="LAN 存取碼" autocomplete="off">
+    <button id="go">開始</button>
+    <button id="hang" disabled>停止</button>
+  </div>
+  <div class="meter"><span>🎤</span><div class="bar"><div class="fill" id="vu"></div></div><span id="vudb">— dB</span></div>
+  <div id="status">尚未連線。請輸入存取碼並允許麥克風。</div>
+  <div class="log" id="log"></div>
+  <div id="lat"></div>
+  </section>
+  <section class="tl" aria-label="Chronologie des composants">
+    <iframe src="trace?embed=1" title="Chronologie VAD / ASR / LLM / TTS et ressources"></iframe>
+  </section>
+  </div>
+</main>
+<script>
+(() => {
+  const SR = 16000;
+  const $ = (id) => document.getElementById(id);
+  let level = 0, peak = 0;  // mic RMS and peak, from the analyser, for the meter
+  let ws = null, mic = null, micCtx = null, play = null, nextAt = 0, sources = [], meta = null;
+
+  const KEY = "vc_token";
+  // Per-browser convenience only: storage can be blocked or throw, the page works without it.
+  const saved = () => { try { return localStorage.getItem(KEY) || ""; } catch (_) { return ""; } };
+  const save = (v) => { try { v ? localStorage.setItem(KEY, v) : localStorage.removeItem(KEY); } catch (_) {} };
+  $("token").value = saved();
+
+  const status = (text, bad) => { $("status").textContent = text; $("status").className = bad ? "bad" : ""; };
+  const line = (cls, text) => {
+    const el = document.createElement("div");
+    el.className = "line " + cls;
+    el.textContent = text;
+    $("log").appendChild(el);
+    el.scrollIntoView({ block: "end" });
+    return el;
+  };
+
+  function stopAudio() {
+    for (const s of sources) { try { s.stop(); } catch (_) {} }
+    sources = [];
+    nextAt = 0;
+    meta = null;
+  }
+
+  function playInt16(buf) {
+    if (!play) play = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SR });
+    const pcm = new Int16Array(buf);
+    const f32 = new Float32Array(pcm.length);
+    for (let i = 0; i < pcm.length; i++) f32[i] = pcm[i] / 32768;
+    const ab = play.createBuffer(1, f32.length, SR);
+    ab.copyToChannel(f32, 0);
+    const src = play.createBufferSource();
+    src.buffer = ab;
+    src.connect(play.destination);
+    const t = Math.max(play.currentTime + 0.02, nextAt);
+    src.start(t);
+    nextAt = t + ab.duration;
+    sources.push(src);
+    src.onended = () => { sources = sources.filter((s) => s !== src); };
+    return t;
+  }
+
+  async function startMic() {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 }
+    });
+    micCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SR });
+    // created after the permission prompt, i.e. outside the click: browsers may leave it suspended
+    if (micCtx.state !== "running") await micCtx.resume().catch(() => {});
+    const source = micCtx.createMediaStreamSource(stream);
+    const analyser = micCtx.createAnalyser();  // meter reads this, independent of the sending path
+    analyser.fftSize = 1024;
+    source.connect(analyser);
+    const proc = micCtx.createScriptProcessor(512, 1, 1);
+    proc.onaudioprocess = (e) => {
+      const f = e.inputBuffer.getChannelData(0);
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const pcm = new Int16Array(f.length);
+      for (let i = 0; i < f.length; i++) {
+        const v = Math.max(-1, Math.min(1, f[i]));
+        pcm[i] = v < 0 ? v * 32768 : v * 32767;
+      }
+      ws.send(pcm.buffer);
+    };
+    source.connect(proc);
+    proc.connect(micCtx.destination);
+    mic = { stream, proc, source, analyser, buf: new Float32Array(analyser.fftSize) };
+  }
+
+  // meter: dBFS from -60 (empty) to 0 (full); orange above -12 dB, red when the peak clips
+  function meter() {
+    if (mic) {
+      mic.analyser.getFloatTimeDomainData(mic.buf);
+      let sum = 0, pk = 0;
+      for (const v of mic.buf) { sum += v * v; pk = Math.max(pk, Math.abs(v)); }
+      level = Math.sqrt(sum / mic.buf.length); peak = pk;
+    }
+    const db = level > 0 ? 20 * Math.log10(level) : -100;
+    const pct = Math.max(0, Math.min(100, (db + 60) / 60 * 100));
+    const el = $("vu");
+    el.style.width = (mic ? pct : 0) + "%";
+    el.className = "fill" + (peak >= 0.99 ? " clip" : db > -12 ? " hot" : "");
+    const state = micCtx ? micCtx.state : "";
+    const track = mic ? mic.stream.getAudioTracks()[0] : null;
+    $("vudb").textContent = !mic ? "— dB"
+      : state !== "running" ? "音訊 " + state  // context paused: nothing is captured
+      : track && (track.muted || !track.enabled) ? "麥克風靜音"
+      : Math.max(-60, db).toFixed(0).padStart(3) + " dB";
+    requestAnimationFrame(meter);
+  }
+  requestAnimationFrame(meter);
+
+  function stopMic() {
+    if (mic) { mic.stream.getTracks().forEach((t) => t.stop()); mic.proc.disconnect(); mic.source.disconnect(); }
+    if (micCtx) micCtx.close();
+    mic = null; micCtx = null; level = 0; peak = 0;
+  }
+
+  async function connect() {
+    const token = $("token").value.trim();
+    if (!token) { status("請輸入存取碼。", true); return; }
+    $("go").disabled = true;
+    try {
+      await startMic();
+    } catch (e) {
+      status("無法使用麥克風：" + e.message, true);
+      $("go").disabled = false;
+      return;
+    }
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(proto + "//" + location.host + "/ws?token=" + encodeURIComponent(token));
+    ws.binaryType = "arraybuffer";
+    ws.onopen = () => { save(token); status("連線中，請開始說話。"); $("hang").disabled = false; };
+    ws.onclose = (e) => {
+      if (e.code === 4401) save("");  // wrong code: forget it so the field is not refilled with it
+      const msg = e.code === 4401 ? "存取碼不正確。" : e.code === 4409 ? "伺服器忙碌，另一個會話使用中。" : "連線已關閉。";
+      status(msg, e.code !== 1000);
+      stopAudio(); stopMic(); ws = null;
+      $("go").disabled = false; $("hang").disabled = true;
+    };
+    ws.onmessage = (e) => {
+      if (e.data instanceof ArrayBuffer) {
+        const t = playInt16(e.data);
+        if (meta && meta.seq === 1 && ws) {
+          ws.send(JSON.stringify({ type: "played", turn: meta.turn, seq: 1 }));
+        }
+        if (meta) meta = null;
+        return;
+      }
+      const m = JSON.parse(e.data);
+      switch (m.type) {
+        case "partial": partialLine(m.text); break;
+        case "user": finalizeUser(m.text, m.replace); break;
+        case "echo_dropped": if (partialEl) { partialEl.remove(); partialEl = null; } break;
+        case "audio_start": meta = m; break;
+        case "stop_audio": stopAudio(); break;
+        case "assistant": line("bot", "助理：" + m.text); break;
+        case "latency": showLatency(m); break;
+        case "error": line("partial", "錯誤：" + m.message); break;
+        case "busy": status("伺服器忙碌，另一個會話使用中。", true); break;
+      }
+    };
+  }
+
+  let partialEl = null;
+  function partialLine(text) {
+    if (!partialEl) partialEl = line("partial", "");
+    partialEl.textContent = "你（辨識中）：" + text;
+  }
+  let lastUser = null;
+  function finalizeUser(text, replace) {
+    if (partialEl) { partialEl.remove(); partialEl = null; }
+    // reopened turn: the server sends the whole utterance, which replaces the cut line
+    if (replace && lastUser) { lastUser.textContent = "你：" + text; return; }
+    lastUser = line("user", "你：" + text);
+  }
+
+  function showLatency(m) {
+    const fmt = (v) => (v == null ? "—" : v.toFixed(0) + " ms");
+    $("lat").textContent =
+      "回合 " + m.turn + "\n" +
+      "最後語音 → LLM 首 token   " + fmt(m.llm_first_token_ms) + "\n" +
+      "最後語音 → 首段音訊送出   " + fmt(m.first_audio_sent_ms) + "\n" +
+      "最後語音 → 首段音訊播放   " + fmt(m.first_audio_played_ms);
+  }
+
+  $("go").onclick = connect;
+  $("hang").onclick = () => { if (ws) ws.close(1000); };
+})();
+</script>
+</body>
+</html>
