@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+import wave
 from collections import deque
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -237,6 +238,28 @@ def _speak(turn, emit, sentence):
     emit(("audio", turn, sentence, wav))
 
 
+REC_DIR = ROOT / "server" / "rec"
+REC_KEEP = 4
+
+
+def open_recording():
+    """Mic audio of the session (16 kHz int16 wav) plus an event log with offsets into it, for replaying
+    what the VAD/ASR did. Stays on the device (server/ is not tracked); the oldest sessions are deleted."""
+    try:
+        REC_DIR.mkdir(parents=True, exist_ok=True)
+        for old in sorted(REC_DIR.glob("*.wav"))[:-(REC_KEEP - 1)]:
+            old.unlink()
+            old.with_suffix(".log").unlink(missing_ok=True)
+        stem = REC_DIR / time.strftime("%Y%m%d-%H%M%S")
+        w = wave.open(str(stem.with_suffix(".wav")), "wb")
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        return w, open(stem.with_suffix(".log"), "w", encoding="utf-8"), [0]
+    except OSError:
+        return None
+
+
 async def session(ws):
     loop = asyncio.get_running_loop()
     out_q = asyncio.Queue()
@@ -249,9 +272,18 @@ async def session(ws):
           "reopen": False,  # the current utterance continues the previous one
           "echo_zone": False}  # the current utterance started while (or right after) the assistant spoke
     history = []
+    rec = open_recording()  # (wav writer, event log, [samples written]) or None
 
     def emit(item):
         loop.call_soon_threadsafe(out_q.put_nowait, item)
+
+    def rec_pos():
+        return rec[2][0] / 16000 if rec else 0.0
+
+    def log_rec(line):
+        if rec:
+            rec[1].write("%s\n" % line)
+            rec[1].flush()
 
     async def start_turn(text, t_last_voice):
         st["n"] += 1
@@ -315,8 +347,11 @@ async def session(ws):
 
     async def end_utterance(t_voice):
         st["open"] = False  # gate closed: the STT hears nothing until the next speech_start
+        partial = clean_cjk(to_tw(ENG.asr.last_text))
         with tr.span("ASR", "finish"):
             text = clean_cjk(to_tw(await asyncio.to_thread(ENG.asr.finish)))
+        log_rec("end at %.2fs: last partial %r | final %r%s" % (
+            rec_pos(), partial, text, "" if text.startswith(partial) else "  <-- final does not extend the partial"))
         if text and st["echo_zone"] and is_echo(text, st["said"]):
             print("echo dropped: %s" % text, flush=True)
             await ws.send_json({"type": "echo_dropped"})  # the UI clears its partial line
@@ -337,6 +372,9 @@ async def session(ws):
             if msg["type"] == "websocket.disconnect":
                 break
             if msg.get("bytes"):
+                if rec:
+                    rec[0].writeframes(msg["bytes"])
+                    rec[2][0] += len(msg["bytes"]) // 2
                 samples = np.frombuffer(msg["bytes"], dtype="<i2").astype(np.float32) / 32768
                 st["tail"] = np.concatenate([st["tail"], samples])[-128000:]
                 playing = time.monotonic() < st["play_end"]
@@ -361,6 +399,7 @@ async def session(ws):
                     st["pre"] = np.concatenate([st["pre"], samples])[-PRE_ROLL:]
                 for ev, t_voice in events:
                     tr.mark(ev)
+                    log_rec("%s at %.2fs%s" % (ev, rec_pos(), " (playing)" if playing else ""))
                     if ev == "speech_start":
                         # barge-in: the VAD decides, not the ASR text. Cut generation and playback now.
                         st["held"] = None
@@ -403,6 +442,9 @@ async def session(ws):
                             "first_audio_played_ms": round(1000 * (now - lv), 1),
                         })
     finally:
+        if rec:
+            rec[0].close()
+            rec[1].close()
         await cut_current(notify=False)
         send_task.cancel()
 
