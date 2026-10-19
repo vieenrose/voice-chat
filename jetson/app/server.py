@@ -206,7 +206,7 @@ RUNAWAY = re.compile(r"\n\s*\n|(.)\1{5,}|(.{2,12}?)\2{2,}")
 
 
 def runaway(text):
-    """Index where a reply degenerates, else -1: a blank line (a spoken answer is one paragraph, the 2B model
+    """Index where a reply degenerates, else -1: a blank line (a spoken answer is one paragraph, the small model
     repeats its last question after it), a character repeated 6+ times, or a phrase repeated 3+ times."""
     m = RUNAWAY.search(text.lstrip("\n"))
     if not m:

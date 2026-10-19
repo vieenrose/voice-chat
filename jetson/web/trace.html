@@ -54,7 +54,7 @@
     <div class="legend">
       <span><span class="sw" style="background:var(--vad)"></span>VAD（Silero，CPU 1 執行緒）</span>
       <span><span class="sw" style="background:var(--asr)"></span>ASR（X-ASR sherpa-onnx，CPU 2 執行緒）</span>
-      <span><span class="sw" style="background:var(--llm)"></span>LLM（Bonsai 2B fwd35，GPU）</span>
+      <span><span class="sw" style="background:var(--llm)"></span>LLM（Bonsai 4B fwd35，GPU）</span>
       <span><span class="sw" style="background:var(--tts)"></span>TTS（PrimeTTS ORT，CPU 3 執行緒）</span>
       <span><span class="sw" style="background:var(--spk)"></span>喇叭（估計播放時間）</span>
     </div>
@@ -68,9 +68,9 @@
     <table>
       <tr><th>元件</th><th>硬體</th><th>執行緒</th><th>何時運作</th><th>實測成本</th></tr>
       <tr><td><span class="sw" style="background:var(--vad)"></span>VAD Silero v6</td><td>CPU</td><td>1</td><td>持續處理每個麥克風音框（32 ms）</td><td>每 128 ms 音訊僅數 ms</td></tr>
-      <tr><td><span class="sw" style="background:var(--asr)"></span>ASR X-ASR（串流）</td><td>CPU</td><td>2</td><td>只在 VAD 開門後運作（先送預錄音訊再送語音），句尾再做一次排空</td><td>RTF 0.32；排空約 0.27 秒</td></tr>
+      <tr><td><span class="sw" style="background:var(--asr)"></span>ASR X-ASR 480 ms（串流）</td><td>CPU</td><td>2</td><td>只在 VAD 開門後運作（先送預錄音訊再送語音），句尾再做一次排空</td><td>RTF 0.47；排空約 0.58 秒（補 1.0 秒靜音）</td></tr>
       <tr><td>Smart Turn v3.2（預設關閉）</td><td>CPU</td><td>2</td><td>設定 VC_SMART_TURN=1 時，每次說完話都執行</td><td>每次約 460 ms</td></tr>
-      <tr><td><span class="sw" style="background:var(--llm)"></span>LLM Bonsai-2 2B 三元權重</td><td>GPU（另用 1 個 CPU 核心驅動）</td><td>—</td><td>說完話後：先預填（prefill），再逐 token 解碼</td><td>預填約 0.35–0.5 秒（換角色後的第一輪需完整預填）</td></tr>
+      <tr><td><span class="sw" style="background:var(--llm)"></span>LLM Bonsai-2 4B 三元權重</td><td>GPU（另用 1 個 CPU 核心驅動）</td><td>—</td><td>說完話後：先預填（prefill），再逐 token 解碼</td><td>整句回覆約 1–3 秒；換角色後第一輪需完整預填，約 7–9 秒</td></tr>
       <tr><td><span class="sw" style="background:var(--tts)"></span>TTS PrimeTTS + g2pW</td><td>CPU</td><td>3</td><td>LLM 產生第一個短句後立即開始，與 LLM 解碼同時進行</td><td>每句約 0.5–2 秒</td></tr>
       <tr><td><span class="sw" style="background:var(--spk)"></span>網路 + 瀏覽器</td><td>—</td><td>—</td><td>傳送每句合成的語音，並由瀏覽器播放</td><td>實測 0.2–1.1 秒</td></tr>
     </table>
