@@ -11,6 +11,7 @@ import numpy as np
 import sherpa_onnx
 
 SAMPLE_RATE = 16000
+FLUSH_S = float(os.environ.get("VC_ASR_FLUSH_S", "1.0"))  # 0.6 s cut the end of sentences (CER 27 -> 16.5%)
 CHUNK = int(0.16 * SAMPLE_RATE)  # 160 ms, as on iOS
 
 
@@ -29,7 +30,7 @@ class Asr:
         """Final text of the utterance (called on VAD speech_end); starts the next utterance."""
         # Flush: the streaming encoder looks ahead, so the last frames are only decoded once more audio
         # (here silence) arrives. Without it the end of the sentence is lost.
-        tail = np.concatenate([self.pending, np.zeros(int(0.6 * SAMPLE_RATE), dtype=np.float32)])
+        tail = np.concatenate([self.pending, np.zeros(int(FLUSH_S * SAMPLE_RATE), dtype=np.float32)])
         self.stream.accept_waveform(SAMPLE_RATE, tail)
         self.stream.input_finished()
         while self.rec.is_ready(self.stream):

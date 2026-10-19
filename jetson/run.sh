@@ -4,6 +4,6 @@ set -euo pipefail
 ROOT="${VC_ROOT:-$HOME/voicechat-jetson}"
 cd "$ROOT"
 export PRIME_ONNX="${PRIME_ONNX:-$HOME/primetts_v2/primetts_v21_3voice.onnx}"
-export VC_ASR_DIR="${VC_ASR_DIR:-$HOME/xasr-eval/base}"
+export VC_ASR_DIR="${VC_ASR_DIR:-$HOME/xasr-new/480}"
 export VC_PORT="${VC_PORT:-8443}"
 exec venv/bin/python app/server.py
