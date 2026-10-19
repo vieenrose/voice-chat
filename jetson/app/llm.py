@@ -40,6 +40,8 @@ def build_prompt(tok, history, user_text, system=SYSTEM):
 class Llm:
     def __init__(self, binary, model, tok_json, max_new=200):
         self.tok = Tokenizer.from_file(tok_json)
+        # the model sometimes writes a think tag itself; it is not special for the decoder and the TTS would read it out
+        self.skip_ids = {i for i in (self.tok.token_to_id("<think>"), self.tok.token_to_id("</think>")) if i is not None}
         self.max_new = max_new
         self.proc = subprocess.Popen(
             [binary, model], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -66,6 +68,35 @@ class Llm:
         except (BrokenPipeError, ValueError):
             pass
 
+    def _prefill_only(self, ids):
+        """Feeds `ids` from scratch and keeps them as the engine state (one decoded token is discarded)."""
+        self.held = []
+        self.proc.stdin.write("1 %s\n" % " ".join(map(str, ids)))
+        self.proc.stdin.flush()
+        while True:
+            line = self.proc.stdout.readline().strip()
+            if not line or line in ("END", "ERR"):
+                break
+            if line.startswith("P "):
+                self.held = ids[:int(line[2:])]
+
+    def prepare(self, history, system=SYSTEM):
+        """If the next turn would restart the history window (its whole prefix is prefilled again, ~45 ms per
+        token on the 4B), prefill that prefix now, while the user listens and answers."""
+        with self.lock:
+            win = self.win if self.win <= len(history) else 0
+            if len(history) - win <= HISTORY_MAX:
+                return
+            win = len(history) - HISTORY_KEEP
+            text = "<|im_start|>system\n" + system + "<|im_end|>\n"
+            for u, a in history[win:]:
+                text += "<|im_start|>user\n" + u + "<|im_end|>\n"
+                text += "<|im_start|>assistant\n<think>\n\n</think>\n\n" + a + "<|im_end|>\n"
+            ids = self.tok.encode(text, add_special_tokens=False).ids
+            self.win = win
+            if self.held[:len(ids)] != ids:
+                self._prefill_only(ids)
+
     def warm(self, system=SYSTEM):
         """Prefills the system block ahead of the first turn (the Nano's 4B prefills ~45 ms per token), so
         that turn only prefills what the user said. A no-op if the engine state already starts with it."""
@@ -73,15 +104,7 @@ class Llm:
         with self.lock:
             if self.held[:len(ids)] == ids:
                 return
-            self.held = []
-            self.proc.stdin.write("1 %s\n" % " ".join(map(str, ids)))
-            self.proc.stdin.flush()
-            while True:
-                line = self.proc.stdout.readline().strip()
-                if not line or line in ("END", "ERR"):
-                    break
-                if line.startswith("P "):
-                    self.held = ids[:int(line[2:])]
+            self._prefill_only(ids)
 
     def stream(self, history, user_text, system=SYSTEM):
         """Yields text deltas. Stops early after cancel(). Ends with the full reply in `self.last`."""
@@ -119,6 +142,8 @@ class Llm:
                 emitted.append(tid)
                 if tid in STOP_IDS:
                     continue  # keep reading until END; the engine stops after EOS anyway
+                if tid in self.skip_ids:
+                    continue
                 out.append(tid)
                 text = self.tok.decode(out, skip_special_tokens=True)
                 if text.endswith("�"):

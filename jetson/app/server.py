@@ -366,6 +366,7 @@ async def session(ws):
                 if not turn.cancelled.is_set() and turn.reply.strip():
                     if not turn.scripted:
                         history.append((turn.text, turn.reply))
+                        asyncio.create_task(asyncio.to_thread(ENG.llm.prepare, list(history), turn.system))
                     await ws.send_json({"type": "assistant", "turn": turn.n, "text": to_tw(turn.reply)})
                 seq = 0
 
