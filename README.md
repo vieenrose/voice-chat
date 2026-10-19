@@ -2,6 +2,8 @@
 
 Fully local voice chat served as a WebUI from the Nano (4 cores, ~4 GB shared RAM, CUDA 10.2 sm_53).
 
+The code is in `jetson/`; paths below are relative to it (deployed on the Nano as `~/voicechat-jetson`).
+
 | Stage | Model | Runs on |
 |---|---|---|
 | VAD | Silero | CPU |
