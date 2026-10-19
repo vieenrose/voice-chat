@@ -52,6 +52,9 @@ KEY = ROOT / "server" / "key.pem"
 END_MARKS = "。！？!?；;\n"
 SOFT_MARKS = "，,"
 SOFT_MIN = 6  # first comma after this many characters ends a TTS chunk
+FIRST_SOFT_MIN = 2  # the turn's first chunk: any comma after 2 characters ends it
+FIRST_MIN, FIRST_MAX = 4, 8  # ...and without punctuation it ends at a word boundary in this range
+FIRST_LOOKAHEAD = 2  # characters past FIRST_MAX needed before the word boundary is trusted
 SMART_TURN = os.environ.get("VC_SMART_TURN", "0") == "1"  # off by default until measured on the Nano
 THRESHOLD_TURN = 0.5  # Smart Turn: probability that the turn is complete
 INCOMPLETE_DELAY_S = 0.6  # upstream smart_turn_incomplete_delay_ms: wait, then ask again
@@ -94,14 +97,42 @@ def is_echo(text, said):
     return False
 
 
-def find_cut(buf):
-    """Index just after the first sentence end (or soft break after SOFT_MIN chars), else -1."""
+def find_cut(buf, soft_min=SOFT_MIN):
+    """Index just after the first sentence end (or soft break after soft_min chars), else -1."""
     for i, ch in enumerate(buf):
         if ch in END_MARKS:
             return i + 1
-        if ch in SOFT_MARKS and i + 1 >= SOFT_MIN:
+        if ch in SOFT_MARKS and i + 1 >= soft_min:
             return i + 1
     return -1
+
+
+_jieba = None
+
+
+def first_cut(buf, final=False):
+    """Cut for the first TTS chunk of a turn: TTS time (g2pW + VITS) grows with length, so the reply
+    starts sounding sooner when its first chunk is short. A comma or sentence end within FIRST_MAX
+    characters wins; otherwise the cut goes to the last word boundary (jieba) between FIRST_MIN and
+    FIRST_MAX characters. -1: wait for more text (or no cut, when `final`)."""
+    global _jieba
+    cut = find_cut(buf, FIRST_SOFT_MIN)
+    if 0 < cut <= FIRST_MAX + FIRST_LOOKAHEAD:  # punctuation just past FIRST_MAX still beats a word cut
+        return cut
+    if len(buf) < FIRST_MAX + FIRST_LOOKAHEAD + 1 and not final:
+        return -1
+    if _jieba is None:
+        import jieba
+        jieba.setLogLevel(60)
+        _jieba = jieba
+    pos, best = 0, -1
+    for w in _jieba.cut(buf[:FIRST_MAX + FIRST_LOOKAHEAD]):
+        pos += len(w)
+        if pos > FIRST_MAX:
+            break
+        if pos >= FIRST_MIN:
+            best = pos
+    return best if best > 0 else cut
 
 
 def token_ok(given):
@@ -145,7 +176,7 @@ def load_engines():
     ENG.asr = Asr(model_dir, threads=int(os.environ.get("VC_ASR_THREADS", "2")))
     ENG.tts = Tts(os.environ.get("PRIME_ONNX", str(ROOT / "primetts_v21_3voice.onnx")),
                   str(ROOT / "models" / "g2pw" / "g2pw_int8.onnx"), str(ROOT / "tts_res"),
-                  threads=int(os.environ.get("TTS_THREADS", "4")))
+                  threads=int(os.environ.get("TTS_THREADS", "3")))
     ENG.vad = SileroVad(str(ROOT / "silero_vad.onnx"), threshold=0.6, min_speech_ms=384, min_silence_ms=450)
     if SMART_TURN:
         ENG.smart = SmartTurn(str(ROOT / "models" / "smart-turn" / "smart-turn-v3.2-int8.onnx"),
@@ -163,6 +194,7 @@ class Turn:
         self.reply = ""
         self.t_first_token = None
         self.t_first_sent = None
+        self.chunks = 0  # TTS chunks emitted so far
 
 
 def run_turn(turn, emit, history):
@@ -180,7 +212,7 @@ def run_turn(turn, emit, history):
             turn.reply += delta
             buf += delta
             while True:
-                cut = find_cut(buf)
+                cut = first_cut(buf) if turn.chunks == 0 else find_cut(buf)
                 if cut < 0:
                     break
                 sentence, buf = buf[:cut], buf[cut:]
@@ -201,6 +233,7 @@ def _speak(turn, emit, sentence):
         wav, _ = ENG.tts.synth_sentence(sentence)
     if turn.cancelled.is_set() or len(wav) == 0:
         return
+    turn.chunks += 1
     emit(("audio", turn, sentence, wav))
 
 
@@ -437,6 +470,7 @@ def main():
     lan_ip = lan_address()
     ensure_cert(["DNS:localhost", "IP:127.0.0.1", "IP:" + lan_ip])
     load_engines()
+    first_cut("預熱分詞器的一句話，不會送出。", final=True)  # loads jieba's dictionary now, not on turn 1
     tr.start()
     port = int(os.environ.get("VC_PORT", "8443"))
     print("voice-chat: https://%s:%d  (token in %s)" % (lan_ip, port, TOKEN_FILE), flush=True)

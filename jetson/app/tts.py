@@ -93,7 +93,7 @@ if __name__ == "__main__":
 
     root = sys.argv[1]
     tts = Tts(os.environ.get("PRIME_ONNX", os.path.join(root, "primetts_v21_3voice.onnx")), os.path.join(root, "models/g2pw/g2pw_int8.onnx"),
-              os.path.join(root, "tts_res"), threads=int(os.environ.get("TTS_THREADS", "4")))
+              os.path.join(root, "tts_res"), threads=int(os.environ.get("TTS_THREADS", "3")))
     text = sys.argv[2] if len(sys.argv) > 2 else "台灣的首都是台北市，人口大約有兩千五百萬。"
     audio, synth = [], 0.0
     for sent, wav, dt in tts.stream(text):
