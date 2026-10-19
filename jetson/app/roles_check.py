@@ -1,9 +1,10 @@
-"""Does the 2B model hold each role? Plays 3 scripted user lines per role and flags replies that break
+"""Does the model (VC_LLM) hold each role? Plays 3 scripted user lines per role and flags replies that break
 character (mentions being an AI), use Markdown, run long, or reuse the same reply. Needs the GPU to
 itself (stop the server first).
 
   venv/bin/python -u app/roles_check.py ./fwd35_serve [role_id ...]
 """
+import os
 import re
 import sys
 import time
@@ -26,7 +27,7 @@ BAD = re.compile(r"人工智慧|語言模型|語音助理|AI|我是機器|[*#`]|
 
 
 def main(binary, ids):
-    llm = Llm(binary, str(ROOT / "models" / "Ternary-Bonsai-2-2B-PTQ1_0.gguf"),
+    llm = Llm(binary, str(ROOT / "models" / os.environ.get("VC_LLM", "Ternary-Bonsai-2-4B-PTQ1_0.gguf")),
               str(ROOT / "models" / "tok" / "tokenizer.json"), max_new=80)
     flagged = 0
     for rid in ids:

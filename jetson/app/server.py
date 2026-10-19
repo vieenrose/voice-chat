@@ -183,7 +183,7 @@ def load_engines():
     if SMART_TURN:
         ENG.smart = SmartTurn(str(ROOT / "models" / "smart-turn" / "smart-turn-v3.2-int8.onnx"),
                               threads=int(os.environ.get("VC_SMART_TURN_THREADS", "2")))
-    ENG.llm = Llm(str(ROOT / "fwd35_serve"), str(ROOT / "models" / "Ternary-Bonsai-2-2B-PTQ1_0.gguf"),
+    ENG.llm = Llm(str(ROOT / "fwd35_serve"), str(ROOT / "models" / os.environ.get("VC_LLM", "Ternary-Bonsai-2-4B-PTQ1_0.gguf")),
                   str(ROOT / "models" / "tok" / "tokenizer.json"), max_new=200)
 
 

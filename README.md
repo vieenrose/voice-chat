@@ -8,7 +8,7 @@
 |---|---|---|
 | VAD | Silero | CPU |
 | STT | X-ASR 480 ms chunk（sherpa-onnx，int8），由 VAD 觸發 | CPU |
-| LLM | Bonsai-2 三元 2B，`fwd35_serve`（PULSAR 引擎，`engine/make_serve.py`） | GPU |
+| LLM | Bonsai-2 三元 4B，`fwd35_serve`（PULSAR 引擎，`engine/make_serve.py`） | GPU |
 | TTS | PrimeTTS v2.1（g2pW + VITS，onnxruntime） | CPU |
 | 輪次偵測 | Smart Turn v3.2（預設關閉） | CPU |
 
@@ -34,7 +34,7 @@
 頁面有角色選單（`app/roles.py`：語音助理、咖啡店店員、面試官、台南導覽員、電信客服）。每個角色包含
 一份系統提示、3 種 TTS 聲音之一，以及一句不經過 LLM、直接由 TTS 說出的開場白；提示中會告訴模型
 這句話已經說過。切換角色會中斷音訊並重新開始對話（系統提示改變，所以第一次回答需完整 prefill）。
-`run_turn` 中的回覆防護會在遇到空行、重複字元或重複詞句時截斷回覆並取消生成：2B 模型否則會
+`run_turn` 中的回覆防護會在遇到空行、重複字元或重複詞句時截斷回覆並取消生成：小模型否則會
 陷入循環（`點點點…`）或重複上一個問題。
 `app/roles_check.py` 逐角色播放腳本對話（僅用 GPU），`app/role_test.py` 在執行中的伺服器上檢查協定。
 
