@@ -227,7 +227,8 @@ def run_turn(turn, emit, history):
                 continue  # keep draining so the engine is free for the next request
             if turn.t_first_token is None:
                 turn.t_first_token = time.monotonic()
-                tr.add_span("LLM", t_req, turn.t_first_token, "prefill")
+                label = "prefill %d reused" % ENG.llm.reused if ENG.llm.reused else "prefill full"
+                tr.add_span("LLM", t_req, turn.t_first_token, label)
                 tr.mark("first_token")
             turn.reply += delta
             buf += delta
@@ -249,7 +250,11 @@ def run_turn(turn, emit, history):
     except Exception as e:  # reported to the client, the turn ends
         emit(("error", turn, str(e)))
     if turn.t_first_token is not None:
-        tr.add_span("LLM", turn.t_first_token, time.monotonic(), "decode" + (" (cut)" if turn.cancelled.is_set() else ""))
+        label = "decode" + (" (cut)" if turn.cancelled.is_set() else "")
+        st = ENG.llm.last_stats  # engine prefill/decode timings of this request (None if the line was late)
+        if st:
+            label += " %d tok %.2f tok/s" % (st["decode_tok"], st["tok_s"])
+        tr.add_span("LLM", turn.t_first_token, time.monotonic(), label)
     emit(("done", turn))
 
 
@@ -284,6 +289,21 @@ def open_recording():
         return w, open(stem.with_suffix(".log"), "w", encoding="utf-8"), [0]
     except OSError:
         return None
+
+
+_bg_tasks = set()  # keeps prepare() tasks alive until they finish (asyncio holds only weak references)
+
+
+def _bg_done(task):
+    _bg_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        print("prepare failed: %r" % task.exception(), flush=True)
+
+
+def prepare_in_background(history, system):
+    task = asyncio.create_task(asyncio.to_thread(ENG.llm.prepare, history, system))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_done)
 
 
 async def session(ws):
@@ -329,6 +349,9 @@ async def session(ws):
             cur.cancelled.set()
             ENG.llm.cancel()
             st["cur"] = None
+            # the cut reply is not in the history: the engine state now holds prompt + reply tokens without
+            # <|im_end|>, so the prompt prefix is prefilled again in the background (prepare) before the next turn
+            prepare_in_background(list(history), cur.system)
         st["play_end"] = 0.0
         if (cur is not None or speaking) and notify:
             try:
@@ -366,7 +389,7 @@ async def session(ws):
                 if not turn.cancelled.is_set() and turn.reply.strip():
                     if not turn.scripted:
                         history.append((turn.text, turn.reply))
-                        asyncio.create_task(asyncio.to_thread(ENG.llm.prepare, list(history), turn.system))
+                        prepare_in_background(list(history), turn.system)
                     await ws.send_json({"type": "assistant", "turn": turn.n, "text": to_tw(turn.reply)})
                 seq = 0
 

@@ -198,10 +198,11 @@
     if (!end || !ft || !sent) return;
     const played = ms[iPlayed];
     const tts = d.spans.find((s) => s.comp === "TTS" && s.t0 >= ft.t - 0.01);
+    const pre = d.spans.find((s) => s.comp === "LLM" && Math.abs(s.t1 - ft.t) < 0.02);
     const f = (v) => (1000 * v).toFixed(0).padStart(5) + " ms";
     const rows = [
       ["說完 → ASR 文字（VAD 的 450 ms 等待已先計入）", user.t - end.t],
-      ["文字 → LLM 首個 token（GPU 預填）", ft.t - user.t],
+      ["文字 → LLM 首個 token（GPU 預填" + (pre && pre.label ? "：" + pre.label : "") + "）", ft.t - user.t],
       ["首個 token → 第一句就緒（LLM 解碼到標點為止）", tts ? tts.t0 - ft.t : null],
       ["第一句的 TTS 合成（CPU）", tts ? tts.t1 - tts.t0 : null],
       ["音訊送出 → 播放（網路 + 瀏覽器）", played.t - sent.t],
@@ -237,9 +238,10 @@
       const ft = span.find((x) => x.name === "first_token"), sent = span.find((x) => x.name === "audio_sent"), pl = span.find((x) => x.name === "played");
       const cut = span.find((x) => x.name === "barge_in");
       const tts = d.spans.find((x) => x.comp === "TTS" && ft && x.t0 >= ft.t - 0.01);
+      const pre = ft && d.spans.find((x) => x.comp === "LLM" && Math.abs(x.t1 - ft.t) < 0.02);
       L.push("第 " + (++n) + " 輪 " + clock(m.t) + "  「" + m.label + "」" + (cut ? "  [被打斷]" : ""));
       if (end) L.push("  說完 → ASR 文字      " + ms(m.t - end.t));
-      if (ft) L.push("  文字 → LLM 首個 token " + ms(ft.t - m.t));
+      if (ft) L.push("  文字 → LLM 首個 token " + ms(ft.t - m.t) + (pre && pre.label ? "  [" + pre.label + "]" : ""));
       if (tts && ft) L.push("  首個 token → 第一句就緒 " + ms(tts.t0 - ft.t) + "；第一句 TTS 合成 " + ms(tts.t1 - tts.t0));
       if (sent && pl) L.push("  音訊送出 → 播放      " + ms(pl.t - sent.t));
       if (end && pl) L.push("  說完 → 聲音播放（合計） " + ms(pl.t - end.t));

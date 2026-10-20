@@ -12,6 +12,7 @@ full prefill.
 """
 import json
 import os
+import re
 import subprocess
 import threading
 
@@ -24,6 +25,8 @@ STOP_IDS = {IM_END, ENDOFTEXT}
 MAX_CTX = 4096
 HISTORY_MAX = 8  # history window: when it would exceed HISTORY_MAX turns it restarts at HISTORY_KEEP,
 HISTORY_KEEP = 4  # so the prompt prefix (and the engine's state) stays valid for several turns
+STATS_RE = re.compile(r"^fwd35: (cont|full) prefill (\d+) tok ([0-9.]+) s \| decode (\d+) tok "
+                      r"([0-9.]+) s = ([0-9.]+) tok/s( \(stopped\))?$")
 
 
 def build_prompt(tok, history, user_text, system=SYSTEM):
@@ -51,14 +54,32 @@ class Llm:
         self.held = []  # token ids in the engine's state after the last request
         self.reused = 0  # tokens skipped by the last request (for logs and tests)
         self.win = 0  # index of the first history turn in the prompt
+        self.truncated = False  # the last reply ended without <|im_end|> (barge-in, runaway guard, max_new)
+        self.last_stats = None  # parsed engine stats of the last request, for span labels and logs
+        self.stats_cv = threading.Condition()  # guards stats_seq / stats_by_seq, notified per stats line
+        self.req_seq = 0  # requests sent so far; the engine emits one stats line per request, in this order
+        self.stats_seq = 0  # stats lines received so far
+        self.stats_by_seq = {}  # parsed stats, keyed by request number
         threading.Thread(target=self._drain_err, daemon=True).start()
         if not self.ready.wait(300):
             raise RuntimeError("fwd35_serve did not become ready")
 
     def _drain_err(self):
         for line in self.proc.stderr:
+            line = line.strip()
             if "ready" in line:
                 self.ready.set()
+                continue
+            m = STATS_RE.match(line)
+            if m:  # prefill/decode timing of the request just finished; kept for logs and the trace page
+                print(line, flush=True)
+                with self.stats_cv:
+                    self.stats_seq += 1
+                    self.stats_by_seq[self.stats_seq] = {"cont": m.group(1) == "cont", "prefill_tok": int(m.group(2)),
+                                                         "prefill_s": float(m.group(3)), "decode_tok": int(m.group(4)),
+                                                         "decode_s": float(m.group(5)), "tok_s": float(m.group(6)),
+                                                         "stopped": bool(m.group(7))}
+                    self.stats_cv.notify_all()
 
     def cancel(self):
         """Barge-in: ends the decode in progress after the current token; safe to call anytime."""
@@ -71,6 +92,8 @@ class Llm:
     def _prefill_only(self, ids):
         """Feeds `ids` from scratch and keeps them as the engine state (one decoded token is discarded)."""
         self.held = []
+        self.truncated = False
+        self.req_seq += 1
         self.proc.stdin.write("1 %s\n" % " ".join(map(str, ids)))
         self.proc.stdin.flush()
         while True:
@@ -81,20 +104,23 @@ class Llm:
                 self.held = ids[:int(line[2:])]
 
     def prepare(self, history, system=SYSTEM):
-        """If the next turn would restart the history window (its whole prefix is prefilled again, ~45 ms per
-        token on the 4B), prefill that prefix now, while the user listens and answers."""
+        """Keeps the engine state equal to the prompt prefix (system + the history window) so that the next
+        turn continues instead of prefilling the whole history again (~45 ms per token on the 4B).
+
+        The window restart needs the prefix prefilled now; a reply cut short (barge-in, runaway guard,
+        max_new) leaves the engine holding prompt + reply tokens without <|im_end|>, which no later prompt
+        can continue from, so that prefix is prefilled again as well."""
         with self.lock:
             win = self.win if self.win <= len(history) else 0
-            if len(history) - win <= HISTORY_MAX:
-                return
-            win = len(history) - HISTORY_KEEP
+            if len(history) - win > HISTORY_MAX:
+                win = len(history) - HISTORY_KEEP
             text = "<|im_start|>system\n" + system + "<|im_end|>\n"
             for u, a in history[win:]:
                 text += "<|im_start|>user\n" + u + "<|im_end|>\n"
                 text += "<|im_start|>assistant\n<think>\n\n</think>\n\n" + a + "<|im_end|>\n"
             ids = self.tok.encode(text, add_special_tokens=False).ids
             self.win = win
-            if self.held[:len(ids)] != ids:
+            if self.truncated or self.held[:len(ids)] != ids:
                 self._prefill_only(ids)
 
     def warm(self, system=SYSTEM):
@@ -122,6 +148,7 @@ class Llm:
             self.reused = n if cont else 0
             base = self.held if cont else []
             self.held = []  # unknown until the engine reports its position
+            self.req_seq += 1
             self.proc.stdin.write("%s%d %s\n" % ("+" if cont else "", self.max_new, " ".join(map(str, send))))
             self.proc.stdin.flush()
             out, sent, emitted = [], "", []
@@ -153,6 +180,12 @@ class Llm:
                 if delta:
                     yield delta
             self.last = sent
+            self.truncated = IM_END not in emitted  # state holds prompt + reply without <|im_end|>
+            # the engine writes one stats line per request, in request order: wait until this request's line
+            # (number req_seq) has arrived; a late line from an earlier request cannot satisfy the wait
+            with self.stats_cv:
+                self.stats_cv.wait_for(lambda: self.stats_seq >= self.req_seq, timeout=0.5)
+                self.last_stats = self.stats_by_seq.get(self.req_seq)
 
 
 if __name__ == "__main__":
