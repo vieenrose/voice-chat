@@ -85,6 +85,15 @@ RTF 含補的靜音，句子很短所以偏高。160 ms 在 2 條執行緒上超
 ## 診斷
 
 - `/trace`（也嵌入在對話頁面中）：各階段時間區段、各核心 CPU、GPU 負載與 RAM。
+  LLM 區段的標籤來自引擎每次請求的統計行（`fwd35: … prefill … | decode … tok/s`）：
+  - `prefill N reused`：沿用引擎狀態，只預填新增的 token，跳過前 N 個；`prefill full`：從頭預填。
+    歷史視窗重新開始或上一輪被截斷時會出現 `full`，這是預期行為。若每一輪都是 `full`，代表 `prepare`
+    產生的 token 與實際生成的不一致（例如回覆文字被改寫過），請檢查 `app/llm.py` 的 `prepare()`。
+  - `decode N tok X tok/s`：本輪解碼的 token 數與速度；`(cut)` 表示被插話打斷。
+  - 首個 token 那一段的文字標籤會顯示上述預填方式（對應 `/trace` 的「文字 → LLM 首個 token」列）。
+  統計行只在引擎輸出時才會到達；若遲到超過 0.5 秒，標籤會省略，不影響語音輸出。
+- 插話後（`cut_current`）會在背景重新預填歷史前綴（`prepare`），下一輪才能接續而不是從頭預填。
+  這段在背景執行的錯誤會以 `prepare failed` 記錄在伺服器日誌中。
 - `server/rec/`：最近 4 次對話的麥克風音訊（`.wav`）與事件記錄（`.log`：
   `speech_start`／`speech_end` 位移、最後的部分文字與最終文字）。檔案只留在裝置上，不納入版本控制。
 - 檢查腳本（需要 GPU 的請先停止伺服器）：`app/bench.py`、`app/text_check.py`、
