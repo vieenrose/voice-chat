@@ -395,6 +395,7 @@ async def session(ws):
 
     async def smart_says_unfinished():
         p = await asyncio.to_thread(ENG.smart.predict, st["tail"])
+        log_rec("turn_check p=%.3f" % p)  # every VAD speech_end, kept with the recording for threshold tuning
         await ws.send_json({"type": "turn_check", "p": round(p, 3)})  # every VAD speech_end, for the UI and tuning
         return p < THRESHOLD_TURN
 

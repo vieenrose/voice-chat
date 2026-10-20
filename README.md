@@ -10,7 +10,7 @@
 | STT | X-ASR 480 ms chunk（sherpa-onnx，int8），由 VAD 觸發 | CPU |
 | LLM | Bonsai-2 三元 2B，`fwd35_serve`（PULSAR 引擎，`engine/make_serve.py`） | GPU |
 | TTS | PrimeTTS v2.1（g2pW + VITS，onnxruntime） | CPU |
-| 輪次偵測 | Smart Turn v3.2（預設關閉） | CPU |
+| 輪次偵測 | Smart Turn v3.2（`run.sh` 預設開啟，`VC_SMART_TURN=0` 關閉；調校中，見下方診斷） | CPU |
 
 ```bash
 ./run.sh        # 在 ~/voicechat-jetson 執行；服務位於 https://<host>:8443，token 在 server/lan_token
@@ -95,7 +95,14 @@ RTF 含補的靜音，句子很短所以偏高。160 ms 在 2 條執行緒上超
 - 插話後（`cut_current`）會在背景重新預填歷史前綴（`prepare`），下一輪才能接續而不是從頭預填。
   這段在背景執行的錯誤會以 `prepare failed` 記錄在伺服器日誌中。
 - `server/rec/`：最近 4 次對話的麥克風音訊（`.wav`）與事件記錄（`.log`：
-  `speech_start`／`speech_end` 位移、最後的部分文字與最終文字）。檔案只留在裝置上，不納入版本控制。
+  `speech_start`／`speech_end` 位移、最後的部分文字與最終文字，以及 Smart Turn 的 `turn_check p=…`）。
+  檔案只留在裝置上，不納入版本控制。
+- Smart Turn 調校（尚未定案）：每次 `speech_end` 會在記錄中寫入 `turn_check p=…`，p ≥ 0.5 視為回合結束。
+  目前的觀察：離線重跑 25 個記錄片段時，24 個 p ≥ 0.5，唯一的例外是 p = 0.317 的一次完整句子；
+  「就是我打開網頁的時候，那個就是沒有辦法」（p = 0.548）是唯一明顯未完成的片段，剛好在閾值之上。
+  即時記錄中，「我檢查過了那個網絡線沒插」（句子在「沒插」後截斷，「沒插好」才完整）得到 p = 0.974，沒有被保留。
+  結論：預設閾值 0.5 幾乎不會保留截斷的句子。需要更多在句中停頓的樣本才能選定閾值，同時估計 CPU 成本。
+  離線分析的腳本未納入版本控制。
 - 檢查腳本（需要 GPU 的請先停止伺服器）：`app/bench.py`、`app/text_check.py`、
   `app/llm_cont_check.py`、`app/tts_cut_check.py`、`app/tts_stream_check.py`、`app/sched_check.py`、
   `server/bargein_test.py`。
