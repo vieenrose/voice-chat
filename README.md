@@ -8,7 +8,7 @@
 |---|---|---|
 | VAD | Silero | CPU |
 | STT | X-ASR 480 ms chunk（sherpa-onnx，int8），由 VAD 觸發 | CPU |
-| LLM | Bonsai-2 三元 2B，`fwd35_serve`（PULSAR 引擎，`engine/make_serve.py`） | GPU |
+| LLM | Bonsai-2 三元 4B（`run.sh` 的 `VC_LLM` 選擇 gguf，可換回 2B），`fwd35_serve`（PULSAR 引擎，`engine/make_serve.py`） | GPU |
 | TTS | PrimeTTS v2.1（g2pW + VITS，onnxruntime） | CPU |
 | 輪次偵測 | Smart Turn v3.2（`run.sh` 預設開啟，`VC_SMART_TURN=0` 關閉；調校中，見下方診斷） | CPU |
 
