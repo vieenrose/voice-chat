@@ -1,0 +1,395 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		B1000000000000000000C000 /* MLXAudioTTS in Frameworks */ = {isa = PBXBuildFile; productRef = B1000000000000000000B001 /* MLXAudioTTS */; };
+		B1000000000000000000C001 /* MLXAudioSTT in Frameworks */ = {isa = PBXBuildFile; productRef = B1000000000000000000B002 /* MLXAudioSTT */; };
+		B1000000000000000000C002 /* MLXAudioCore in Frameworks */ = {isa = PBXBuildFile; productRef = B1000000000000000000B003 /* MLXAudioCore */; };
+		B1000000000000000000C003 /* MLXLLM in Frameworks */ = {isa = PBXBuildFile; productRef = B1000000000000000000B004 /* MLXLLM */; };
+		B1000000000000000000C004 /* MLXLMCommon in Frameworks */ = {isa = PBXBuildFile; productRef = B1000000000000000000B005 /* MLXLMCommon */; };
+		B1000000000000000000C006 /* HuggingFace in Frameworks */ = {isa = PBXBuildFile; productRef = B1000000000000000000B007 /* HuggingFace */; };
+		B1000000000000000000C007 /* Tokenizers in Frameworks */ = {isa = PBXBuildFile; productRef = B1000000000000000000B008 /* Tokenizers */; };
+		B1000000000000000000C008 /* MLX in Frameworks */ = {isa = PBXBuildFile; productRef = B1000000000000000000B009 /* MLX */; };
+		B1000000000000000000C009 /* onnxruntime in Frameworks */ = {isa = PBXBuildFile; productRef = B1000000000000000000B00A /* onnxruntime */; };
+		B1000000000000000000C00A /* sherpa-onnx-shared in Frameworks */ = {isa = PBXBuildFile; productRef = B1000000000000000000B00B /* sherpa-onnx-shared */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		B10000000000000000000001 /* MemBench.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MemBench.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		B10000000000000000000009 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		B1000000000000000000000A /* MemBench.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = MemBench.entitlements; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		B1000000000000000000000B /* Exceptions */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+				MemBench.entitlements,
+			);
+			target = B10000000000000000000006 /* MemBench */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		B10000000000000000000002 /* MemBench */ = {isa = PBXFileSystemSynchronizedRootGroup; exceptions = (B1000000000000000000000B /* Exceptions */,); path = MemBench; sourceTree = "<group>"; };
+/* End PBXFileSystemSynchronizedRootGroup section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		B10000000000000000000003 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B1000000000000000000C000 /* MLXAudioTTS in Frameworks */,
+				B1000000000000000000C001 /* MLXAudioSTT in Frameworks */,
+				B1000000000000000000C002 /* MLXAudioCore in Frameworks */,
+				B1000000000000000000C003 /* MLXLLM in Frameworks */,
+				B1000000000000000000C004 /* MLXLMCommon in Frameworks */,
+				B1000000000000000000C006 /* HuggingFace in Frameworks */,
+				B1000000000000000000C007 /* Tokenizers in Frameworks */,
+				B1000000000000000000C008 /* MLX in Frameworks */,
+				B1000000000000000000C009 /* onnxruntime in Frameworks */,
+				B1000000000000000000C00A /* sherpa-onnx-shared in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		B10000000000000000000004 = {
+			isa = PBXGroup;
+			children = (
+				B10000000000000000000002 /* MemBench */,
+				B10000000000000000000005 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		B10000000000000000000005 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				B10000000000000000000001 /* MemBench.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		B10000000000000000000006 /* MemBench */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B100000000000000000000F01 /* Build configuration list for PBXNativeTarget "MemBench" */;
+			buildPhases = (
+				B10000000000000000000007 /* Sources */,
+				B10000000000000000000003 /* Frameworks */,
+				B10000000000000000000008 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				B10000000000000000000002 /* MemBench */,
+			);
+			name = MemBench;
+			packageProductDependencies = (
+				B1000000000000000000B001 /* MLXAudioTTS */,
+				B1000000000000000000B002 /* MLXAudioSTT */,
+				B1000000000000000000B003 /* MLXAudioCore */,
+				B1000000000000000000B004 /* MLXLLM */,
+				B1000000000000000000B005 /* MLXLMCommon */,
+				B1000000000000000000B007 /* HuggingFace */,
+				B1000000000000000000B008 /* Tokenizers */,
+				B1000000000000000000B009 /* MLX */,
+				B1000000000000000000B00A /* onnxruntime */,
+				B1000000000000000000B00B /* sherpa-onnx-shared */,
+			);
+			productName = MemBench;
+			productReference = B10000000000000000000001 /* MemBench.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		B100000000000000000000AA /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2600;
+				LastUpgradeCheck = 2600;
+				TargetAttributes = {
+					B10000000000000000000006 = {
+						CreatedOnToolsVersion = 26.0;
+					};
+				};
+			};
+			buildConfigurationList = B100000000000000000000F02 /* Build configuration list for PBXProject "MemBench" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = B10000000000000000000004;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				B1000000000000000000A001 /* XCRemoteSwiftPackageReference "mlx-audio-swift" */,
+				B1000000000000000000A002 /* XCRemoteSwiftPackageReference "mlx-swift-lm" */,
+				B1000000000000000000A003 /* XCRemoteSwiftPackageReference "swift-huggingface" */,
+				B1000000000000000000A004 /* XCRemoteSwiftPackageReference "swift-transformers" */,
+				B1000000000000000000A005 /* XCRemoteSwiftPackageReference "mlx-swift" */,
+				B1000000000000000000A006 /* XCRemoteSwiftPackageReference "onnxruntime-libs" */,
+				B1000000000000000000A007 /* XCRemoteSwiftPackageReference "sherpa-onnx" */,
+			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = B10000000000000000000005 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				B10000000000000000000006 /* MemBench */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		B10000000000000000000008 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		B10000000000000000000007 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		B100000000000000000000D01 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SDKROOT = iphoneos;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				ONLY_ACTIVE_ARCH = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		B100000000000000000000D02 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		B100000000000000000000E01 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = MemBench/MemBench.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = QGKL6RDGM3;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = MemBench/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = MemBench;
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = UIInterfaceOrientationPortrait;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.luigi.membench-demo";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		B100000000000000000000E02 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = MemBench/MemBench.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = QGKL6RDGM3;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = MemBench/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = MemBench;
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = UIInterfaceOrientationPortrait;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.luigi.membench-demo";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		B100000000000000000000F01 /* Build configuration list for PBXNativeTarget "MemBench" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B100000000000000000000E01 /* Debug */,
+				B100000000000000000000E02 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		B100000000000000000000F02 /* Build configuration list for PBXProject "MemBench" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B100000000000000000000D01 /* Debug */,
+				B100000000000000000000D02 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		B1000000000000000000A001 /* XCRemoteSwiftPackageReference "mlx-audio-swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/Blaizzy/mlx-audio-swift.git";
+			requirement = {
+				kind = upToNextMinorVersion;
+				minimumVersion = 0.1.5;
+			};
+		};
+		B1000000000000000000A002 /* XCRemoteSwiftPackageReference "mlx-swift-lm" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/ml-explore/mlx-swift-lm";
+			requirement = {
+				kind = upToNextMinorVersion;
+				minimumVersion = 3.32.3;
+			};
+		};
+		B1000000000000000000A003 /* XCRemoteSwiftPackageReference "swift-huggingface" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/huggingface/swift-huggingface";
+			requirement = {
+				kind = upToNextMinorVersion;
+				minimumVersion = 0.9.0;
+			};
+		};
+		B1000000000000000000A004 /* XCRemoteSwiftPackageReference "swift-transformers" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/huggingface/swift-transformers";
+			requirement = {
+				kind = upToNextMinorVersion;
+				minimumVersion = 1.3.0;
+			};
+		};
+		B1000000000000000000A005 /* XCRemoteSwiftPackageReference "mlx-swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/ml-explore/mlx-swift";
+			requirement = {
+				kind = upToNextMinorVersion;
+				minimumVersion = 0.32.3;
+			};
+		};
+		B1000000000000000000A006 /* XCRemoteSwiftPackageReference "onnxruntime-libs" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/csukuangfj/onnxruntime-libs";
+			requirement = {
+				kind = exactVersion;
+				version = 1.28.2;
+			};
+		};
+		B1000000000000000000A007 /* XCRemoteSwiftPackageReference "sherpa-onnx" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/k2-fsa/sherpa-onnx";
+			requirement = {
+				kind = exactVersion;
+				version = 1.13.8;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		B1000000000000000000B001 /* MLXAudioTTS */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B1000000000000000000A001;
+			productName = MLXAudioTTS;
+		};
+		B1000000000000000000B002 /* MLXAudioSTT */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B1000000000000000000A001;
+			productName = MLXAudioSTT;
+		};
+		B1000000000000000000B003 /* MLXAudioCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B1000000000000000000A001;
+			productName = MLXAudioCore;
+		};
+		B1000000000000000000B004 /* MLXLLM */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B1000000000000000000A002;
+			productName = MLXLLM;
+		};
+		B1000000000000000000B005 /* MLXLMCommon */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B1000000000000000000A002;
+			productName = MLXLMCommon;
+		};
+		B1000000000000000000B007 /* HuggingFace */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B1000000000000000000A003;
+			productName = HuggingFace;
+		};
+		B1000000000000000000B008 /* Tokenizers */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B1000000000000000000A004;
+			productName = Tokenizers;
+		};
+		B1000000000000000000B009 /* MLX */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B1000000000000000000A005;
+			productName = MLX;
+		};
+		B1000000000000000000B00A /* onnxruntime */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B1000000000000000000A006;
+			productName = "onnxruntime-ios-shared";
+		};
+		B1000000000000000000B00B /* sherpa-onnx-shared */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B1000000000000000000A007;
+			productName = "sherpa-onnx-shared";
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = B100000000000000000000AA /* Project object */;
+}
