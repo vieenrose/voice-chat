@@ -13,7 +13,10 @@ request ends with `P n` (tokens now held in the state) before `END`; app/llm.py 
 whether the next prompt can be sent as a continuation.
 
 A reader thread owns stdin. A line `STOP` sets a flag that ends the decode of the request in
-progress after the current token (barge-in); it is never queued as a request.
+progress after the current token (barge-in); it is never queued as a request. A prefill (N == 1)
+also ends at the next chunk boundary when STOP arrives or when a real generation (N > 1) is
+queued behind it, so a turn never waits for a background prepare to finish; the state is then the
+prefix fed so far (reported as `P n`) and the next request continues from it.
 
 usage: make_serve.py fwd35_sm53.cu fwd35_serve.cu
 """
@@ -75,6 +78,17 @@ tail = r'''    cudaEvent_t evx[2];
         qcv.notify_one();
     });
 
+    auto decode_pending = [&]() {
+        std::lock_guard<std::mutex> lk(qm);
+        for (auto &q : queue) {
+            char *p = &q.second[0];
+            while (*p == ' ') p++;
+            if (*p == '+') p++;
+            return strtol(p, NULL, 10) > 1;  /* a real generation, not another prefill, waits first */
+        }
+        return false;
+    };
+
     std::vector<int> ids;
     /* Positions already in the K/V cache and recurrent states. A request starting with "+"
        continues from there (multi-turn chat: only the new tokens are prefilled); any other request
@@ -111,10 +125,18 @@ tail = r'''    cudaEvent_t evx[2];
         }
         if (stop_upto.load() >= my_seq) { printf("P %d\nEND\n", kpos); fflush(stdout); continue; }
         const int tinyr = npr >= 2;
-        int pos = base, chunk = 0;
+        int pos = base, chunk = 0, pruned = 0;
         tcur = 0;
         const double t0 = now();
         for (int i = 0; i < npr;) {
+            /* barge-in STOP, or a real generation queued behind this N=1 prefill: end the prefill
+               at the chunk boundary; the state is the prefix fed so far, reported as P below. */
+            if (stop_upto.load() >= my_seq || (N2 == 1 && decode_pending())) {
+                kpos = base + i;  /* the state is the prefix fed so far; a "+" request continues from it */
+                printf("P %d\nEND\n", kpos); fflush(stdout);
+                fprintf(stderr, "fwd35: prefill %d tok pruned at %d tok %.3f s\n", npr, i, now() - t0);
+                pruned = 1; break;
+            }
             const int nt = npr - i < pch ? npr - i : pch;
             float *hb = hx + (size_t)E * NTM * (chunk & 1);
             if (chunk >= 2) CK(cudaEventSynchronize(evx[chunk & 1]));
@@ -126,6 +148,7 @@ tail = r'''    cudaEvent_t evx[2];
             i += nt; pos += nt; chunk++;
             run(nt, tinyr, i == npr ? 1 : 0);
         }
+        if (pruned) continue;
         CK(cudaMemcpyAsync(hid, d_out, 4, cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
         const double t1 = now();

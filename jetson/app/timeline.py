@@ -77,7 +77,7 @@ def _sampler():
         time.sleep(SAMPLE_S)
         cur = _cpu_times()
         cores = [round(100.0 * (1 - (ci - pi) / max(1, ct - pt)), 1)
-                 for (ct, ci), (pt, pi) in zip(cur, prev, strict=True)]
+                 for (ct, ci), (pt, pi) in zip(cur, prev)]  # equal length: one entry per core
         prev = cur
         now = time.monotonic()
         used, _ = _mem_used_mb()
