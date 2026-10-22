@@ -55,7 +55,7 @@
     <div class="legend">
       <span><span class="sw" style="background:var(--vad)"></span>VAD（Silero，CPU 1 執行緒）</span>
       <span><span class="sw" style="background:var(--asr)"></span>ASR（X-ASR sherpa-onnx，CPU 2 執行緒）</span>
-      <span><span class="sw" style="background:var(--llm)"></span>LLM（Bonsai 2B fwd35，GPU）</span>
+      <span><span class="sw" style="background:var(--llm)"></span>LLM（<span id="llm-name">Bonsai-2 2B fwd35</span>，GPU）</span>
       <span><span class="sw" style="background:var(--tts)"></span>TTS（PrimeTTS ORT，CPU 3 執行緒）</span>
       <span><span class="sw" style="background:var(--spk)"></span>喇叭（估計播放時間）</span>
     </div>
@@ -71,7 +71,7 @@
       <tr><td><span class="sw" style="background:var(--vad)"></span>VAD Silero v6</td><td>CPU</td><td>1</td><td>持續處理每個麥克風音框（32 ms）</td><td>每 128 ms 音訊僅數 ms</td></tr>
       <tr><td><span class="sw" style="background:var(--asr)"></span>ASR X-ASR 480 ms（串流）</td><td>CPU</td><td>2</td><td>只在 VAD 開門後運作（先送預錄音訊再送語音），句尾再做一次排空</td><td>RTF 0.47；排空約 0.58 秒（補 1.0 秒靜音）</td></tr>
       <tr><td>Smart Turn v3.2（預設關閉）</td><td>CPU</td><td>2</td><td>設定 VC_SMART_TURN=1 時，每次說完話都執行</td><td>每次約 460 ms</td></tr>
-      <tr><td><span class="sw" style="background:var(--llm)"></span>LLM Bonsai-2 2B 三元權重</td><td>GPU（另用 1 個 CPU 核心驅動）</td><td>—</td><td>說完話後：先預填（prefill），再逐 token 解碼</td><td>預填約 0.35–0.5 秒；換角色後的系統提示在開場白播放時預先預填</td></tr>
+      <tr><td><span class="sw" style="background:var(--llm)"></span>LLM <span id="llm-model">Bonsai-2 2B 三元權重</span></td><td>GPU（另用 1 個 CPU 核心驅動）</td><td>—</td><td>說完話後：先預填（prefill），再逐 token 解碼</td><td><span id="llm-prefill">預填約 0.35–0.5 秒</span>；換角色後的系統提示在開場白播放時預先預填</td></tr>
       <tr><td><span class="sw" style="background:var(--tts)"></span>TTS PrimeTTS + g2pW</td><td>CPU</td><td>3</td><td>LLM 產生第一個短句後立即開始，與 LLM 解碼同時進行</td><td>每句約 0.5–2 秒</td></tr>
       <tr><td><span class="sw" style="background:var(--spk)"></span>網路 + 瀏覽器</td><td>—</td><td>—</td><td>傳送每句合成的語音，並由瀏覽器播放</td><td>實測 0.2–1.1 秒</td></tr>
     </table>
@@ -300,7 +300,34 @@
       if (r.status === 401) { $("token").value = ""; $("status").textContent = "存取碼不正確。"; $("status").className = "bad"; return; }
       last = await r.json(); save(token); $("status").className = "";
       draw(last); turnSummary(last);
+      fetchModelLabel(token);
     } catch (e) { $("status").textContent = "無法連線到伺服器。"; $("status").className = "bad"; }
+  }
+
+  // the LLM label follows the model the server actually loads (VC_LLM, and the UI's model selector),
+  // not the text written in this page: health is re-read every 5 s so a mid-session switch shows up
+  const PREFILL = { "2B": "預填約 0.35–0.5 秒", "4B": "預填約 0.7–0.9 秒", "9B": "預填約 1.5–2 秒" };
+  let lastModel = "", modelFetchedAt = 0;
+  async function fetchModelLabel(token) {
+    const now = Date.now();
+    if (lastModel && now - modelFetchedAt < 5000) return;  // first call always fetches
+    try {
+      const r = await fetch("health?token=" + encodeURIComponent(token), { cache: "no-store" });
+      modelFetchedAt = Date.now();
+      if (!r.ok) return;
+      const h = await r.json();
+      const model = h.model || "";
+      if (model && model !== lastModel) {
+        lastModel = model;
+        const m = model.match(/Bonsai[-\s]?([\d.]+)[-\s](\d+(?:\.\d+)?B)/i);
+        if (m) {
+          const size = m[2].toUpperCase();
+          $("llm-name").textContent = "Bonsai-" + m[1] + " " + size + " fwd35";
+          $("llm-model").textContent = "Bonsai-" + m[1] + " " + size + " 三元權重";
+          if (PREFILL[size]) $("llm-prefill").textContent = PREFILL[size];
+        }
+      }
+    } catch (_) {}
   }
   window.addEventListener("resize", () => last && draw(last));
   setInterval(tick, 1000); tick();

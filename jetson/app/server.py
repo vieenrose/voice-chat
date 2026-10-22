@@ -3,6 +3,7 @@
 Client -> server
   binary  int16 PCM, 16 kHz mono (mic)
   json    {"type": "played", "turn": n, "seq": k}   first sample of chunk k of turn n is audible
+  json    {"type": "model", "id"}                   switch the serving LLM (engine reloads, talk is cut)
 Server -> client
   json    {"type": "partial" | "user", "text"}     ASR hypotheses / finished user utterance
   json    {"type": "audio_start", "turn", "seq", "text", "samples"} followed by one binary int16 frame
@@ -10,12 +11,15 @@ Server -> client
   json    {"type": "assistant", "turn", "text"}    full reply (not sent when the turn was cut)
   json    {"type": "latency", ...}                 ms from last voiced chunk, server clock
   json    {"type": "busy"}                         another session holds the slot (close 4409)
+  json    {"type": "model_switch", "id", "est_s"}  engine loading: talk cut, mic held until model_ready
+  json    {"type": "model_ready", "id", "name"}    new model serving; json model_failed on load error
 
 Barge-in: a partial ASR hypothesis of at least BARGE_CHARS characters while a turn is running
 cancels that turn: STOP to the engine, the TTS queue is dropped, the client stops playback.
 Cut turns are never written to the history, as on iOS.
 """
 import asyncio
+import functools
 import hmac
 import json
 import os
@@ -36,6 +40,13 @@ from fastapi import FastAPI, Query, WebSocket
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.websockets import WebSocketDisconnect
 
+if not hasattr(asyncio, "to_thread"):  # Python 3.8 (Jetson L4T image): 3.9 added this
+    async def _to_thread(fn, *args, **kwargs):
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, functools.partial(fn, *args, **kwargs))
+
+    asyncio.to_thread = _to_thread
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from asr import Asr  # noqa: E402
 from llm import Llm  # noqa: E402
@@ -55,7 +66,8 @@ END_MARKS = "。！？!?；;\n"
 SOFT_MARKS = "，,"
 SOFT_MIN = 6  # first comma after this many characters ends a TTS chunk
 FIRST_SOFT_MIN = 2  # the turn's first chunk: any comma after 2 characters ends it
-FIRST_MIN, FIRST_MAX = 4, 8  # ...and without punctuation it ends at a word boundary in this range
+FIRST_MIN = int(os.environ.get("VC_FIRST_MIN", "4"))  # first TTS chunk: word boundary no shorter than this
+FIRST_MAX = int(os.environ.get("VC_FIRST_MAX", "8"))  # ...and no longer than this (TTS time grows with length)
 FIRST_LOOKAHEAD = 2  # characters past FIRST_MAX needed before the word boundary is trusted
 SMART_TURN = os.environ.get("VC_SMART_TURN", "0") == "1"  # off by default until measured on the Nano
 THRESHOLD_TURN = 0.5  # Smart Turn: probability that the turn is complete
@@ -165,9 +177,28 @@ def ensure_cert(hosts):
     os.chmod(KEY, 0o600)
 
 
+# id -> (model file in models/, cold load estimate in seconds shown to the UI).
+# 4 GB of RAM holds one LLM at a time, so picking one is a cold swap: talk is cut, the engine is
+# reloaded, the current role re-warms and repeats its opening. A restart falls back to VC_LLM.
+MODELS = {
+    "2b": ("Ternary-Bonsai-2-2B-PTQ1_0.gguf", 15),
+    "4b": ("Ternary-Bonsai-2-4B-PTQ1_0.gguf", 70),
+}
+
+
+def model_id(name):
+    """Reverse of MODELS: file name back to the selector id, for /health and the roles greeting."""
+    for mid, (fname, _est) in MODELS.items():
+        if fname == name:
+            return mid
+    return ""
+
+
 class Engines:
     llm = tts = asr = smart = None
     busy = False
+    model = ""  # serving model file name, set by load_engines; shown by /health and the trace page
+    lock = threading.Lock()  # held while a model swap replaces llm, so run_turn never sees it mid-swap
 
 
 ENG = Engines()
@@ -179,12 +210,17 @@ def load_engines():
     ENG.tts = Tts(os.environ.get("PRIME_ONNX", str(ROOT / "primetts_v21_3voice.onnx")),
                   str(ROOT / "models" / "g2pw" / "g2pw_int8.onnx"), str(ROOT / "tts_res"),
                   threads=int(os.environ.get("TTS_THREADS", "3")))
-    ENG.vad = SileroVad(str(ROOT / "silero_vad.onnx"), threshold=0.6, min_speech_ms=384, min_silence_ms=450)
+    ENG.vad = SileroVad(str(ROOT / "silero_vad.onnx"), threshold=0.6, min_speech_ms=384,
+                        min_silence_ms=int(os.environ.get("VC_VAD_MIN_SILENCE_MS", "450")))
     if SMART_TURN:
         ENG.smart = SmartTurn(str(ROOT / "models" / "smart-turn" / "smart-turn-v3.2-int8.onnx"),
                               threads=int(os.environ.get("VC_SMART_TURN_THREADS", "2")))
-    ENG.llm = Llm(str(ROOT / "fwd35_serve"), str(ROOT / "models" / os.environ.get("VC_LLM", "Ternary-Bonsai-2-2B-PTQ1_0.gguf")),
-                  str(ROOT / "models" / "tok" / "tokenizer.json"), max_new=200)
+    ENG.model = os.environ.get("VC_LLM", MODELS["2b"][0])
+    new = Llm(str(ROOT / "fwd35_serve"), str(ROOT / "models" / ENG.model),
+              str(ROOT / "models" / "tok" / "tokenizer.json"), max_new=200)
+    old, ENG.llm = ENG.llm, new
+    if old is not None:
+        old.close()
 
 
 class Turn:
@@ -221,13 +257,14 @@ def run_turn(turn, emit, history):
     buf = ""
     t_req = time.monotonic()
     stopped = False  # the reply degenerated: what was kept is final, the rest of the stream is drained
+    llm = ENG.llm  # fixed for the whole turn: a model swap mid-turn must not repoint a running stream
     try:
-        for delta in (iter([turn.text]) if turn.scripted else ENG.llm.stream(history, turn.text, turn.system)):
+        for delta in (iter([turn.text]) if turn.scripted else llm.stream(history, turn.text, turn.system)):
             if turn.cancelled.is_set() or stopped:
                 continue  # keep draining so the engine is free for the next request
             if turn.t_first_token is None:
                 turn.t_first_token = time.monotonic()
-                label = "prefill %d reused" % ENG.llm.reused if ENG.llm.reused else "prefill full"
+                label = "prefill %d reused" % llm.reused if llm.reused else "prefill full"
                 tr.add_span("LLM", t_req, turn.t_first_token, label)
                 tr.mark("first_token")
             turn.reply += delta
@@ -237,7 +274,7 @@ def run_turn(turn, emit, history):
                 buf = buf[:max(0, len(buf) - (len(turn.reply) - bad))]
                 turn.reply = turn.reply[:bad].strip()
                 stopped = True
-                ENG.llm.cancel()
+                llm.cancel()
                 print("reply cut (degenerate): %r" % turn.reply, flush=True)
             while True:
                 cut = first_cut(buf) if turn.chunks == 0 else find_cut(buf)
@@ -251,7 +288,7 @@ def run_turn(turn, emit, history):
         emit(("error", turn, str(e)))
     if turn.t_first_token is not None:
         label = "decode" + (" (cut)" if turn.cancelled.is_set() else "")
-        st = ENG.llm.last_stats  # engine prefill/decode timings of this request (None if the line was late)
+        st = llm.last_stats  # engine prefill/decode timings of this request (None if the line was late)
         if st:
             label += " %d tok %.2f tok/s" % (st["decode_tok"], st["tok_s"])
         tr.add_span("LLM", turn.t_first_token, time.monotonic(), label)
@@ -317,6 +354,8 @@ async def session(ws):
           "prev": None,  # (text, end time) of the last user utterance, for turn reopen
           "reopen": False,  # the current utterance continues the previous one
           "echo_zone": False,  # the current utterance started while (or right after) the assistant spoke
+          "loading": False,  # a model swap is running: the loop sits inside switch_model, not at the socket
+          "backlog": 0, "drain_n": 0,  # mic frames counted during a swap, dropped right after it ends
           "role": roles.ROLES[0]}
     history = []
     rec = open_recording()  # (wav writer, event log, [samples written]) or None
@@ -429,8 +468,50 @@ async def session(ws):
         if role["opening"]:
             await start_turn(role["opening"], time.monotonic(), scripted=True)
 
+    async def switch_model(mid):
+        """Cold-swap the serving LLM (the Nano holds one model in RAM). The talk is cut, the new engine
+        loads on a worker thread (~15 s for 2B, ~70 s for 4B), then the current role re-warms and
+        repeats its opening, so the session resumes hands-free. A load failure keeps the old engine."""
+        fname, est = MODELS[mid]
+        label = "Bonsai-2 " + (re.search(r"(\d+(?:\.\d+)?B)", fname).group(1))
+        async def sendj(obj):
+            try:
+                await ws.send_json(obj)
+            except RuntimeError:  # socket closed mid-swap: the rest of the swap is moot, session is ending
+                pass
+        await cut_current()
+        st["loading"] = True
+        st["pre"] = np.zeros(0, dtype=np.float32)
+        st["held"] = None
+        st["tail"] = np.zeros(0, dtype=np.float32)
+        st["prev"], st["reopen"] = None, False
+        await sendj({"type": "model_switch", "id": mid, "name": label, "est_s": est})
+        try:
+            # sequential on purpose: loading the new model next to the old one exceeds the Nano's 4 GB
+            new = await asyncio.to_thread(
+                Llm, str(ROOT / "fwd35_serve"), str(ROOT / "models" / fname),
+                str(ROOT / "models" / "tok" / "tokenizer.json"), max_new=200)
+        except Exception as e:  # RuntimeError: the engine never became ready (missing/truncated file)
+            st["loading"] = False
+            st["drain_n"], st["backlog"] = st["backlog"], 0
+            await sendj({"type": "model_failed", "id": mid, "message": str(e)})
+            return
+        with ENG.lock:
+            old, ENG.llm = ENG.llm, new
+        ENG.model = fname  # /health and the trace page label follow the serving model
+        old.close()
+        st["loading"] = False
+        st["drain_n"], st["backlog"] = st["backlog"], 0  # drop the mic backlog of the swap, oldest first
+        history.clear()  # a fresh engine starts its context from the role's system prompt
+        asyncio.create_task(asyncio.to_thread(ENG.llm.warm, roles.system_prompt(st["role"])))
+        await sendj({"type": "model_ready", "id": mid, "name": label})
+        if st["role"]["opening"]:
+            await start_turn(st["role"]["opening"], time.monotonic(), scripted=True)
+
     send_task = asyncio.create_task(sender())
-    await ws.send_json({"type": "roles", "items": roles.listing(), "current": st["role"]["id"]})
+    await ws.send_json({"type": "roles", "items": roles.listing(), "current": st["role"]["id"],
+                        "models": [{"id": k, "file": f} for k, (f, _e) in MODELS.items()],
+                        "model": model_id(ENG.model)})
     await switch_role(st["role"])  # the scene starts with its spoken opening line (and warms the prompt)
     try:
         while True:
@@ -441,6 +522,12 @@ async def session(ws):
                 if rec:
                     rec[0].writeframes(msg["bytes"])
                     rec[2][0] += len(msg["bytes"]) // 2
+                if st["loading"]:
+                    st["backlog"] += 1  # mic kept streaming into the socket while the engine loads
+                    continue
+                if st["drain_n"]:
+                    st["drain_n"] -= 1  # drop the backlog counted during the swap, oldest first
+                    continue
                 samples = np.frombuffer(msg["bytes"], dtype="<i2").astype(np.float32) / 32768
                 st["tail"] = np.concatenate([st["tail"], samples])[-128000:]
                 playing = time.monotonic() < st["play_end"]
@@ -458,7 +545,7 @@ async def session(ws):
                 if st["open"]:
                     with tr.span("ASR"):
                         asr_events = await asyncio.to_thread(ENG.asr.feed, samples)
-                    for kind, text in asr_events:
+                    for _kind, text in asr_events:
                         if not playing or ENG.vad.triggered:  # while the assistant talks, partials are mostly echo
                             await ws.send_json({"type": "partial", "text": clean_cjk(to_tw(text))})
                 else:
@@ -495,6 +582,8 @@ async def session(ws):
                 data = json.loads(msg["text"])
                 if data.get("type") == "role" and data.get("id") in roles.BY_ID:
                     await switch_role(roles.BY_ID[data["id"]])
+                elif data.get("type") == "model" and data.get("id") in MODELS:
+                    await switch_model(data["id"])  # blocks the loop while the engine loads: one swap at a time
                 elif data.get("type") == "played":
                     turn = st["last"]
                     if turn is not None and turn.n == data.get("turn") and turn.t_first_sent is not None \
@@ -539,7 +628,7 @@ async def trace_json(token: str = Query(""), s: float = Query(30.0)):
 
 @app.get("/health")
 async def health():
-    return JSONResponse({"ok": True, "busy": ENG.busy})
+    return JSONResponse({"ok": True, "busy": ENG.busy, "model": ENG.model})
 
 
 @app.websocket("/ws")

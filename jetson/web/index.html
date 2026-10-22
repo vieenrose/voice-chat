@@ -40,6 +40,10 @@
   .meter .fill.hot { background:#d97706; }
   .meter .fill.clip { background:var(--bad); }
   select { padding:10px; border-radius:8px; border:1px solid #9ca3af; background:var(--card); color:var(--fg); font-size:16px; }
+  #load { display:flex; align-items:center; gap:8px; margin:8px 0; font:13px ui-monospace, monospace; color:var(--muted); }
+  #load[hidden] { display:none; }
+  #load .bar2 { flex:1; height:8px; border-radius:5px; background:var(--card); border:1px solid #9ca3af; overflow:hidden; }
+  #loadfill { height:100%; width:0; background:var(--accent); transition: width 120ms linear; }
   #blurb { color: var(--muted); font-size: 14px; margin: 6px 0 0; min-height: 1.4em; }
   .scene { color: var(--muted); text-align:center; font-size:13px; margin: 10px 0; }
   #lat { font: 14px ui-monospace, monospace; color: var(--muted); white-space: pre; margin-top: 10px; }
@@ -58,7 +62,10 @@
   <div class="row">
     <label for="role">角色</label>
     <select id="role" disabled><option value="support">電信客服</option></select>
+    <label for="model">模型</label>
+    <select id="model" disabled><option value="">—</option></select>
   </div>
+  <div id="load" hidden><div class="bar2"><div id="loadfill"></div></div><span id="loadtext"></span></div>
   <div id="blurb"></div>
   <div class="meter"><span>🎤</span><div class="bar"><div class="fill" id="vu"></div></div><span id="vudb">— dB</span></div>
   <div id="status">尚未連線。請輸入存取碼並允許麥克風。</div>
@@ -132,7 +139,9 @@
     const proc = micCtx.createScriptProcessor(512, 1, 1);
     proc.onaudioprocess = (e) => {
       const f = e.inputBuffer.getChannelData(0);
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      // paused during a model swap: frames queued in the socket while the engine loads (up to ~70 s)
+      // would flood the VAD as one burst when the session resumes, so the mic is muted client-side
+      if (!ws || ws.readyState !== WebSocket.OPEN || modelLoading) return;
       const pcm = new Int16Array(f.length);
       for (let i = 0; i < f.length; i++) {
         const v = Math.max(-1, Math.min(1, f[i]));
@@ -194,7 +203,9 @@
       const msg = e.code === 4401 ? "存取碼不正確。" : e.code === 4409 ? "伺服器忙碌，另一個會話使用中。" : "連線已關閉。";
       status(msg, e.code !== 1000);
       stopAudio(); stopMic(); ws = null;
-      $("go").disabled = false; $("hang").disabled = true; $("role").disabled = true;
+      $("go").disabled = false; $("hang").disabled = true; $("role").disabled = true; $("model").disabled = true;
+      if (loadTimer) { cancelAnimationFrame(loadTimer); loadTimer = null; }
+      $("load").hidden = true;
     };
     ws.onmessage = (e) => {
       if (e.data instanceof ArrayBuffer) {
@@ -218,6 +229,13 @@
         case "latency": showLatency(m); break;
         case "error": line("partial", "錯誤：" + m.message); break;
         case "busy": status("伺服器忙碌，另一個會話使用中。", true); break;
+        case "model_switch":
+          $("model").disabled = true; $("role").disabled = true;
+          modelLoading = true;
+          startLoad(m.name, m.est_s);
+          break;
+        case "model_ready": endLoad(true, m.name); break;
+        case "model_failed": endLoad(false, m.id, m.message); break;
       }
     };
   }
@@ -233,6 +251,16 @@
     sel.value = m.current;
     sel.disabled = false;
     $("blurb").textContent = blurbs[m.current] || "";
+    const ms = $("model");
+    ms.innerHTML = "";
+    for (const md of m.models || []) { modelLabels[md.id] = modelLabel(md); ms.add(new Option(modelLabels[md.id], md.id)); }
+    servingModel = m.model || "";
+    ms.value = servingModel;
+    ms.disabled = false;
+  }
+  function modelLabel(md) {
+    const m = /(\d+(?:\.\d+)?B)/.exec(md.file || "");
+    return "Bonsai-2 " + (m ? m[1] : md.id);
   }
   function sceneChanged(m) {
     stopAudio();
@@ -243,6 +271,40 @@
     line("scene", "—— 角色：" + m.name + " ——");
   }
   $("role").onchange = () => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "role", id: $("role").value })); };
+
+  // Model switch: the server cold-loads the engine (2B ~15 s, 4B ~70 s) and repeats the role's opening.
+  const modelLabels = {};
+  let servingModel = "", loadTimer = null, modelLoading = false;
+  $("model").onchange = () => {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "model", id: $("model").value }));
+  };
+  function startLoad(name, est) {
+    $("load").hidden = false;
+    const t0 = Date.now(), ms = Math.max(1, est) * 1000;
+    const step = () => {  // the bar creeps toward 97%; model_ready finishes it
+      const left = Math.max(0, ms - (Date.now() - t0));
+      $("loadfill").style.width = (Math.min(0.97, 1 - left / ms) * 100).toFixed(1) + "%";
+      $("loadtext").textContent = "正在載入 " + name + "，約 " + Math.ceil(left / 1000) + " 秒";
+      if (left > 0) loadTimer = requestAnimationFrame(step);
+    };
+    loadTimer = requestAnimationFrame(step);
+    status("正在載入 " + name + "（約 " + est + " 秒），載入期間請稍候。");
+  }
+  function endLoad(ok, name, msg) {
+    if (loadTimer) { cancelAnimationFrame(loadTimer); loadTimer = null; }
+    $("loadfill").style.width = ok ? "100%" : "0%";
+    $("load").hidden = true;
+    $("model").disabled = false;
+    $("role").disabled = false;
+    if (ok) {
+      servingModel = $("model").value;
+      line("scene", "—— 模型：" + name + " ——");
+      status("已切換為 " + name + "，請開始說話。");
+    } else {
+      $("model").value = servingModel;  // the server kept the old engine running
+      status("模型載入失敗：" + msg + "（維持 " + (modelLabels[servingModel] || servingModel) + "）", true);
+    }
+  }
 
   let partialEl = null;
   function partialLine(text) {

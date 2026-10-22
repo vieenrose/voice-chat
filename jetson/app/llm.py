@@ -62,6 +62,7 @@ class Llm:
         self.stats_by_seq = {}  # parsed stats, keyed by request number
         threading.Thread(target=self._drain_err, daemon=True).start()
         if not self.ready.wait(300):
+            self.close()  # a half-loaded model holds its weights in RAM; the Nano has room for one
             raise RuntimeError("fwd35_serve did not become ready")
 
     def _drain_err(self):
@@ -88,6 +89,19 @@ class Llm:
             self.proc.stdin.flush()
         except (BrokenPipeError, ValueError):
             pass
+
+    def close(self):
+        """Ends the engine process (its stderr reader thread exits with the pipe). A model swap calls this
+        on the old engine only after the new one is ready: 4 GB of RAM holds one model at a time."""
+        try:
+            self.proc.stdin.close()
+        except (BrokenPipeError, ValueError):
+            pass
+        self.proc.terminate()
+        try:
+            self.proc.wait(10)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
 
     def _prefill_only(self, ids):
         """Feeds `ids` from scratch and keeps them as the engine state (one decoded token is discarded)."""
